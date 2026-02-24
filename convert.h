@@ -86,10 +86,16 @@ struct conv_attrs {
 	enum convert_crlf_action crlf_action; /* When no attr is set, use core.autocrlf */
 	int ident;
 	const char *working_tree_encoding; /* Supported encoding or default encoding if NULL */
+	const char *filter_attr_value; /* raw gitattributes filter= value, or NULL */
 };
 
 void convert_attrs(struct index_state *istate,
 		   struct conv_attrs *ca, const char *path);
+
+/*
+ * Return the raw gitattributes filter= value from conv_attrs, or NULL.
+ */
+const char *conv_attrs_filter_name(const struct conv_attrs *ca);
 
 extern enum eol core_eol;
 extern char *check_roundtrip_encoding;

@@ -19,6 +19,7 @@
 #include "trace.h"
 #include "utf8.h"
 #include "merge-ll.h"
+#include "textil-ext-policy.h"
 
 /*
  * convert.c - convert a file when checking it out and checking it in.
@@ -1337,6 +1338,13 @@ void convert_attrs(struct index_state *istate,
 		ca->crlf_action = git_path_check_crlf(ccheck + 0);
 	ca->ident = git_path_check_ident(ccheck + 1);
 	ca->drv = git_path_check_convert(ccheck + 2);
+	{
+		const char *fval = (ccheck + 2)->value;
+		if (ATTR_TRUE(fval) || ATTR_FALSE(fval) || ATTR_UNSET(fval))
+			ca->filter_attr_value = NULL;
+		else
+			ca->filter_attr_value = fval;
+	}
 	if (ca->crlf_action != CRLF_BINARY) {
 		enum eol eol_attr = git_path_check_eol(ccheck + 3);
 		if (ca->crlf_action == CRLF_AUTO && eol_attr == EOL_LF)
@@ -1360,6 +1368,13 @@ void convert_attrs(struct index_state *istate,
 		ca->crlf_action = CRLF_AUTO_CRLF;
 	if (ca->crlf_action == CRLF_UNDEFINED && auto_crlf == AUTO_CRLF_INPUT)
 		ca->crlf_action = CRLF_AUTO_INPUT;
+}
+
+const char *conv_attrs_filter_name(const struct conv_attrs *ca)
+{
+	if (ca)
+		return ca->filter_attr_value;
+	return NULL;
 }
 
 void reset_parsed_attributes(void)
@@ -1436,6 +1451,14 @@ int convert_to_git(struct index_state *istate,
 
 	convert_attrs(istate, &ca, path);
 
+	if (conv_flags & CONV_WRITE_OBJECT) {
+		struct textil_ext_eval_result ext_result;
+		textil_ext_evaluate_for_checkin(
+			conv_attrs_filter_name(&ca), 1, &ext_result);
+		textil_ext_require_supported_or_die(
+			&ext_result, "checkin", path);
+	}
+
 	ret |= apply_filter(path, src, len, -1, dst, ca.drv, CAP_CLEAN, NULL, NULL);
 	if (!ret && ca.drv && ca.drv->required)
 		die(_("%s: clean filter '%s' failed"), path, ca.drv->name);
@@ -1467,6 +1490,14 @@ void convert_to_git_filter_fd(struct index_state *istate,
 {
 	struct conv_attrs ca;
 	convert_attrs(istate, &ca, path);
+
+	if (conv_flags & CONV_WRITE_OBJECT) {
+		struct textil_ext_eval_result ext_result;
+		textil_ext_evaluate_for_checkin(
+			conv_attrs_filter_name(&ca), 1, &ext_result);
+		textil_ext_require_supported_or_die(
+			&ext_result, "checkin", path);
+	}
 
 	assert(ca.drv);
 
