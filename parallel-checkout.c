@@ -15,6 +15,7 @@
 #include "sigchain.h"
 #include "odb/streaming.h"
 #include "symlinks.h"
+#include "textil-ext-policy.h"
 #include "thread-utils.h"
 #include "trace2.h"
 
@@ -278,6 +279,14 @@ static int write_pc_item_to_fd(struct parallel_checkout_item *pc_item, int fd,
 
 	/* Sanity check */
 	ASSERT(is_eligible_for_parallel_checkout(pc_item->ce, &pc_item->ca));
+
+	{
+		struct textil_ext_eval_result ext_result;
+		textil_ext_evaluate_for_checkout(
+			conv_attrs_filter_name(&pc_item->ca), 1, &ext_result);
+		textil_ext_require_supported_or_die(
+			&ext_result, "checkout", pc_item->ce->name);
+	}
 
 	filter = get_stream_filter_ca(&pc_item->ca, &pc_item->ce->oid);
 	if (filter) {

@@ -15,6 +15,8 @@
 #include "fsmonitor.h"
 #include "entry.h"
 #include "parallel-checkout.h"
+#include "textil-ext-policy.h"
+#include "convert.h"
 
 static void create_directories(const char *path, int path_len,
 			       const struct checkout *state)
@@ -302,7 +304,15 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 	clone_checkout_metadata(&meta, &state->meta, &ce->oid);
 
 	if (ce_mode_s_ifmt == S_IFREG) {
-		struct stream_filter *filter = get_stream_filter_ca(ca, &ce->oid);
+		struct stream_filter *filter;
+		struct textil_ext_eval_result ext_result;
+
+		textil_ext_evaluate_for_checkout(
+			conv_attrs_filter_name(ca), 1, &ext_result);
+		textil_ext_require_supported_or_die(
+			&ext_result, "checkout", ce->name);
+
+		filter = get_stream_filter_ca(ca, &ce->oid);
 		if (filter &&
 		    !streaming_write_entry(ce, path, filter,
 					   state, to_tempfile,
@@ -584,6 +594,14 @@ int checkout_entry_ca(struct cache_entry *ce, struct conv_attrs *ca,
 	if (S_ISREG(ce->ce_mode) && !ca) {
 		convert_attrs(state->istate, &ca_buf, ce->name);
 		ca = &ca_buf;
+	}
+
+	if (S_ISREG(ce->ce_mode) && ca) {
+		struct textil_ext_eval_result ext_result;
+		textil_ext_evaluate_for_checkout(
+			conv_attrs_filter_name(ca), 1, &ext_result);
+		textil_ext_require_supported_or_die(
+			&ext_result, "checkout", ce->name);
 	}
 
 	if (!enqueue_checkout(ce, ca, nr_checkouts))
