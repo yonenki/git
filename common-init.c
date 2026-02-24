@@ -8,6 +8,7 @@
 #include "repository.h"
 #include "setup.h"
 #include "strbuf.h"
+#include "textil-ext-policy.h"
 #include "trace2.h"
 
 /*
@@ -60,4 +61,6 @@ void init_git(const char **argv)
 
 	if (!strbuf_getcwd(&tmp))
 		tmp_original_cwd = strbuf_detach(&tmp, NULL);
+
+	textil_ext_policy_init();
 }

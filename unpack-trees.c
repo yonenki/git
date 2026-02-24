@@ -28,6 +28,8 @@
 #include "fsmonitor.h"
 #include "odb.h"
 #include "promisor-remote.h"
+#include "textil-ext-policy.h"
+#include "textil-ext-executor.h"
 #include "entry.h"
 #include "parallel-checkout.h"
 #include "setup.h"
@@ -456,6 +458,34 @@ static int check_updates(struct unpack_trees_options *o,
 
 	if (should_update_submodules())
 		load_gitmodules_file(index, NULL);
+
+	/*
+	 * Textil preflight batch: evaluate policy for all checkout
+	 * candidates BEFORE any workspace mutation (unlink / write).
+	 * Collect takeover candidates into a batch, then dispatch
+	 * to the executor.  If executor returns non-OK, die.
+	 */
+	if (textil_ext_policy_is_active()) {
+		struct textil_ext_takeover_batch pf_batch = {0};
+		struct strbuf pf_err = STRBUF_INIT;
+		enum textil_ext_executor_status pf_status =
+			TEXTIL_EXT_EXECUTOR_OK;
+
+		textil_ext_collect_preflight_takeover_batch(
+			index, "checkout",
+			repo_get_work_tree(the_repository), &pf_batch);
+
+		if (pf_batch.nr_items > 0)
+			pf_status = textil_ext_execute_takeover_batch(
+				&pf_batch, &pf_err);
+
+		textil_ext_takeover_batch_release(&pf_batch);
+		free(pf_batch.items);
+
+		if (pf_status != TEXTIL_EXT_EXECUTOR_OK)
+			die("%s", pf_err.buf);
+		strbuf_release(&pf_err);
+	}
 
 	for (i = 0; i < index->cache_nr; i++) {
 		const struct cache_entry *ce = index->cache[i];

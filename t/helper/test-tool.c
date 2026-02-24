@@ -83,6 +83,8 @@ static struct test_cmd cmds[] = {
 	{ "submodule-nested-repo-config", cmd__submodule_nested_repo_config },
 	{ "subprocess", cmd__subprocess },
 	{ "synthesize", cmd__synthesize },
+	{ "textil-ext-executor-server", cmd__textil_ext_executor_server },
+	{ "textil-ext-policy", cmd__textil_ext_policy },
 	{ "trace2", cmd__trace2 },
 	{ "truncate", cmd__truncate },
 	{ "userdiff", cmd__userdiff },
