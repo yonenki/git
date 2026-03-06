@@ -16,6 +16,8 @@
 #include "entry.h"
 #include "parallel-checkout.h"
 #include "textil-ext-policy.h"
+#include "textil-ext-executor.h"
+#include "string-list.h"
 #include "convert.h"
 
 static void create_directories(const char *path, int path_len,
@@ -309,8 +311,60 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 
 		textil_ext_evaluate_for_checkout(
 			conv_attrs_filter_name(ca), 1, &ext_result);
-		textil_ext_require_supported_or_die(
-			&ext_result, "checkout", ce->name);
+
+		if (ext_result.matched &&
+		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
+			struct strbuf pointer_err = STRBUF_INIT;
+			int is_pointer = 0;
+
+			if (textil_ext_blob_oid_is_lfs_pointer(&ce->oid,
+							       &is_pointer,
+							       &pointer_err)) {
+				error("%s", pointer_err.buf);
+				strbuf_release(&pointer_err);
+				return -1;
+			}
+			strbuf_release(&pointer_err);
+			if (!is_pointer)
+				goto no_takeover;
+
+			/* Materialize via executor helper */
+			struct strbuf mat_err = STRBUF_INIT;
+			int out_fd;
+
+			out_fd = open_output_fd(path, ce, to_tempfile);
+			if (out_fd < 0) {
+				error_errno("unable to create file %s", path);
+				strbuf_release(&mat_err);
+				return -1;
+			}
+
+			{
+				struct strbuf main_wt = STRBUF_INIT;
+				int mat_rc;
+				textil_ext_resolve_main_worktree(&main_wt);
+				mat_rc = textil_ext_materialize_one_to_fd(
+				    ce->name, &ce->oid,
+				    conv_attrs_filter_name(ca),
+				    &ext_result,
+				    main_wt.buf,
+				    out_fd, &mat_err);
+				strbuf_release(&main_wt);
+				if (mat_rc) {
+					close(out_fd);
+					strbuf_release(&mat_err);
+					return -1;
+				}
+			}
+
+			if (!to_tempfile)
+				fstat_done = fstat_checkout_output(out_fd, state, &st);
+			close(out_fd);
+			strbuf_release(&mat_err);
+			goto finish;
+		}
+
+no_takeover:
 
 		filter = get_stream_filter_ca(ca, &ce->oid);
 		if (filter &&
@@ -596,12 +650,22 @@ int checkout_entry_ca(struct cache_entry *ce, struct conv_attrs *ca,
 		ca = &ca_buf;
 	}
 
+	/*
+	 * Materialize takeover: evaluate in the main process where
+	 * conv_attrs (filter_attr_value) is still available.  Worker
+	 * processes lose this value across the packet boundary, so
+	 * takeover items must bypass enqueue and go through write_entry()
+	 * directly.  write_pc_item_to_fd() retains a defense-in-depth
+	 * check but is not expected to be reached for takeover items.
+	 */
 	if (S_ISREG(ce->ce_mode) && ca) {
 		struct textil_ext_eval_result ext_result;
 		textil_ext_evaluate_for_checkout(
 			conv_attrs_filter_name(ca), 1, &ext_result);
-		textil_ext_require_supported_or_die(
-			&ext_result, "checkout", ce->name);
+		if (ext_result.matched &&
+		    ext_result.action == TEXTIL_ACTION_TAKEOVER)
+			return write_entry(ce, path.buf, ca, state, 0,
+					   nr_checkouts);
 	}
 
 	if (!enqueue_checkout(ce, ca, nr_checkouts))
