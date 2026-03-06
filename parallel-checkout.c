@@ -16,6 +16,7 @@
 #include "odb/streaming.h"
 #include "symlinks.h"
 #include "textil-ext-policy.h"
+#include "textil-ext-executor.h"
 #include "thread-utils.h"
 #include "trace2.h"
 
@@ -284,9 +285,44 @@ static int write_pc_item_to_fd(struct parallel_checkout_item *pc_item, int fd,
 		struct textil_ext_eval_result ext_result;
 		textil_ext_evaluate_for_checkout(
 			conv_attrs_filter_name(&pc_item->ca), 1, &ext_result);
-		textil_ext_require_supported_or_die(
-			&ext_result, "checkout", pc_item->ce->name);
+
+		if (ext_result.matched &&
+		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
+			struct strbuf pointer_err = STRBUF_INIT;
+			int is_pointer = 0;
+
+			if (textil_ext_blob_oid_is_lfs_pointer(&pc_item->ce->oid,
+							       &is_pointer,
+							       &pointer_err)) {
+				error("%s", pointer_err.buf);
+				strbuf_release(&pointer_err);
+				return -1;
+			}
+			strbuf_release(&pointer_err);
+			if (!is_pointer)
+				goto no_takeover;
+
+			/* Materialize via executor helper */
+			struct strbuf mat_err = STRBUF_INIT;
+			int ret;
+
+			{
+				struct strbuf main_wt = STRBUF_INIT;
+				textil_ext_resolve_main_worktree(&main_wt);
+				ret = textil_ext_materialize_one_to_fd(
+					pc_item->ce->name, &pc_item->ce->oid,
+					conv_attrs_filter_name(&pc_item->ca),
+					&ext_result,
+					main_wt.buf,
+					fd, &mat_err);
+				strbuf_release(&main_wt);
+			}
+			strbuf_release(&mat_err);
+			return ret;
+		}
 	}
+
+no_takeover:
 
 	filter = get_stream_filter_ca(&pc_item->ca, &pc_item->ce->oid);
 	if (filter) {
