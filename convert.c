@@ -20,6 +20,9 @@
 #include "utf8.h"
 #include "merge-ll.h"
 #include "textil-ext-policy.h"
+#include "textil-ext-executor.h"
+#include "repository.h"
+#include "abspath.h"
 
 /*
  * convert.c - convert a file when checking it out and checking it in.
@@ -384,6 +387,13 @@ static int check_roundtrip(const char *enc_name)
 }
 
 static const char *default_encoding = "UTF-8";
+
+static int textil_ext_checkin_endpoint_unavailable(const struct strbuf *err)
+{
+	return err->len &&
+		(strstr(err->buf, "TEXTIL_GIT_EXT_ENDPOINT is not set") ||
+		 strstr(err->buf, "failed to connect to endpoint"));
+}
 
 static int encode_to_git(const char *path, const char *src, size_t src_len,
 			 struct strbuf *buf, const char *enc, int conv_flags)
@@ -1451,12 +1461,42 @@ int convert_to_git(struct index_state *istate,
 
 	convert_attrs(istate, &ca, path);
 
-	if (conv_flags & CONV_WRITE_OBJECT) {
+	/*
+	 * Textil ext checkin takeover: activate for any real conversion
+	 * (src && dst are non-NULL) but NOT for would_convert_to_git()
+	 * probes which pass src=NULL, dst=NULL.
+	 *
+	 * This covers both object-write (CONV_WRITE_OBJECT) and
+	 * canonicalization for status/diff (global_conv_flags_eol).
+	 */
+	if (src && dst) {
 		struct textil_ext_eval_result ext_result;
 		textil_ext_evaluate_for_checkin(
 			conv_attrs_filter_name(&ca), 1, &ext_result);
-		textil_ext_require_supported_or_die(
-			&ext_result, "checkin", path);
+		if (ext_result.matched &&
+		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
+			struct strbuf main_wt = STRBUF_INIT;
+			struct strbuf cc_err = STRBUF_INIT;
+			textil_ext_resolve_main_worktree(&main_wt);
+			if (textil_ext_checkin_convert_one_to_buf(
+				    path, src, len,
+				    conv_attrs_filter_name(&ca),
+				    &ext_result,
+				    main_wt.buf,
+				    dst, &cc_err)) {
+				int fail_open = !(conv_flags & CONV_WRITE_OBJECT) &&
+					textil_ext_checkin_endpoint_unavailable(&cc_err);
+				strbuf_release(&main_wt);
+				if (!fail_open)
+					die(_("textil-ext: checkin_convert failed for '%s': %s"),
+					    path, cc_err.buf);
+				strbuf_release(&cc_err);
+			} else {
+				strbuf_release(&main_wt);
+				strbuf_release(&cc_err);
+				return 1;
+			}
+		}
 	}
 
 	ret |= apply_filter(path, src, len, -1, dst, ca.drv, CAP_CLEAN, NULL, NULL);
@@ -1491,12 +1531,44 @@ void convert_to_git_filter_fd(struct index_state *istate,
 	struct conv_attrs ca;
 	convert_attrs(istate, &ca, path);
 
-	if (conv_flags & CONV_WRITE_OBJECT) {
+	/*
+	 * Textil ext checkin takeover (fd path).
+	 *
+	 * Precondition: this function is never called as a probe —
+	 * dst is always non-NULL and fd is a valid descriptor, so we
+	 * unconditionally attempt takeover evaluation.
+	 *
+	 * Matches the src && dst gate in convert_to_git() but here
+	 * the equivalent is "always true" since fd implies real data.
+	 */
+	{
 		struct textil_ext_eval_result ext_result;
 		textil_ext_evaluate_for_checkin(
 			conv_attrs_filter_name(&ca), 1, &ext_result);
-		textil_ext_require_supported_or_die(
-			&ext_result, "checkin", path);
+		if (ext_result.matched &&
+		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
+			struct strbuf main_wt = STRBUF_INIT;
+			struct strbuf cc_err = STRBUF_INIT;
+			textil_ext_resolve_main_worktree(&main_wt);
+			if (textil_ext_checkin_convert_fd_to_buf(
+				    path, fd,
+				    conv_attrs_filter_name(&ca),
+				    &ext_result,
+				    main_wt.buf,
+				    dst, &cc_err)) {
+				int fail_open = !(conv_flags & CONV_WRITE_OBJECT) &&
+					textil_ext_checkin_endpoint_unavailable(&cc_err);
+				strbuf_release(&main_wt);
+				if (!fail_open)
+					die(_("textil-ext: checkin_convert failed for '%s': %s"),
+					    path, cc_err.buf);
+				strbuf_release(&cc_err);
+			} else {
+				strbuf_release(&main_wt);
+				strbuf_release(&cc_err);
+				return;
+			}
+		}
 	}
 
 	assert(ca.drv);

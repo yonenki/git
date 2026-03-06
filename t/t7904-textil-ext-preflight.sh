@@ -17,6 +17,14 @@ run_with_policy () {
 		"$@"
 }
 
+write_pointer () {
+	cat <<-EOF
+	version https://git-lfs.github.com/spec/v1
+	oid sha256:$1
+	size $2
+	EOF
+}
+
 # === Setup ===
 
 test_expect_success 'setup: create repo with two branches' '
@@ -29,9 +37,9 @@ test_expect_success 'setup: create repo with two branches' '
 		git commit -m "base" &&
 		git branch -M master main &&
 		git checkout -b with-lfs &&
-		echo "binary-a" >a.bin &&
-		echo "binary-b" >b.bin &&
-		echo "binary-c" >c.bin &&
+		write_pointer 1111111111111111111111111111111111111111111111111111111111111111 11 >a.bin &&
+		write_pointer 2222222222222222222222222222222222222222222222222222222222222222 12 >b.bin &&
+		write_pointer 3333333333333333333333333333333333333333333333333333333333333333 13 >c.bin &&
 		git add a.bin b.bin c.bin &&
 		git commit -m "add lfs files" &&
 		git checkout main
@@ -281,13 +289,15 @@ test_expect_success 'preflight: materialize-only rule does not trigger preflight
 	EOF
 	(
 		cd preflight-repo &&
-		test_must_fail env \
+		env \
 			TEXTIL_GIT_EXT_POLICY_PATH="$POLICY_PATH" \
 			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
 			git checkout with-lfs 2>err &&
-		# Should fail at entry.c/checkout level, NOT at preflight
-		grep "takeover.*not wired yet" err &&
-		! grep "preflight" err
+		grep "TEXTIL_GIT_EXT_ENDPOINT is not set" err &&
+		! grep "preflight" err &&
+		echo with-lfs >expect &&
+		git branch --show-current >actual &&
+		test_cmp expect actual
 	)
 '
 
