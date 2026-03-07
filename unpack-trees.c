@@ -468,12 +468,14 @@ static int check_updates(struct unpack_trees_options *o,
 	if (textil_ext_policy_is_active()) {
 		struct textil_ext_takeover_batch pf_batch = {0};
 		struct strbuf pf_err = STRBUF_INIT;
+		struct strbuf main_wt = STRBUF_INIT;
 		enum textil_ext_executor_status pf_status =
 			TEXTIL_EXT_EXECUTOR_OK;
 
+		textil_ext_resolve_main_worktree(&main_wt);
 		textil_ext_collect_preflight_takeover_batch(
 			index, "checkout",
-			repo_get_work_tree(the_repository), &pf_batch);
+			main_wt.buf, &pf_batch);
 
 		if (pf_batch.nr_items > 0)
 			pf_status = textil_ext_execute_takeover_batch(
@@ -481,6 +483,7 @@ static int check_updates(struct unpack_trees_options *o,
 
 		textil_ext_takeover_batch_release(&pf_batch);
 		free(pf_batch.items);
+		strbuf_release(&main_wt);
 
 		if (pf_status != TEXTIL_EXT_EXECUTOR_OK)
 			die("%s", pf_err.buf);

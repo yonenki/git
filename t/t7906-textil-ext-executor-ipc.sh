@@ -195,6 +195,15 @@ test_expect_success 'validate-request: server validates pkt-line request and ret
 	)
 '
 
+test_expect_success 'validate-request: materialize command-phase pairing accepted' '
+	restart_server validate-request-materialize &&
+	env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize \
+			--name="$IPC_PATH" >out &&
+	grep "^status=ok$" out
+'
+
 # === Workspace invariant: failed IPC does not mutate workspace ===
 
 test_expect_success 'workspace unchanged after rejected IPC' '
@@ -413,28 +422,253 @@ test_expect_success 'strict parser: duplicate key in response rejected' '
 
 # === Request-side value validation ===
 
-test_expect_success 'request validation: control char in path rejects before IPC' '
+test_expect_success 'request validation: LF in path rejects before IPC' '
 	restart_server ok &&
-	git init ctrl-char-repo &&
+	git init lf-path-repo &&
 	(
-		cd ctrl-char-repo &&
+		cd lf-path-repo &&
 		echo "* filter=lfs diff=lfs merge=lfs -text" >.gitattributes &&
 		echo "plain" >file.txt &&
 		git add .gitattributes file.txt &&
 		git commit -m "base" &&
 		git branch -M master main &&
-		git checkout -b with-ctrl-char &&
-		TAB_NAME=$(printf "bad\tfile.bin") &&
-		printf "binary-data" >"$TAB_NAME" &&
+		git checkout -b with-lf-path &&
+		LF_NAME=$(printf "bad\nfile.bin") &&
+		printf "binary-data" >"$LF_NAME" &&
 		git add -A &&
-		git commit -m "add file with tab in path" &&
+		git commit -m "add file with LF in path" &&
 		git checkout main &&
 		test_must_fail env \
 			TEXTIL_GIT_EXT_POLICY_PATH="$POLICY_PATH" \
 			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
 			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			git checkout with-ctrl-char 2>err &&
-		grep "control character" err
+			git checkout with-lf-path 2>err &&
+		grep "forbidden character" err
+	)
+'
+
+# === Materialize phase E2E tests ===
+
+test_expect_success 'materialize-ok: executor parses delim-separated src_paths' '
+	restart_server materialize-ok &&
+	TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+	test-tool textil-ext-executor-server send-materialize \
+		--name="$IPC_PATH" >out &&
+	grep "^status=ok$" out
+'
+
+test_expect_success 'materialize-rejected: executor reports rejected status' '
+	restart_server materialize-rejected &&
+	test_must_fail env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize \
+			--name="$IPC_PATH" >out &&
+	grep "^status=rejected$" out
+'
+
+test_expect_success 'materialize-src-path-relative: C-side validates absolute path' '
+	restart_server materialize-src-path-relative &&
+	test_must_fail env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize \
+			--name="$IPC_PATH" >out &&
+	grep "^status=error$" out
+'
+
+test_expect_success 'materialize-ok-without-src-path: ok with zero src_paths is invalid' '
+	restart_server materialize-ok-without-src-path &&
+	test_must_fail env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize \
+			--name="$IPC_PATH" >out &&
+	grep "^status=error$" out
+'
+
+test_expect_success 'materialize-ok-with-message: message forbidden for materialize ok' '
+	restart_server materialize-ok-with-message &&
+	test_must_fail env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize \
+			--name="$IPC_PATH" >out &&
+	grep "^status=error$" out
+'
+
+test_expect_success 'materialize-src-path-with-status-error: delim after non-ok is rejected' '
+	restart_server materialize-src-path-with-status-error &&
+	test_must_fail env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize \
+			--name="$IPC_PATH" >out &&
+	grep "^status=error$" out
+'
+
+# === Materialize src_path count mismatch ===
+
+test_expect_success 'materialize-count-mismatch: src_path count != batch items is ERROR' '
+	restart_server materialize-count-mismatch &&
+	test_must_fail env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize \
+			--name="$IPC_PATH" >out &&
+	grep "^status=error$" out
+'
+
+# === Preflight API contract (BUG guard) ===
+
+test_expect_success 'preflight API: materialize phase triggers BUG' '
+	test_expect_code 99 \
+		test-tool textil-ext-executor-server \
+			send-preflight-wrong-phase 2>err &&
+	grep "BUG:" err &&
+	grep "non-preflight phase" err
+'
+
+test_expect_success 'materialize API: preflight phase triggers BUG' '
+	test_expect_code 99 \
+		test-tool textil-ext-executor-server \
+			send-materialize-wrong-phase 2>err &&
+	grep "BUG:" err &&
+	grep "non-materialize phase" err
+'
+
+# === Materialize E2E checkout ===
+
+test_expect_success 'setup: policy for lfs materialize takeover' '
+	setup_policy "$(pwd)/policy-ipc-mat-takeover.json" <<-\EOF
+	{
+	  "version": "v1",
+	  "rules": [
+	    {
+	      "id": "lfs-takeover",
+	      "phases": ["materialize"],
+	      "selector": {
+	        "attr_filter_equals": "lfs",
+	        "regular_file_only": true
+	      },
+	      "action": "takeover",
+	      "strict": true,
+	      "fallback": "deny",
+	      "required_capabilities": ["lfs-smudge"]
+	    }
+	  ]
+	}
+	EOF
+'
+
+test_expect_success 'materialize E2E: checkout writes src_path content to file' '
+	restart_server materialize-checkout &&
+	(
+		cd executor-ipc-repo &&
+		git checkout -f main &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-ipc-mat-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git checkout with-lfs &&
+		test -f a.bin &&
+		test -f b.bin &&
+		grep "materialized-by-textil" a.bin &&
+		grep "materialized-by-textil" b.bin
+	)
+'
+
+test_expect_success 'materialize E2E: parallel checkout writes src_path content' '
+	restart_server materialize-checkout &&
+	(
+		cd executor-ipc-repo &&
+		git checkout -f main &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-ipc-mat-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			GIT_TEST_CHECKOUT_WORKERS=2 \
+			git checkout with-lfs &&
+		test -f a.bin &&
+		test -f b.bin &&
+		grep "materialized-by-textil" a.bin &&
+		grep "materialized-by-textil" b.bin
+	)
+'
+
+# === Checkin convert phase tests ===
+
+test_expect_success 'setup: policy for lfs checkin_convert takeover' '
+	setup_policy "$(pwd)/policy-ipc-cc-takeover.json" <<-\EOF
+	{
+	  "version": "v1",
+	  "rules": [
+	    {
+	      "id": "lfs-takeover",
+	      "phases": ["checkin_convert"],
+	      "selector": {
+	        "attr_filter_equals": "lfs",
+	        "regular_file_only": true
+	      },
+	      "action": "takeover",
+	      "strict": true,
+	      "fallback": "deny",
+	      "required_capabilities": ["lfs-checkin-convert"]
+	    }
+	  ]
+	}
+	EOF
+'
+
+test_expect_success 'checkin_convert-ok: executor parses delim-separated src_paths' '
+	restart_server checkin-convert-checkin &&
+	TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+	test-tool textil-ext-executor-server send-checkin-convert \
+		--name="$IPC_PATH" >out &&
+	grep "^status=ok$" out
+'
+
+test_expect_success 'checkin_convert-rejected: executor reports rejected status' '
+	restart_server rejected &&
+	test_must_fail env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-checkin-convert \
+			--name="$IPC_PATH" >out &&
+	grep "^status=rejected$" out
+'
+
+test_expect_success 'validate-request-checkin-convert: command-phase pairing accepted' '
+	restart_server validate-request-checkin-convert &&
+	env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-checkin-convert \
+			--name="$IPC_PATH" >out &&
+	grep "^status=ok$" out
+'
+
+# === Checkin convert API contract (BUG guard) ===
+
+test_expect_success 'checkin_convert API: preflight phase triggers BUG' '
+	test_expect_code 99 \
+		test-tool textil-ext-executor-server \
+			send-checkin-convert-wrong-phase 2>err &&
+	grep "BUG:" err &&
+	grep "non-checkin_convert phase" err
+'
+
+# === Checkin convert E2E ===
+
+test_expect_success 'checkin_convert E2E: git add writes LFS pointer via executor' '
+	restart_server checkin-convert-checkin &&
+	(
+		cd executor-ipc-repo &&
+		rm -f .git/index.lock &&
+		git checkout -f main &&
+		echo "new-binary-content" >new.bin &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-ipc-cc-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git add new.bin &&
+		git diff --cached --name-only | grep new.bin &&
+		git show :new.bin >staged-content &&
+		grep "version https://git-lfs.github.com/spec/v1" staged-content &&
+		grep "oid sha256:" staged-content &&
+		grep "size 42" staged-content
 	)
 '
 

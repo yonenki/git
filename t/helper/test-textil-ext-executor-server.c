@@ -15,9 +15,13 @@
  */
 
 #include "test-tool.h"
+#include "textil-ext-executor.h"
 #include "gettext.h"
 #include "strbuf.h"
 #include "parse-options.h"
+#include "alloc.h"
+#include "string-list.h"
+#include "write-or-die.h"
 
 #ifndef SUPPORTS_SIMPLE_IPC
 int cmd__textil_ext_executor_server(int argc, const char **argv)
@@ -49,6 +53,17 @@ enum reply_mode {
 	REPLY_UNKNOWN_KEY,
 	REPLY_OVERSIZED,
 	REPLY_DUPLICATE_KEY,
+	REPLY_MATERIALIZE_OK,
+	REPLY_MATERIALIZE_REJECTED,
+	REPLY_MATERIALIZE_SRC_PATH_RELATIVE,
+	REPLY_MATERIALIZE_SRC_PATH_WITH_STATUS_ERROR,
+	REPLY_MATERIALIZE_OK_WITHOUT_SRC_PATH,
+	REPLY_MATERIALIZE_OK_WITH_MESSAGE,
+	REPLY_MATERIALIZE_CHECKOUT,
+	REPLY_MATERIALIZE_COUNT_MISMATCH,
+	REPLY_VALIDATE_REQUEST_MATERIALIZE,
+	REPLY_CHECKIN_CONVERT_CHECKIN,
+	REPLY_VALIDATE_REQUEST_CHECKIN_CONVERT,
 };
 
 static struct {
@@ -99,6 +114,28 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_OVERSIZED;
 	if (!strcmp(s, "duplicate-key"))
 		return REPLY_DUPLICATE_KEY;
+	if (!strcmp(s, "materialize-ok"))
+		return REPLY_MATERIALIZE_OK;
+	if (!strcmp(s, "materialize-rejected"))
+		return REPLY_MATERIALIZE_REJECTED;
+	if (!strcmp(s, "materialize-src-path-relative"))
+		return REPLY_MATERIALIZE_SRC_PATH_RELATIVE;
+	if (!strcmp(s, "materialize-src-path-with-status-error"))
+		return REPLY_MATERIALIZE_SRC_PATH_WITH_STATUS_ERROR;
+	if (!strcmp(s, "materialize-ok-without-src-path"))
+		return REPLY_MATERIALIZE_OK_WITHOUT_SRC_PATH;
+	if (!strcmp(s, "materialize-ok-with-message"))
+		return REPLY_MATERIALIZE_OK_WITH_MESSAGE;
+	if (!strcmp(s, "materialize-checkout"))
+		return REPLY_MATERIALIZE_CHECKOUT;
+	if (!strcmp(s, "materialize-count-mismatch"))
+		return REPLY_MATERIALIZE_COUNT_MISMATCH;
+	if (!strcmp(s, "validate-request-materialize"))
+		return REPLY_VALIDATE_REQUEST_MATERIALIZE;
+	if (!strcmp(s, "checkin-convert-checkin"))
+		return REPLY_CHECKIN_CONVERT_CHECKIN;
+	if (!strcmp(s, "validate-request-checkin-convert"))
+		return REPLY_VALIDATE_REQUEST_CHECKIN_CONVERT;
 	die("unknown reply-mode: '%s'", s);
 }
 
@@ -214,13 +251,13 @@ static int val_equals(const char *val, size_t val_len,
 }
 
 /*
- * Structural pkt-line v1 validation of a preflight_batch request.
+ * Structural pkt-line v1 validation of a batch request.
  *
  * Validates:
  *   Header section (before first delim):
  *   - "version": must be "1"
- *   - "command": must be "preflight_batch"
- *   - "phase": must be "preflight"
+ *   - "command": must be "preflight_batch" or "materialize_batch"
+ *   - "phase": must be "preflight" or "materialize"
  *   - "operation": non-empty string
  *   - "repo_root": optional string
  *
@@ -234,8 +271,8 @@ static int val_equals(const char *val, size_t val_len,
  * Returns 1 if valid, 0 if not.
  * On failure, writes a short reason to 'reason'.
  */
-static int validate_preflight_request(const char *req, size_t req_len,
-				      struct strbuf *reason)
+static int validate_batch_request(const char *req, size_t req_len,
+				  struct strbuf *reason)
 {
 	size_t pos = 0;
 	int has_version = 0, has_command = 0, has_phase = 0;
@@ -243,6 +280,8 @@ static int validate_preflight_request(const char *req, size_t req_len,
 	int nr_items = 0;
 	int in_header = 1;
 	int has_path = 0, has_rule_id = 0;
+	int command_is_preflight = 0, phase_is_preflight = 0;
+	int command_is_checkin_convert = 0, phase_is_checkin_convert = 0;
 
 	if (req_len > MAX_VALIDATE_REQUEST_SIZE) {
 		strbuf_addstr(reason, "request too large");
@@ -303,6 +342,13 @@ static int validate_preflight_request(const char *req, size_t req_len,
 						      "missing operation");
 					return 0;
 				}
+				/* Verify command-phase pairing */
+				if (command_is_preflight != phase_is_preflight ||
+				    command_is_checkin_convert != phase_is_checkin_convert) {
+					strbuf_addstr(reason,
+						      "command-phase mismatch");
+					return 0;
+				}
 				in_header = 0;
 			} else {
 				/* Validate previous item */
@@ -340,20 +386,38 @@ static int validate_preflight_request(const char *req, size_t req_len,
 				has_version = 1;
 			} else if (kv_matches(key, key_len, "command")) {
 				if (!val_equals(val, val_len,
-						"preflight_batch")) {
+						"preflight_batch") &&
+				    !val_equals(val, val_len,
+						"materialize_batch") &&
+				    !val_equals(val, val_len,
+						"checkin_convert_batch")) {
 					strbuf_addstr(reason,
 						      "command must be "
-						      "preflight_batch");
+						      "preflight_batch, "
+						      "materialize_batch, or "
+						      "checkin_convert_batch");
 					return 0;
 				}
+				command_is_preflight = val_equals(
+					val, val_len, "preflight_batch");
+				command_is_checkin_convert = val_equals(
+					val, val_len, "checkin_convert_batch");
 				has_command = 1;
 			} else if (kv_matches(key, key_len, "phase")) {
-				if (!val_equals(val, val_len, "preflight")) {
+				if (!val_equals(val, val_len, "preflight") &&
+				    !val_equals(val, val_len, "materialize") &&
+				    !val_equals(val, val_len, "checkin_convert")) {
 					strbuf_addstr(reason,
 						      "phase must be "
-						      "preflight");
+						      "preflight, "
+						      "materialize, or "
+						      "checkin_convert");
 					return 0;
 				}
+				phase_is_preflight = val_equals(
+					val, val_len, "preflight");
+				phase_is_checkin_convert = val_equals(
+					val, val_len, "checkin_convert");
 				has_phase = 1;
 			} else if (kv_matches(key, key_len, "operation")) {
 				if (!val_len) {
@@ -386,6 +450,20 @@ static int validate_preflight_request(const char *req, size_t req_len,
 					return 0;
 				}
 				has_rule_id = 1;
+			} else if (kv_matches(key, key_len, "blob_oid")) {
+				if (!val_len) {
+					strbuf_addstr(reason,
+						      "blob_oid must be "
+						      "non-empty");
+					return 0;
+				}
+			} else if (kv_matches(key, key_len, "input_path")) {
+				if (!val_len) {
+					strbuf_addstr(reason,
+						      "input_path must be "
+						      "non-empty");
+					return 0;
+				}
 			}
 			/* Accept other item fields without validation */
 		}
@@ -467,8 +545,8 @@ static int app_cb(void *application_data UNUSED,
 	case REPLY_VALIDATE_REQUEST: {
 		struct strbuf reason = STRBUF_INIT;
 
-		if (validate_preflight_request(request, request_len,
-					       &reason)) {
+		if (validate_batch_request(request, request_len,
+					   &reason)) {
 			build_ok_reply(&reply);
 			ret = reply_cb(reply_data, reply.buf, reply.len);
 		} else {
@@ -582,6 +660,354 @@ static int app_cb(void *application_data UNUSED,
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
 		return ret;
+
+	case REPLY_MATERIALIZE_OK:
+		/* materialize ok with 1 src_path (matches 1-item batch) */
+		packet_buf_write(&reply, "status=ok\n");
+		packet_buf_delim(&reply);
+		packet_buf_write(&reply, "src_path=/tmp/textil/materialize/aa/bb/aabb1234\n");
+		packet_buf_flush(&reply);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
+	case REPLY_MATERIALIZE_REJECTED:
+		/* materialize rejected with message, no src_path */
+		packet_buf_write(&reply, "status=rejected\n");
+		packet_buf_write(&reply, "message=2 object(s) not available for materialize\n");
+		packet_buf_flush(&reply);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
+	case REPLY_MATERIALIZE_SRC_PATH_RELATIVE:
+		/* materialize ok but src_path is relative (invalid) */
+		packet_buf_write(&reply, "status=ok\n");
+		packet_buf_delim(&reply);
+		packet_buf_write(&reply, "src_path=relative/path/file.bin\n");
+		packet_buf_flush(&reply);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
+	case REPLY_MATERIALIZE_SRC_PATH_WITH_STATUS_ERROR:
+		/* status=error but includes src_path (forbidden) */
+		packet_buf_write(&reply, "status=error\n");
+		packet_buf_write(&reply, "message=something failed\n");
+		packet_buf_delim(&reply);
+		packet_buf_write(&reply, "src_path=/tmp/should/not/be/here\n");
+		packet_buf_flush(&reply);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
+	case REPLY_MATERIALIZE_OK_WITHOUT_SRC_PATH:
+		/* materialize status=ok but no delim/src_path (contract violation) */
+		packet_buf_write(&reply, "status=ok\n");
+		packet_buf_flush(&reply);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
+	case REPLY_MATERIALIZE_OK_WITH_MESSAGE:
+		/* materialize status=ok with message (forbidden for materialize ok) */
+		packet_buf_write(&reply, "status=ok\n");
+		packet_buf_write(&reply, "message=should not be here\n");
+		packet_buf_delim(&reply);
+		packet_buf_write(&reply, "src_path=/tmp/textil/materialize/aa/bb/aabb1234\n");
+		packet_buf_flush(&reply);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
+	case REPLY_MATERIALIZE_CHECKOUT: {
+		/*
+		 * Parse request to extract item paths, create temp files
+		 * with predictable content, return src_paths.
+		 */
+		size_t pos = 0;
+		int in_header = 1;
+		int nr_items = 0;
+		struct strbuf *item_paths = NULL;
+		int alloc_items = 0;
+		struct strbuf cur_path = STRBUF_INIT;
+		int i;
+
+		/* Parse request to count items and extract paths */
+		for (;;) {
+			const char *line;
+			size_t line_len;
+			enum pktline_mem_status st;
+			const char *key, *val;
+			size_t key_len, val_len;
+
+			st = pktline_read_mem(request, request_len,
+					      &pos, &line, &line_len);
+			if (st == PKTLINE_MEM_FLUSH || st == PKTLINE_MEM_ERROR)
+				break;
+			if (st == PKTLINE_MEM_DELIM) {
+				if (!in_header && cur_path.len) {
+					/* save previous item path */
+					ALLOC_GROW(item_paths, nr_items + 1,
+						   alloc_items);
+					strbuf_init(&item_paths[nr_items], 0);
+					strbuf_addbuf(&item_paths[nr_items],
+						      &cur_path);
+					nr_items++;
+				}
+				in_header = 0;
+				strbuf_reset(&cur_path);
+				continue;
+			}
+			if (st != PKTLINE_MEM_DATA)
+				continue;
+			if (in_header)
+				continue;
+			if (!parse_kv(line, line_len, &key, &key_len,
+				      &val, &val_len) &&
+			    kv_matches(key, key_len, "path"))
+				strbuf_add(&cur_path, val, val_len);
+		}
+		/* Save last item if any */
+		if (!in_header && cur_path.len) {
+			ALLOC_GROW(item_paths, nr_items + 1, alloc_items);
+			strbuf_init(&item_paths[nr_items], 0);
+			strbuf_addbuf(&item_paths[nr_items], &cur_path);
+			nr_items++;
+		}
+		strbuf_release(&cur_path);
+
+		if (!nr_items) {
+			build_error_reply(&reply,
+					  "no items in materialize request");
+			ret = reply_cb(reply_data, reply.buf, reply.len);
+			strbuf_release(&reply);
+			free(item_paths);
+			return ret;
+		}
+
+		/* Build reply: status=ok + src_paths */
+		packet_buf_write(&reply, "status=ok\n");
+		for (i = 0; i < nr_items; i++) {
+			struct strbuf tmp_path = STRBUF_INIT;
+			int tmp_fd;
+
+			strbuf_addf(&tmp_path, "%s/materialize-XXXXXX",
+				    getenv("TMPDIR") ? getenv("TMPDIR")
+						     : "/tmp");
+			tmp_fd = mkstemp(tmp_path.buf);
+			if (tmp_fd >= 0) {
+				const char *content = "materialized-by-textil\n";
+				write_in_full(tmp_fd, content, strlen(content));
+				close(tmp_fd);
+			}
+			packet_buf_delim(&reply);
+			packet_buf_write(&reply, "src_path=%s\n",
+					 tmp_path.buf);
+			strbuf_release(&tmp_path);
+			strbuf_release(&item_paths[i]);
+		}
+		packet_buf_flush(&reply);
+		free(item_paths);
+
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+	}
+
+	case REPLY_MATERIALIZE_COUNT_MISMATCH: {
+		/*
+		 * Return more src_paths than items in the request.
+		 * Parse request to count items, then return items+1 paths.
+		 */
+		size_t pos = 0;
+		int in_header = 1;
+		int nr_items = 0;
+		int i;
+
+		for (;;) {
+			const char *line;
+			size_t line_len;
+			enum pktline_mem_status st;
+
+			st = pktline_read_mem(request, request_len,
+					      &pos, &line, &line_len);
+			if (st == PKTLINE_MEM_FLUSH || st == PKTLINE_MEM_ERROR)
+				break;
+			if (st == PKTLINE_MEM_DELIM) {
+				if (!in_header)
+					nr_items++;
+				in_header = 0;
+				continue;
+			}
+		}
+		/* Last item (after last delim before flush) */
+		if (!in_header)
+			nr_items++;
+
+		/* Return nr_items + 1 src_paths (mismatch) */
+		packet_buf_write(&reply, "status=ok\n");
+		for (i = 0; i < nr_items + 1; i++) {
+			packet_buf_delim(&reply);
+			packet_buf_write(&reply,
+					 "src_path=/tmp/mismatch-%d\n", i);
+		}
+		packet_buf_flush(&reply);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+	}
+
+	case REPLY_VALIDATE_REQUEST_MATERIALIZE: {
+		/*
+		 * Validate request structure (including command-phase pairing),
+		 * then reply with proper materialize format (ok + 1 src_path).
+		 */
+		struct strbuf reason = STRBUF_INIT;
+
+		if (validate_batch_request(request, request_len,
+					   &reason)) {
+			/* Valid: reply with materialize ok + 1 fake src_path */
+			packet_buf_write(&reply, "status=ok\n");
+			packet_buf_delim(&reply);
+			packet_buf_write(&reply,
+					 "src_path=/tmp/validate-ok\n");
+			packet_buf_flush(&reply);
+			ret = reply_cb(reply_data, reply.buf, reply.len);
+		} else {
+			build_error_reply(&reply, reason.buf);
+			ret = reply_cb(reply_data, reply.buf, reply.len);
+		}
+		strbuf_release(&reason);
+		strbuf_release(&reply);
+		return ret;
+	}
+
+	case REPLY_CHECKIN_CONVERT_CHECKIN: {
+		/*
+		 * Parse request to extract item paths, create temp files
+		 * with predictable LFS pointer content, return src_paths.
+		 * Mirror of REPLY_MATERIALIZE_CHECKOUT for checkin_convert.
+		 */
+		size_t pos = 0;
+		int in_header = 1;
+		int nr_items = 0;
+		struct strbuf *item_paths = NULL;
+		int alloc_items = 0;
+		struct strbuf cur_path = STRBUF_INIT;
+		int i;
+
+		/* Parse request to count items and extract paths */
+		for (;;) {
+			const char *line;
+			size_t line_len;
+			enum pktline_mem_status st;
+			const char *key, *val;
+			size_t key_len, val_len;
+
+			st = pktline_read_mem(request, request_len,
+					      &pos, &line, &line_len);
+			if (st == PKTLINE_MEM_FLUSH || st == PKTLINE_MEM_ERROR)
+				break;
+			if (st == PKTLINE_MEM_DELIM) {
+				if (!in_header && cur_path.len) {
+					ALLOC_GROW(item_paths, nr_items + 1,
+						   alloc_items);
+					strbuf_init(&item_paths[nr_items], 0);
+					strbuf_addbuf(&item_paths[nr_items],
+						      &cur_path);
+					nr_items++;
+				}
+				in_header = 0;
+				strbuf_reset(&cur_path);
+				continue;
+			}
+			if (st != PKTLINE_MEM_DATA)
+				continue;
+			if (in_header)
+				continue;
+			if (!parse_kv(line, line_len, &key, &key_len,
+				      &val, &val_len) &&
+			    kv_matches(key, key_len, "path"))
+				strbuf_add(&cur_path, val, val_len);
+		}
+		/* Save last item if any */
+		if (!in_header && cur_path.len) {
+			ALLOC_GROW(item_paths, nr_items + 1, alloc_items);
+			strbuf_init(&item_paths[nr_items], 0);
+			strbuf_addbuf(&item_paths[nr_items], &cur_path);
+			nr_items++;
+		}
+		strbuf_release(&cur_path);
+
+		if (!nr_items) {
+			build_error_reply(&reply,
+					  "no items in checkin_convert request");
+			ret = reply_cb(reply_data, reply.buf, reply.len);
+			strbuf_release(&reply);
+			free(item_paths);
+			return ret;
+		}
+
+		/* Build reply: status=ok + src_paths with LFS pointer content */
+		packet_buf_write(&reply, "status=ok\n");
+		for (i = 0; i < nr_items; i++) {
+			struct strbuf tmp_path = STRBUF_INIT;
+			int tmp_fd;
+
+			strbuf_addf(&tmp_path, "%s/checkin-convert-XXXXXX",
+				    getenv("TMPDIR") ? getenv("TMPDIR")
+						     : "/tmp");
+			tmp_fd = mkstemp(tmp_path.buf);
+			if (tmp_fd >= 0) {
+				/*
+				 * Write a predictable LFS pointer.
+				 * Use a fixed OID to make test assertions simple.
+				 */
+				const char *content =
+					"version https://git-lfs.github.com/spec/v1\n"
+					"oid sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+					"size 42\n";
+				write_in_full(tmp_fd, content, strlen(content));
+				close(tmp_fd);
+			}
+			packet_buf_delim(&reply);
+			packet_buf_write(&reply, "src_path=%s\n",
+					 tmp_path.buf);
+			strbuf_release(&tmp_path);
+			strbuf_release(&item_paths[i]);
+		}
+		packet_buf_flush(&reply);
+		free(item_paths);
+
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+	}
+
+	case REPLY_VALIDATE_REQUEST_CHECKIN_CONVERT: {
+		/*
+		 * Validate request structure (including command-phase pairing),
+		 * then reply with proper checkin_convert format (ok + 1 src_path).
+		 */
+		struct strbuf reason = STRBUF_INIT;
+
+		if (validate_batch_request(request, request_len,
+					   &reason)) {
+			packet_buf_write(&reply, "status=ok\n");
+			packet_buf_delim(&reply);
+			packet_buf_write(&reply,
+					 "src_path=/tmp/validate-cc-ok\n");
+			packet_buf_flush(&reply);
+			ret = reply_cb(reply_data, reply.buf, reply.len);
+		} else {
+			build_error_reply(&reply, reason.buf);
+			ret = reply_cb(reply_data, reply.buf, reply.len);
+		}
+		strbuf_release(&reason);
+		strbuf_release(&reply);
+		return ret;
+	}
 	}
 
 	BUG("unhandled reply_mode");
@@ -750,6 +1176,257 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		if (client__probe_server())
 			return 1;
 		return !!client__stop_server();
+	}
+
+	/*
+	 * send-materialize: invoke textil_ext_execute_materialize_batch()
+	 * with a fake 1-item batch.
+	 * Uses TEXTIL_GIT_EXT_ENDPOINT from env (must be set).
+	 * Prints executor status, src_paths, and any error message to stdout.
+	 */
+	if (!strcmp(subcmd, "send-materialize")) {
+		struct textil_ext_takeover_batch batch;
+		struct textil_ext_takeover_item item;
+		struct string_list src_paths = STRING_LIST_INIT_DUP;
+		struct strbuf err_buf = STRBUF_INIT;
+		enum textil_ext_executor_status st;
+		int i;
+
+		memset(&batch, 0, sizeof(batch));
+		memset(&item, 0, sizeof(item));
+
+		item.path = xstrdup("test/a.bin");
+		item.rule_id = "lfs-takeover";
+		item.attr_filter = xstrdup("lfs");
+		item.blob_oid = xstrdup("aabbccdd00112233445566778899aabbccddeeff");
+		item.is_regular_file = 1;
+		item.strict = 1;
+		item.capabilities = NULL;
+		item.nr_capabilities = 0;
+
+		batch.phase = TEXTIL_EXT_EXEC_PHASE_MATERIALIZE;
+		batch.operation = "checkout";
+		batch.repo_root = "/tmp/fake-repo";
+		batch.items = &item;
+		batch.nr_items = 1;
+
+		st = textil_ext_execute_materialize_batch(&batch, &src_paths,
+							  &err_buf);
+
+		switch (st) {
+		case TEXTIL_EXT_EXECUTOR_OK:
+			printf("status=ok\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_REJECTED:
+			printf("status=rejected\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_NOT_IMPLEMENTED:
+			printf("status=not-implemented\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_ERROR:
+			printf("status=error\n");
+			break;
+		}
+		for (i = 0; i < src_paths.nr; i++)
+			printf("src_path=%s\n", src_paths.items[i].string);
+		if (err_buf.len)
+			printf("message=%s\n", err_buf.buf);
+
+		free(item.path);
+		free(item.attr_filter);
+		free(item.blob_oid);
+		string_list_clear(&src_paths, 0);
+		strbuf_release(&err_buf);
+		return (st != TEXTIL_EXT_EXECUTOR_OK) ? 1 : 0;
+	}
+
+	/*
+	 * send-preflight-wrong-phase: call textil_ext_execute_takeover_batch()
+	 * with phase=MATERIALIZE.  This is a programming error and must
+	 * trigger BUG() / SIGABRT.  Used to verify the preflight-only
+	 * API contract.
+	 */
+	if (!strcmp(subcmd, "send-preflight-wrong-phase")) {
+		struct textil_ext_takeover_batch batch;
+		struct textil_ext_takeover_item item;
+		struct strbuf err_buf = STRBUF_INIT;
+
+		memset(&batch, 0, sizeof(batch));
+		memset(&item, 0, sizeof(item));
+
+		item.path = xstrdup("test/a.bin");
+		item.rule_id = "lfs-takeover";
+		item.attr_filter = xstrdup("lfs");
+		item.blob_oid = xstrdup("aabbccdd00112233445566778899aabbccddeeff");
+		item.is_regular_file = 1;
+		item.strict = 1;
+		item.capabilities = NULL;
+		item.nr_capabilities = 0;
+
+		/* Deliberately wrong phase: materialize instead of preflight */
+		batch.phase = TEXTIL_EXT_EXEC_PHASE_MATERIALIZE;
+		batch.operation = "checkout";
+		batch.repo_root = "/tmp/fake-repo";
+		batch.items = &item;
+		batch.nr_items = 1;
+
+		/* This must BUG() and abort — should never return */
+		textil_ext_execute_takeover_batch(&batch, &err_buf);
+
+		/* If we reach here, the BUG guard is broken */
+		die("BUG guard did not fire for non-preflight phase");
+	}
+
+	/*
+	 * send-checkin-convert: invoke textil_ext_execute_checkin_convert_batch()
+	 * with a fake 1-item batch.
+	 * Uses TEXTIL_GIT_EXT_ENDPOINT from env (must be set).
+	 * Prints executor status, src_paths, and any error message to stdout.
+	 */
+	if (!strcmp(subcmd, "send-checkin-convert")) {
+		struct textil_ext_takeover_batch batch;
+		struct textil_ext_takeover_item item;
+		struct string_list src_paths = STRING_LIST_INIT_DUP;
+		struct strbuf err_buf = STRBUF_INIT;
+		enum textil_ext_executor_status st;
+		struct strbuf tmp_input = STRBUF_INIT;
+		int tmp_fd, i;
+
+		memset(&batch, 0, sizeof(batch));
+		memset(&item, 0, sizeof(item));
+
+		/* Create a temp input file for the checkin_convert */
+		strbuf_addf(&tmp_input, "%s/cc-input-XXXXXX",
+			    getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+		tmp_fd = mkstemp(tmp_input.buf);
+		if (tmp_fd >= 0) {
+			const char *data = "fake-binary-content-for-test";
+			write_in_full(tmp_fd, data, strlen(data));
+			close(tmp_fd);
+		}
+
+		item.path = xstrdup("test/a.bin");
+		item.rule_id = "lfs-takeover";
+		item.attr_filter = xstrdup("lfs");
+		item.blob_oid = NULL;
+		item.input_path = strbuf_detach(&tmp_input, NULL);
+		item.is_regular_file = 1;
+		item.strict = 1;
+		item.capabilities = NULL;
+		item.nr_capabilities = 0;
+
+		batch.phase = TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT;
+		batch.operation = "checkin";
+		batch.repo_root = "/tmp/fake-repo";
+		batch.items = &item;
+		batch.nr_items = 1;
+
+		st = textil_ext_execute_checkin_convert_batch(&batch, &src_paths,
+							      &err_buf);
+
+		switch (st) {
+		case TEXTIL_EXT_EXECUTOR_OK:
+			printf("status=ok\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_REJECTED:
+			printf("status=rejected\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_NOT_IMPLEMENTED:
+			printf("status=not-implemented\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_ERROR:
+			printf("status=error\n");
+			break;
+		}
+		for (i = 0; i < src_paths.nr; i++)
+			printf("src_path=%s\n", src_paths.items[i].string);
+		if (err_buf.len)
+			printf("message=%s\n", err_buf.buf);
+
+		if (item.input_path)
+			unlink(item.input_path);
+		free(item.path);
+		free(item.attr_filter);
+		free(item.input_path);
+		string_list_clear(&src_paths, 0);
+		strbuf_release(&err_buf);
+		return (st != TEXTIL_EXT_EXECUTOR_OK) ? 1 : 0;
+	}
+
+	/*
+	 * send-checkin-convert-wrong-phase: call textil_ext_execute_checkin_convert_batch()
+	 * with phase=PREFLIGHT.  This is a programming error and must
+	 * trigger BUG() / exit(99).
+	 */
+	if (!strcmp(subcmd, "send-checkin-convert-wrong-phase")) {
+		struct textil_ext_takeover_batch batch;
+		struct textil_ext_takeover_item item;
+		struct string_list src_paths = STRING_LIST_INIT_DUP;
+		struct strbuf err_buf = STRBUF_INIT;
+
+		memset(&batch, 0, sizeof(batch));
+		memset(&item, 0, sizeof(item));
+
+		item.path = xstrdup("test/a.bin");
+		item.rule_id = "lfs-takeover";
+		item.attr_filter = xstrdup("lfs");
+		item.blob_oid = NULL;
+		item.input_path = xstrdup("/tmp/fake-input");
+		item.is_regular_file = 1;
+		item.strict = 1;
+		item.capabilities = NULL;
+		item.nr_capabilities = 0;
+
+		/* Deliberately wrong phase: preflight instead of checkin_convert */
+		batch.phase = TEXTIL_EXT_EXEC_PHASE_PREFLIGHT;
+		batch.operation = "checkin";
+		batch.repo_root = "/tmp/fake-repo";
+		batch.items = &item;
+		batch.nr_items = 1;
+
+		/* This must BUG() and abort — should never return */
+		textil_ext_execute_checkin_convert_batch(&batch, &src_paths, &err_buf);
+
+		/* If we reach here, the BUG guard is broken */
+		die("BUG guard did not fire for non-checkin_convert phase");
+	}
+
+	/*
+	 * send-materialize-wrong-phase: call textil_ext_execute_materialize_batch()
+	 * with phase=PREFLIGHT.  This is a programming error and must
+	 * trigger BUG() / exit(99).  Used to verify the materialize-only
+	 * API contract (symmetric with send-preflight-wrong-phase).
+	 */
+	if (!strcmp(subcmd, "send-materialize-wrong-phase")) {
+		struct textil_ext_takeover_batch batch;
+		struct textil_ext_takeover_item item;
+		struct string_list src_paths = STRING_LIST_INIT_DUP;
+		struct strbuf err_buf = STRBUF_INIT;
+
+		memset(&batch, 0, sizeof(batch));
+		memset(&item, 0, sizeof(item));
+
+		item.path = xstrdup("test/a.bin");
+		item.rule_id = "lfs-takeover";
+		item.attr_filter = xstrdup("lfs");
+		item.blob_oid = xstrdup("aabbccdd00112233445566778899aabbccddeeff");
+		item.is_regular_file = 1;
+		item.strict = 1;
+		item.capabilities = NULL;
+		item.nr_capabilities = 0;
+
+		/* Deliberately wrong phase: preflight instead of materialize */
+		batch.phase = TEXTIL_EXT_EXEC_PHASE_PREFLIGHT;
+		batch.operation = "checkout";
+		batch.repo_root = "/tmp/fake-repo";
+		batch.items = &item;
+		batch.nr_items = 1;
+
+		/* This must BUG() and abort — should never return */
+		textil_ext_execute_materialize_batch(&batch, &src_paths, &err_buf);
+
+		/* If we reach here, the BUG guard is broken */
+		die("BUG guard did not fire for non-materialize phase");
 	}
 
 	die("unknown subcommand: '%s'", subcmd);

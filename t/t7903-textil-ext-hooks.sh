@@ -1,6 +1,12 @@
 #!/bin/sh
 
-test_description='textil-ext-policy: hook point integration (entry/convert)'
+test_description='textil-ext-policy: hook point integration (entry/convert)
+
+Tests are organized in three layers:
+  Layer 1: Implemented functionality (materialize via IPC executor)
+  Layer 2: Unimplemented boundary (checkin_convert fail-fast guard)
+  Layer 3: Purity regression (no hook/filter management, IPC delegation)
+'
 
 . ./test-lib.sh
 
@@ -31,9 +37,33 @@ test_expect_success 'setup: create repo with lfs-tracked file' '
 	)
 '
 
+# === IPC server for materialize tests ===
+
+if test-tool textil-ext-executor-server SUPPORTS_SIMPLE_IPC
+then
+	test_set_prereq SIMPLE_IPC
+fi
+
+IPC_PATH="$TRASH_DIRECTORY/textil-hooks-test"
+
+stop_executor_server () {
+	test-tool textil-ext-executor-server stop-daemon --name="$IPC_PATH" 2>/dev/null
+	return 0
+}
+
+restart_server () {
+	stop_executor_server &&
+	test-tool textil-ext-executor-server start-daemon \
+		--name="$IPC_PATH" --reply-mode="$1" &&
+	test-tool textil-ext-executor-server is-active \
+		--name="$IPC_PATH"
+}
+
 # === Checkout (entry.c) tests ===
 
-test_expect_success 'checkout: takeover policy dies on checkout' '
+test_expect_success SIMPLE_IPC 'checkout: takeover materializes via executor' '
+	test_atexit stop_executor_server &&
+	restart_server materialize-checkout &&
 	setup_policy "$(pwd)/policy-takeover.json" <<-\EOF &&
 	{
 	  "version": "v1",
@@ -56,13 +86,13 @@ test_expect_success 'checkout: takeover policy dies on checkout' '
 	(
 		cd hook-repo &&
 		rm -f file.bin &&
-		test_must_fail env \
+		env \
 			TEXTIL_GIT_EXT_POLICY_PATH="$POLICY_PATH" \
 			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
-			git checkout -- file.bin 2>err &&
-		grep "takeover.*not wired yet" err &&
-		grep "checkout" err &&
-		grep "file.bin" err
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git checkout -- file.bin &&
+		test -f file.bin &&
+		grep "materialized-by-textil" file.bin
 	)
 '
 
@@ -162,9 +192,41 @@ test_expect_success 'checkout: takeover does not affect non-lfs files' '
 '
 
 # === Checkin (convert.c) tests ===
+#
+# Phase2-3b: materialize-only policy (no checkin_convert phase).
+# Backend policy provider does not emit checkin_convert in this phase.
+# checkin_convert takeover → Phase2-4.
 
-test_expect_success 'checkin: takeover policy dies on git add' '
-	setup_policy "$(pwd)/policy-checkin-takeover.json" <<-\EOF &&
+test_expect_success 'checkin: materialize-only policy allows git add' '
+	setup_policy "$(pwd)/policy-checkin-matonly.json" <<-\EOF &&
+	{
+	  "version": "v1",
+	  "rules": [
+	    {
+	      "id": "lfs-takeover",
+	      "phases": ["materialize"],
+	      "selector": {
+	        "attr_filter_equals": "lfs",
+	        "regular_file_only": true
+	      },
+	      "action": "takeover",
+	      "strict": true,
+	      "fallback": "deny",
+	      "required_capabilities": ["lfs-smudge"]
+	    }
+	  ]
+	}
+	EOF
+	(
+		cd hook-repo &&
+		echo "modified-bin" >file.bin &&
+		run_with_policy git add file.bin
+	)
+'
+
+test_expect_success SIMPLE_IPC 'checkin: checkin_convert takeover via executor' '
+	restart_server checkin-convert-checkin &&
+	setup_policy "$(pwd)/policy-checkin-takeover-guard.json" <<-\EOF &&
 	{
 	  "version": "v1",
 	  "rules": [
@@ -185,14 +247,52 @@ test_expect_success 'checkin: takeover policy dies on git add' '
 	EOF
 	(
 		cd hook-repo &&
-		echo "modified-bin" >file.bin &&
-		test_must_fail env \
+		echo "modified-bin-guard" >file.bin &&
+		env \
 			TEXTIL_GIT_EXT_POLICY_PATH="$POLICY_PATH" \
 			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
-			git add file.bin 2>err &&
-		grep "takeover.*not wired yet" err &&
-		grep "checkin" err &&
-		grep "file.bin" err
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git add file.bin &&
+		git diff --cached --name-only | grep file.bin
+	)
+'
+
+test_expect_success SIMPLE_IPC 'checkin: checkin_convert works in linked worktree' '
+	restart_server checkin-convert-checkin &&
+	setup_policy "$(pwd)/policy-checkin-worktree.json" <<-\EOF &&
+	{
+	  "version": "v1",
+	  "rules": [
+	    {
+	      "id": "lfs-takeover",
+	      "phases": ["checkin_convert"],
+	      "selector": {
+	        "attr_filter_equals": "lfs",
+	        "regular_file_only": true
+	      },
+	      "action": "takeover",
+	      "strict": true,
+	      "fallback": "deny",
+	      "required_capabilities": ["lfs-clean"]
+	    }
+	  ]
+	}
+	EOF
+	(
+		cd hook-repo &&
+		git worktree add ../hook-repo-wt HEAD &&
+		cd ../hook-repo-wt &&
+		echo "worktree-bin-data" >file.bin &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$POLICY_PATH" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git add file.bin &&
+		git diff --cached --name-only | grep file.bin
+	) &&
+	(
+		cd hook-repo &&
+		git worktree remove --force ../hook-repo-wt
 	)
 '
 
@@ -250,14 +350,14 @@ test_expect_success 'checkin: no-match policy allows git add' '
 	)
 '
 
-test_expect_success 'checkin: takeover does not affect non-lfs files' '
-	setup_policy "$(pwd)/policy-checkin-takeover2.json" <<-\EOF &&
+test_expect_success 'checkin: materialize takeover does not affect non-lfs on add' '
+	setup_policy "$(pwd)/policy-checkin-matonly2.json" <<-\EOF &&
 	{
 	  "version": "v1",
 	  "rules": [
 	    {
 	      "id": "lfs-takeover",
-	      "phases": ["checkin_convert"],
+	      "phases": ["materialize"],
 	      "selector": {
 	        "attr_filter_equals": "lfs",
 	        "regular_file_only": true
@@ -265,7 +365,7 @@ test_expect_success 'checkin: takeover does not affect non-lfs files' '
 	      "action": "takeover",
 	      "strict": true,
 	      "fallback": "deny",
-	      "required_capabilities": ["lfs-clean"]
+	      "required_capabilities": ["lfs-smudge"]
 	    }
 	  ]
 	}
@@ -293,7 +393,8 @@ test_expect_success 'setup: create repo with multiple lfs-tracked files' '
 	)
 '
 
-test_expect_success 'parallel-checkout: takeover policy dies via parallel path' '
+test_expect_success SIMPLE_IPC 'parallel-checkout: takeover materializes under parallel workers' '
+	restart_server materialize-checkout &&
 	setup_policy "$(pwd)/policy-pc-takeover.json" <<-\EOF &&
 	{
 	  "version": "v1",
@@ -316,12 +417,16 @@ test_expect_success 'parallel-checkout: takeover policy dies via parallel path' 
 	(
 		cd pc-repo &&
 		rm -f a.bin b.bin c.bin &&
-		test_must_fail env \
+		env \
 			TEXTIL_GIT_EXT_POLICY_PATH="$POLICY_PATH" \
 			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
 			GIT_TEST_CHECKOUT_WORKERS=2 \
-			git checkout -- a.bin b.bin c.bin 2>err &&
-		grep "takeover.*not wired yet" err
+			git checkout -- a.bin b.bin c.bin &&
+		test -f a.bin &&
+		test -f b.bin &&
+		test -f c.bin &&
+		grep "materialized-by-textil" a.bin
 	)
 '
 
