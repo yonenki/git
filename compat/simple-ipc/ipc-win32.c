@@ -22,6 +22,22 @@ static int initialize_pipe_name(const char *path, wchar_t *wpath, size_t alloc)
 {
 	int off = 0;
 	struct strbuf realpath = STRBUF_INIT;
+	const char *canonical_prefix_backslash = "\\\\.\\pipe\\";
+	const char *canonical_prefix_slash = "//./pipe/";
+
+	if (!strncasecmp(path, canonical_prefix_backslash,
+			 strlen(canonical_prefix_backslash)) ||
+	    !strncasecmp(path, canonical_prefix_slash,
+			 strlen(canonical_prefix_slash))) {
+		if (xutftowcs(wpath, path, alloc) < 0)
+			return -1;
+
+		for (off = 0; wpath[off]; off++)
+			if (wpath[off] == L'/')
+				wpath[off] = L'\\';
+
+		return 0;
+	}
 
 	if (!strbuf_realpath(&realpath, path, 0))
 		return -1;

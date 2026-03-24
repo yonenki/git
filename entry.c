@@ -19,6 +19,73 @@
 #include "textil-ext-executor.h"
 #include "string-list.h"
 #include "convert.h"
+#include "copy.h"
+
+static int textil_ext_materialize_batch_to_fd(const char *ce_name,
+					      const struct object_id *ce_oid,
+					      const char *attr_filter,
+					      const struct textil_ext_eval_result *eval_result,
+					      int out_fd,
+					      struct strbuf *err)
+{
+	struct textil_ext_takeover_batch batch;
+	struct textil_ext_takeover_item item;
+	struct textil_ext_materialize_batch_result result;
+	struct strbuf main_wt = STRBUF_INIT;
+	enum textil_ext_executor_status status;
+	int src_fd, ret = -1;
+
+	memset(&batch, 0, sizeof(batch));
+	memset(&item, 0, sizeof(item));
+	textil_ext_materialize_batch_result_init(&result);
+
+	item.path = xstrdup(ce_name);
+	item.rule_id = eval_result->rule_id;
+	item.attr_filter = attr_filter ? xstrdup(attr_filter) : NULL;
+	item.blob_oid = xstrdup(oid_to_hex(ce_oid));
+	item.is_regular_file = 1;
+	item.strict = eval_result->strict;
+	item.capabilities = eval_result->capabilities;
+	item.nr_capabilities = eval_result->nr_capabilities;
+
+	textil_ext_resolve_main_worktree(&main_wt);
+	batch.phase = TEXTIL_EXT_EXEC_PHASE_MATERIALIZE;
+	batch.operation = "checkout";
+	batch.repo_root = main_wt.buf;
+	batch.items = &item;
+	batch.nr_items = 1;
+
+	status = textil_ext_resolve_materialize_batch(&batch, &result, err);
+	if (status != TEXTIL_EXT_EXECUTOR_OK) {
+		error("textil-ext: materialize failed for '%s': %s",
+		      ce_name, err->buf);
+		goto cleanup;
+	}
+	if (result.src_paths.nr != 1)
+		BUG("materialize batch returned %lu src_paths for single checkout item",
+		    (unsigned long)result.src_paths.nr);
+
+	src_fd = open(result.src_paths.items[0].string, O_RDONLY);
+	if (src_fd < 0) {
+		error_errno("textil-ext: cannot open src_path '%s'",
+			    result.src_paths.items[0].string);
+		goto cleanup;
+	}
+
+	if (copy_fd(src_fd, out_fd)) {
+		close(src_fd);
+		error("textil-ext: copy_fd failed for '%s'", ce_name);
+		goto cleanup;
+	}
+	close(src_fd);
+	ret = 0;
+
+cleanup:
+	strbuf_release(&main_wt);
+	textil_ext_takeover_batch_release(&batch);
+	textil_ext_materialize_batch_result_release(&result);
+	return ret;
+}
 
 static void create_directories(const char *path, int path_len,
 			       const struct checkout *state)
@@ -314,21 +381,6 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 
 		if (ext_result.matched &&
 		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
-			struct strbuf pointer_err = STRBUF_INIT;
-			int is_pointer = 0;
-
-			if (textil_ext_blob_oid_is_lfs_pointer(&ce->oid,
-							       &is_pointer,
-							       &pointer_err)) {
-				error("%s", pointer_err.buf);
-				strbuf_release(&pointer_err);
-				return -1;
-			}
-			strbuf_release(&pointer_err);
-			if (!is_pointer)
-				goto no_takeover;
-
-			/* Materialize via executor helper */
 			struct strbuf mat_err = STRBUF_INIT;
 			int out_fd;
 
@@ -340,16 +392,12 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 			}
 
 			{
-				struct strbuf main_wt = STRBUF_INIT;
 				int mat_rc;
-				textil_ext_resolve_main_worktree(&main_wt);
-				mat_rc = textil_ext_materialize_one_to_fd(
+				mat_rc = textil_ext_materialize_batch_to_fd(
 				    ce->name, &ce->oid,
 				    conv_attrs_filter_name(ca),
 				    &ext_result,
-				    main_wt.buf,
 				    out_fd, &mat_err);
-				strbuf_release(&main_wt);
 				if (mat_rc) {
 					close(out_fd);
 					strbuf_release(&mat_err);
@@ -363,8 +411,6 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 			strbuf_release(&mat_err);
 			goto finish;
 		}
-
-no_takeover:
 
 		filter = get_stream_filter_ca(ca, &ce->oid);
 		if (filter &&
@@ -648,24 +694,6 @@ int checkout_entry_ca(struct cache_entry *ce, struct conv_attrs *ca,
 	if (S_ISREG(ce->ce_mode) && !ca) {
 		convert_attrs(state->istate, &ca_buf, ce->name);
 		ca = &ca_buf;
-	}
-
-	/*
-	 * Materialize takeover: evaluate in the main process where
-	 * conv_attrs (filter_attr_value) is still available.  Worker
-	 * processes lose this value across the packet boundary, so
-	 * takeover items must bypass enqueue and go through write_entry()
-	 * directly.  write_pc_item_to_fd() retains a defense-in-depth
-	 * check but is not expected to be reached for takeover items.
-	 */
-	if (S_ISREG(ce->ce_mode) && ca) {
-		struct textil_ext_eval_result ext_result;
-		textil_ext_evaluate_for_checkout(
-			conv_attrs_filter_name(ca), 1, &ext_result);
-		if (ext_result.matched &&
-		    ext_result.action == TEXTIL_ACTION_TAKEOVER)
-			return write_entry(ce, path.buf, ca, state, 0,
-					   nr_checkouts);
 	}
 
 	if (!enqueue_checkout(ce, ca, nr_checkouts))
