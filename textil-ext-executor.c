@@ -15,10 +15,16 @@
 #include "hex.h"
 #include "abspath.h"
 #include "odb.h"
+#include "trace.h"
 
 #ifdef SUPPORTS_SIMPLE_IPC
 #include "simple-ipc.h"
 #endif
+
+#define ENV_TRACE_FILE "TEXTIL_GIT_EXT_TRACE_FILE"
+#define ENV_OPERATION_ID "TEXTIL_GIT_EXT_OPERATION_ID"
+
+static const char *phase_to_string(enum textil_ext_executor_phase phase);
 
 /* --- Env helper --------------------------------------------------------- */
 
@@ -33,6 +39,107 @@ static const char *endpoint_from_env(struct strbuf *err)
 		return NULL;
 	}
 	return ep;
+}
+
+static void trace_json_string(FILE *fp, const char *value)
+{
+	const unsigned char *p;
+
+	fputc('"', fp);
+	if (!value)
+		value = "";
+	for (p = (const unsigned char *)value; *p; p++) {
+		switch (*p) {
+		case '\\':
+			fputs("\\\\", fp);
+			break;
+		case '"':
+			fputs("\\\"", fp);
+			break;
+		case '\n':
+			fputs("\\n", fp);
+			break;
+		case '\r':
+			fputs("\\r", fp);
+			break;
+		case '\t':
+			fputs("\\t", fp);
+			break;
+		default:
+			if (*p < 0x20)
+				fprintf(fp, "\\u%04x", (unsigned)*p);
+			else
+				fputc(*p, fp);
+		}
+	}
+	fputc('"', fp);
+}
+
+static const char *executor_status_name(enum textil_ext_executor_status status)
+{
+	switch (status) {
+	case TEXTIL_EXT_EXECUTOR_OK:
+		return "ok";
+	case TEXTIL_EXT_EXECUTOR_REJECTED:
+		return "rejected";
+	case TEXTIL_EXT_EXECUTOR_NOT_IMPLEMENTED:
+		return "not_implemented";
+	case TEXTIL_EXT_EXECUTOR_ERROR:
+		return "error";
+	}
+	return "unknown";
+}
+
+static void trace_batch_roundtrip(
+	const struct textil_ext_takeover_batch *batch,
+	const char *endpoint,
+	enum textil_ext_executor_status status,
+	const char *message,
+	uint64_t start_ns)
+{
+	const char *trace_path = getenv(ENV_TRACE_FILE);
+	const char *operation_id = getenv(ENV_OPERATION_ID);
+	FILE *fp;
+	uint64_t end_ns;
+
+	if (!trace_path || !*trace_path || !operation_id || !*operation_id || !batch)
+		return;
+
+	fp = fopen(trace_path, "ab");
+	if (!fp)
+		return;
+
+	end_ns = (uint64_t)getnanotime();
+	fputs("{\"source\":\"git_ext\",\"category\":\"controller\",\"event\":\"ipc_roundtrip\"", fp);
+	fputs(",\"operation_id\":", fp);
+	trace_json_string(fp, operation_id);
+	fputs(",\"ts_ns\":\"", fp);
+	fprintf(fp, "%llu", (unsigned long long)end_ns);
+	fputs("\"", fp);
+	fputs(",\"phase\":", fp);
+	trace_json_string(fp, phase_to_string(batch->phase));
+	fputs(",\"operation\":", fp);
+	trace_json_string(fp, batch->operation);
+	fputs(",\"items\":", fp);
+	fprintf(fp, "%d", batch->nr_items);
+	fputs(",\"status\":", fp);
+	trace_json_string(fp, executor_status_name(status));
+	fputs(",\"start_ns\":\"", fp);
+	fprintf(fp, "%llu", (unsigned long long)start_ns);
+	fputs("\"", fp);
+	fputs(",\"end_ns\":\"", fp);
+	fprintf(fp, "%llu", (unsigned long long)end_ns);
+	fputs("\"", fp);
+	if (endpoint && *endpoint) {
+		fputs(",\"endpoint\":", fp);
+		trace_json_string(fp, endpoint);
+	}
+	if (message && *message) {
+		fputs(",\"message\":", fp);
+		trace_json_string(fp, message);
+	}
+	fputs("}\n", fp);
+	fclose(fp);
 }
 
 /* --- pkt-line request builder ------------------------------------------- */
@@ -310,12 +417,25 @@ static int validate_src_path(const char *path, size_t path_len)
 	if (path_len > TEXTIL_EXT_MAX_SRC_PATH_LEN)
 		return -1;
 
-	/* Must be absolute: starts with '/' or drive letter (e.g. C:\) */
+	/*
+	 * Must be absolute.
+	 *
+	 * Keep this aligned with the backend-side src_path contract:
+	 *   - Unix absolute: /tmp/file
+	 *   - Windows drive-absolute: C:\path or C:/path
+	 *   - Windows verbatim / UNC prefixes: \\?\C:\path, \\server\share\path
+	 *
+	 * ex-git is always launched by the backend, and on Windows the
+	 * controller may canonicalize LFS object paths into verbatim form.
+	 * Rejecting those here turns valid controller replies into
+	 * "invalid response from endpoint" during checkout/materialize.
+	 */
 	if (path[0] != '/' &&
 	    !(path_len >= 3 &&
 	      ((path[0] >= 'A' && path[0] <= 'Z') ||
 	       (path[0] >= 'a' && path[0] <= 'z')) &&
-	      path[1] == ':' && (path[2] == '\\' || path[2] == '/')))
+	      path[1] == ':' && (path[2] == '\\' || path[2] == '/')) &&
+	    !(path_len >= 2 && path[0] == '\\' && path[1] == '\\'))
 		return -1;
 
 	/* Forbidden characters: LF, CR, DEL */
@@ -477,6 +597,109 @@ static int parse_executor_response(const char *buf, size_t len,
 	return 0;
 }
 
+static enum textil_ext_executor_status execute_src_path_batch(
+	const struct textil_ext_takeover_batch *batch,
+	const char *count_mismatch_label,
+	struct string_list *src_paths_out,
+	struct strbuf *err)
+{
+#ifndef SUPPORTS_SIMPLE_IPC
+	strbuf_addstr(err,
+		_("textil-ext: simple-ipc not available on this platform"));
+	return TEXTIL_EXT_EXECUTOR_ERROR;
+#else
+	const char *endpoint;
+	struct strbuf request = STRBUF_INIT;
+	struct strbuf answer = STRBUF_INIT;
+	struct strbuf status_str = STRBUF_INIT;
+	struct strbuf msg = STRBUF_INIT;
+	struct ipc_client_connect_options options
+		= IPC_CLIENT_CONNECT_OPTIONS_INIT;
+	int ipc_ret;
+	enum textil_ext_executor_status status;
+	uint64_t trace_start_ns = (uint64_t)getnanotime();
+
+	endpoint = endpoint_from_env(err);
+	if (!endpoint) {
+		status = TEXTIL_EXT_EXECUTOR_ERROR;
+		goto done;
+	}
+
+	if (build_batch_request(batch, &request, err)) {
+		status = TEXTIL_EXT_EXECUTOR_ERROR;
+		goto done;
+	}
+
+	options.wait_if_busy = 1;
+	options.wait_if_not_found = 0;
+
+	ipc_ret = ipc_client_send_command(endpoint, &options,
+					  request.buf, request.len,
+					  &answer);
+	if (ipc_ret) {
+		strbuf_addf(err,
+			_("textil-ext: failed to connect to endpoint '%s'"),
+			endpoint);
+		status = TEXTIL_EXT_EXECUTOR_ERROR;
+		goto done;
+	}
+
+	if (answer.len > TEXTIL_EXT_MAX_REPLY_SIZE) {
+		strbuf_addf(err,
+			_("textil-ext: reply too large (%lu bytes, max %d) "
+			  "from endpoint '%s'"),
+			(unsigned long)answer.len,
+			TEXTIL_EXT_MAX_REPLY_SIZE, endpoint);
+		status = TEXTIL_EXT_EXECUTOR_ERROR;
+		goto done;
+	}
+
+	if (parse_executor_response(answer.buf, answer.len,
+				    &status_str, &msg,
+				    src_paths_out)) {
+		strbuf_addf(err,
+			_("textil-ext: invalid response from endpoint '%s'"),
+			endpoint);
+		status = TEXTIL_EXT_EXECUTOR_ERROR;
+		goto done;
+	}
+
+	if (!strcmp(status_str.buf, "ok")) {
+		if (src_paths_out->nr != batch->nr_items) {
+			strbuf_addf(err,
+				_("textil-ext: %s src_path count mismatch: got %lu, expected %d"),
+				count_mismatch_label,
+				(unsigned long)src_paths_out->nr,
+				batch->nr_items);
+			status = TEXTIL_EXT_EXECUTOR_ERROR;
+			goto done;
+		}
+		status = TEXTIL_EXT_EXECUTOR_OK;
+		goto done;
+	}
+
+	if (!strcmp(status_str.buf, "rejected")) {
+		strbuf_addf(err,
+			_("textil-ext: takeover rejected: %s"),
+			msg.len ? msg.buf : "(no message)");
+		status = TEXTIL_EXT_EXECUTOR_REJECTED;
+	} else {
+		strbuf_addf(err,
+			_("textil-ext: takeover error: %s"),
+			msg.len ? msg.buf : "(no message)");
+		status = TEXTIL_EXT_EXECUTOR_ERROR;
+	}
+
+done:
+	trace_batch_roundtrip(batch, endpoint, status, err->buf, trace_start_ns);
+	strbuf_release(&request);
+	strbuf_release(&answer);
+	strbuf_release(&status_str);
+	strbuf_release(&msg);
+	return status;
+#endif /* SUPPORTS_SIMPLE_IPC */
+}
+
 /* --- Preflight collection ----------------------------------------------- */
 
 #define TEXTIL_EXT_MAX_POINTER_BLOB_SIZE 8192
@@ -617,8 +840,6 @@ void textil_ext_collect_preflight_takeover_batch(
 		struct textil_ext_eval_result ext_result;
 		const char *filter_name;
 		struct textil_ext_takeover_item *item;
-		struct strbuf pointer_err = STRBUF_INIT;
-		int is_pointer = 0;
 
 		if (!(ce->ce_flags & CE_UPDATE))
 			continue;
@@ -632,13 +853,6 @@ void textil_ext_collect_preflight_takeover_batch(
 
 		if (!ext_result.matched ||
 		    ext_result.action != TEXTIL_ACTION_TAKEOVER)
-			continue;
-
-		if (textil_ext_blob_oid_is_lfs_pointer(&ce->oid, &is_pointer,
-						       &pointer_err))
-			die("%s", pointer_err.buf);
-		strbuf_release(&pointer_err);
-		if (!is_pointer)
 			continue;
 
 		ALLOC_GROW(batch_out->items,
@@ -686,6 +900,7 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 		= IPC_CLIENT_CONNECT_OPTIONS_INIT;
 	int ipc_ret;
 	enum textil_ext_executor_status status;
+	uint64_t trace_start_ns = (uint64_t)getnanotime();
 
 	/* 1. Resolve endpoint */
 	endpoint = endpoint_from_env(err);
@@ -755,6 +970,7 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 	}
 
 done:
+	trace_batch_roundtrip(batch, endpoint, status, err->buf, trace_start_ns);
 	strbuf_release(&request);
 	strbuf_release(&answer);
 	strbuf_release(&status_str);
@@ -763,121 +979,66 @@ done:
 #endif /* SUPPORTS_SIMPLE_IPC */
 }
 
+void textil_ext_materialize_batch_result_init(
+	struct textil_ext_materialize_batch_result *result)
+{
+	if (!result)
+		BUG("textil_ext_materialize_batch_result_init called with NULL result");
+
+	memset(result, 0, sizeof(*result));
+	string_list_init_dup(&result->src_paths);
+}
+
+void textil_ext_materialize_batch_result_release(
+	struct textil_ext_materialize_batch_result *result)
+{
+	if (!result)
+		return;
+
+	string_list_clear(&result->src_paths, 0);
+}
+
+enum textil_ext_executor_status textil_ext_resolve_materialize_batch(
+	const struct textil_ext_takeover_batch *batch,
+	struct textil_ext_materialize_batch_result *result_out,
+	struct strbuf *err)
+{
+	if (!batch || !batch->items || batch->nr_items <= 0)
+		BUG("resolve_materialize_batch called with invalid batch");
+	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_MATERIALIZE)
+		BUG("resolve_materialize_batch called with non-materialize phase");
+	if (!result_out)
+		BUG("resolve_materialize_batch called with NULL result_out");
+	if (!err)
+		BUG("resolve_materialize_batch called with NULL err");
+
+	return execute_src_path_batch(batch, "materialize",
+				      &result_out->src_paths, err);
+}
+
 enum textil_ext_executor_status textil_ext_execute_materialize_batch(
 	const struct textil_ext_takeover_batch *batch,
 	struct string_list *src_paths_out,
 	struct strbuf *err)
 {
-	/* Preconditions (common, evaluated before #ifdef split) */
-	if (!batch || !batch->items || batch->nr_items <= 0)
-		BUG("execute_materialize_batch called with invalid batch");
-	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_MATERIALIZE)
-		BUG("execute_materialize_batch called with non-materialize phase");
-	if (!src_paths_out)
-		BUG("execute_materialize_batch called with NULL src_paths_out");
-	if (!err)
-		BUG("execute_materialize_batch called with NULL err");
-
-#ifndef SUPPORTS_SIMPLE_IPC
-	strbuf_addstr(err,
-		_("textil-ext: simple-ipc not available on this platform"));
-	return TEXTIL_EXT_EXECUTOR_ERROR;
-#else
-	const char *endpoint;
-	struct strbuf request = STRBUF_INIT;
-	struct strbuf answer = STRBUF_INIT;
-	struct strbuf status_str = STRBUF_INIT;
-	struct strbuf msg = STRBUF_INIT;
-	struct ipc_client_connect_options options
-		= IPC_CLIENT_CONNECT_OPTIONS_INIT;
-	int ipc_ret;
+	struct textil_ext_materialize_batch_result result;
+	struct string_list_item *item;
 	enum textil_ext_executor_status status;
 
-	/* 1. Resolve endpoint */
-	endpoint = endpoint_from_env(err);
-	if (!endpoint) {
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
+	if (!src_paths_out)
+		BUG("execute_materialize_batch called with NULL src_paths_out");
+
+	textil_ext_materialize_batch_result_init(&result);
+	status = textil_ext_resolve_materialize_batch(batch, &result, err);
+	if (status != TEXTIL_EXT_EXECUTOR_OK)
 		goto done;
-	}
 
-	/* 2. Build pkt-line request */
-	if (build_batch_request(batch, &request, err)) {
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
-	/* 3. Send via simple-ipc */
-	options.wait_if_busy = 1;
-	options.wait_if_not_found = 0;
-
-	ipc_ret = ipc_client_send_command(endpoint, &options,
-					  request.buf, request.len,
-					  &answer);
-	if (ipc_ret) {
-		strbuf_addf(err,
-			_("textil-ext: failed to connect to endpoint '%s'"),
-			endpoint);
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
-	/* 4. Size guard */
-	if (answer.len > TEXTIL_EXT_MAX_REPLY_SIZE) {
-		strbuf_addf(err,
-			_("textil-ext: reply too large (%lu bytes, max %d) "
-			  "from endpoint '%s'"),
-			(unsigned long)answer.len,
-			TEXTIL_EXT_MAX_REPLY_SIZE, endpoint);
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
-	/* 5. Parse pkt-line response with src_paths */
-	if (parse_executor_response(answer.buf, answer.len,
-				    &status_str, &msg,
-				    src_paths_out)) {
-		strbuf_addf(err,
-			_("textil-ext: invalid response from endpoint '%s'"),
-			endpoint);
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
-	/* 6. Map status */
-	if (!strcmp(status_str.buf, "ok")) {
-		/* Validate src_path count matches batch items */
-		if (src_paths_out->nr != batch->nr_items) {
-			strbuf_addf(err,
-				_("textil-ext: materialize src_path count "
-				  "mismatch: got %lu, expected %d"),
-				(unsigned long)src_paths_out->nr,
-				batch->nr_items);
-			status = TEXTIL_EXT_EXECUTOR_ERROR;
-			goto done;
-		}
-		status = TEXTIL_EXT_EXECUTOR_OK;
-		goto done;
-	}
-
-	if (!strcmp(status_str.buf, "rejected")) {
-		strbuf_addf(err,
-			_("textil-ext: takeover rejected: %s"),
-			msg.len ? msg.buf : "(no message)");
-		status = TEXTIL_EXT_EXECUTOR_REJECTED;
-	} else {
-		strbuf_addf(err,
-			_("textil-ext: takeover error: %s"),
-			msg.len ? msg.buf : "(no message)");
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-	}
+	for_each_string_list_item(item, &result.src_paths)
+		string_list_append(src_paths_out, item->string);
 
 done:
-	strbuf_release(&request);
-	strbuf_release(&answer);
-	strbuf_release(&status_str);
-	strbuf_release(&msg);
+	textil_ext_materialize_batch_result_release(&result);
 	return status;
-#endif /* SUPPORTS_SIMPLE_IPC */
 }
 
 void textil_ext_resolve_main_worktree(struct strbuf *out)
@@ -922,12 +1083,13 @@ int textil_ext_materialize_one_to_fd(
 {
 	struct textil_ext_takeover_batch batch;
 	struct textil_ext_takeover_item item;
-	struct string_list src_paths = STRING_LIST_INIT_DUP;
+	struct textil_ext_materialize_batch_result result;
 	enum textil_ext_executor_status st;
 	int src_fd, ret = -1;
 
 	memset(&batch, 0, sizeof(batch));
 	memset(&item, 0, sizeof(item));
+	textil_ext_materialize_batch_result_init(&result);
 
 	item.path = xstrdup(ce_name);
 	item.rule_id = eval_result->rule_id;
@@ -944,17 +1106,17 @@ int textil_ext_materialize_one_to_fd(
 	batch.items = &item;
 	batch.nr_items = 1;
 
-	st = textil_ext_execute_materialize_batch(&batch, &src_paths, err);
+	st = textil_ext_resolve_materialize_batch(&batch, &result, err);
 	if (st != TEXTIL_EXT_EXECUTOR_OK) {
 		error("textil-ext: materialize failed for '%s': %s",
 		      ce_name, err->buf);
 		goto cleanup;
 	}
 
-	src_fd = open(src_paths.items[0].string, O_RDONLY);
+	src_fd = open(result.src_paths.items[0].string, O_RDONLY);
 	if (src_fd < 0) {
 		error_errno("textil-ext: cannot open src_path '%s'",
-			    src_paths.items[0].string);
+			    result.src_paths.items[0].string);
 		goto cleanup;
 	}
 
@@ -969,7 +1131,7 @@ int textil_ext_materialize_one_to_fd(
 
 cleanup:
 	textil_ext_takeover_batch_release(&batch);
-	string_list_clear(&src_paths, 0);
+	textil_ext_materialize_batch_result_release(&result);
 	return ret;
 }
 
@@ -990,105 +1152,8 @@ enum textil_ext_executor_status textil_ext_execute_checkin_convert_batch(
 	if (!err)
 		BUG("execute_checkin_convert_batch called with NULL err");
 
-#ifndef SUPPORTS_SIMPLE_IPC
-	strbuf_addstr(err,
-		_("textil-ext: simple-ipc not available on this platform"));
-	return TEXTIL_EXT_EXECUTOR_ERROR;
-#else
-	const char *endpoint;
-	struct strbuf request = STRBUF_INIT;
-	struct strbuf answer = STRBUF_INIT;
-	struct strbuf status_str = STRBUF_INIT;
-	struct strbuf msg = STRBUF_INIT;
-	struct ipc_client_connect_options options
-		= IPC_CLIENT_CONNECT_OPTIONS_INIT;
-	int ipc_ret;
-	enum textil_ext_executor_status status;
-
-	/* 1. Resolve endpoint */
-	endpoint = endpoint_from_env(err);
-	if (!endpoint) {
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
-	/* 2. Build pkt-line request */
-	if (build_batch_request(batch, &request, err)) {
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
-	/* 3. Send via simple-ipc */
-	options.wait_if_busy = 1;
-	options.wait_if_not_found = 0;
-
-	ipc_ret = ipc_client_send_command(endpoint, &options,
-					  request.buf, request.len,
-					  &answer);
-	if (ipc_ret) {
-		strbuf_addf(err,
-			_("textil-ext: failed to connect to endpoint '%s'"),
-			endpoint);
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
-	/* 4. Size guard */
-	if (answer.len > TEXTIL_EXT_MAX_REPLY_SIZE) {
-		strbuf_addf(err,
-			_("textil-ext: reply too large (%lu bytes, max %d) "
-			  "from endpoint '%s'"),
-			(unsigned long)answer.len,
-			TEXTIL_EXT_MAX_REPLY_SIZE, endpoint);
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
-	/* 5. Parse pkt-line response with src_paths (same as materialize) */
-	if (parse_executor_response(answer.buf, answer.len,
-				    &status_str, &msg,
-				    src_paths_out)) {
-		strbuf_addf(err,
-			_("textil-ext: invalid response from endpoint '%s'"),
-			endpoint);
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
-	/* 6. Map status */
-	if (!strcmp(status_str.buf, "ok")) {
-		if (src_paths_out->nr != batch->nr_items) {
-			strbuf_addf(err,
-				_("textil-ext: checkin_convert src_path count "
-				  "mismatch: got %lu, expected %d"),
-				(unsigned long)src_paths_out->nr,
-				batch->nr_items);
-			status = TEXTIL_EXT_EXECUTOR_ERROR;
-			goto done;
-		}
-		status = TEXTIL_EXT_EXECUTOR_OK;
-		goto done;
-	}
-
-	if (!strcmp(status_str.buf, "rejected")) {
-		strbuf_addf(err,
-			_("textil-ext: takeover rejected: %s"),
-			msg.len ? msg.buf : "(no message)");
-		status = TEXTIL_EXT_EXECUTOR_REJECTED;
-	} else {
-		strbuf_addf(err,
-			_("textil-ext: takeover error: %s"),
-			msg.len ? msg.buf : "(no message)");
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-	}
-
-done:
-	strbuf_release(&request);
-	strbuf_release(&answer);
-	strbuf_release(&status_str);
-	strbuf_release(&msg);
-	return status;
-#endif /* SUPPORTS_SIMPLE_IPC */
+	return execute_src_path_batch(batch, "checkin_convert",
+				      src_paths_out, err);
 }
 
 /* --- Checkin convert one-to-buf helper ---------------------------------- */

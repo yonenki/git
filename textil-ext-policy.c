@@ -6,6 +6,8 @@
 #include "trace.h"
 #include "gettext.h"
 
+#define ENV_POLICY_JSON    "TEXTIL_GIT_EXT_POLICY_JSON"
+#define ENV_POLICY_B64     "TEXTIL_GIT_EXT_POLICY_B64"
 #define ENV_POLICY_PATH    "TEXTIL_GIT_EXT_POLICY_PATH"
 #define ENV_POLICY_VERSION "TEXTIL_GIT_EXT_POLICY_VERSION"
 #define EXPECTED_VERSION   "v1"
@@ -25,6 +27,61 @@ static struct textil_ext_policy the_policy;
 
 /* File path for error messages (set during init, valid for parse lifetime) */
 static const char *policy_parse_path;
+
+static int b64_value(unsigned char ch)
+{
+	if (ch >= 'A' && ch <= 'Z')
+		return ch - 'A';
+	if (ch >= 'a' && ch <= 'z')
+		return ch - 'a' + 26;
+	if (ch >= '0' && ch <= '9')
+		return ch - '0' + 52;
+	if (ch == '+')
+		return 62;
+	if (ch == '/')
+		return 63;
+	return -1;
+}
+
+static void decode_policy_base64(const char *encoded, struct strbuf *out)
+{
+	size_t len = strlen(encoded);
+	size_t i;
+
+	if (!len)
+		die(_("textil-ext: %s must not be empty"), ENV_POLICY_B64);
+	if (len % 4)
+		die(_("textil-ext: invalid base64 policy payload in %s"),
+		    ENV_POLICY_B64);
+
+	for (i = 0; i < len; i += 4) {
+		unsigned char c0 = encoded[i];
+		unsigned char c1 = encoded[i + 1];
+		unsigned char c2 = encoded[i + 2];
+		unsigned char c3 = encoded[i + 3];
+		int v0 = b64_value(c0);
+		int v1 = b64_value(c1);
+		int v2 = (c2 == '=') ? -2 : b64_value(c2);
+		int v3 = (c3 == '=') ? -2 : b64_value(c3);
+
+		if (v0 < 0 || v1 < 0 || v2 == -1 || v3 == -1)
+			die(_("textil-ext: invalid base64 policy payload in %s"),
+			    ENV_POLICY_B64);
+		if (v2 == -2 && c3 != '=')
+			die(_("textil-ext: invalid base64 policy payload in %s"),
+			    ENV_POLICY_B64);
+		if ((v2 == -2 || v3 == -2) && i + 4 != len)
+			die(_("textil-ext: invalid base64 policy payload in %s"),
+			    ENV_POLICY_B64);
+
+		strbuf_addch(out, (char)((v0 << 2) | (v1 >> 4)));
+		if (v2 != -2) {
+			strbuf_addch(out, (char)(((v1 & 0xf) << 4) | (v2 >> 2)));
+			if (v3 != -2)
+				strbuf_addch(out, (char)(((v2 & 0x3) << 6) | v3));
+		}
+	}
+}
 
 static void policy_expect(struct textil_json_ctx *ctx, char expected)
 {
@@ -458,48 +515,70 @@ static void parse_policy(struct textil_json_ctx *ctx,
 
 void textil_ext_policy_init(void)
 {
-	const char *env_path, *env_version;
+	const char *env_json, *env_b64, *env_path, *env_version;
+	int source_count = 0;
+	const char *loaded_from = NULL;
 	struct strbuf json_buf = STRBUF_INIT;
 	struct textil_json_ctx ctx;
 
+	env_json = getenv(ENV_POLICY_JSON);
+	env_b64 = getenv(ENV_POLICY_B64);
 	env_path = getenv(ENV_POLICY_PATH);
 	env_version = getenv(ENV_POLICY_VERSION);
+	source_count += !!env_json;
+	source_count += !!env_b64;
+	source_count += !!env_path;
 
 	/* Both unset: disabled (normal git operation) */
-	if (!env_path && !env_version) {
+	if (!source_count && !env_version) {
 		trace_printf_key(&trace_textil_ext,
 				 "textil-ext: policy disabled (env not set)\n");
 		return;
 	}
 
 	/* Partial configuration: fatal */
-	if (!env_path)
-		die(_("textil-ext: %s is set but %s is not"),
-		    ENV_POLICY_VERSION, ENV_POLICY_PATH);
 	if (!env_version)
-		die(_("textil-ext: %s is set but %s is not"),
-		    ENV_POLICY_PATH, ENV_POLICY_VERSION);
+		die(_("textil-ext: policy source env is set but %s is not"),
+		    ENV_POLICY_VERSION);
+	if (!source_count)
+		die(_("textil-ext: %s is set but no policy source env is set"),
+		    ENV_POLICY_VERSION);
+	if (source_count > 1)
+		die(_("textil-ext: policy source envs are mutually exclusive "
+		      "(set only one of %s, %s, %s)"),
+		    ENV_POLICY_JSON, ENV_POLICY_B64, ENV_POLICY_PATH);
 
 	/* Version check (env) */
 	if (strcmp(env_version, EXPECTED_VERSION))
 		die(_("textil-ext: unsupported policy version '%s' "
 		      "(expected '%s')"), env_version, EXPECTED_VERSION);
 
-	/* Absolute path check */
-	if (!is_absolute_path(env_path))
-		die(_("textil-ext: %s must be an absolute path, got '%s'"),
-		    ENV_POLICY_PATH, env_path);
+	if (env_json) {
+		if (!*env_json)
+			die(_("textil-ext: %s must not be empty"), ENV_POLICY_JSON);
+		strbuf_addstr(&json_buf, env_json);
+		loaded_from = "env:TEXTIL_GIT_EXT_POLICY_JSON";
+	} else if (env_b64) {
+		decode_policy_base64(env_b64, &json_buf);
+		loaded_from = "env:TEXTIL_GIT_EXT_POLICY_B64";
+	} else {
+		/* Absolute path check */
+		if (!is_absolute_path(env_path))
+			die(_("textil-ext: %s must be an absolute path, got '%s'"),
+			    ENV_POLICY_PATH, env_path);
 
-	/* Read the file */
-	if (strbuf_read_file(&json_buf, env_path, 0) < 0)
-		die_errno(_("textil-ext: unable to read policy file '%s'"),
-			  env_path);
+		/* Read the file */
+		if (strbuf_read_file(&json_buf, env_path, 0) < 0)
+			die_errno(_("textil-ext: unable to read policy file '%s'"),
+				  env_path);
+		loaded_from = env_path;
+	}
 
 	/* Strict parse */
 	ctx.buf = json_buf.buf;
 	ctx.pos = 0;
 	ctx.len = json_buf.len;
-	policy_parse_path = env_path;
+	policy_parse_path = loaded_from;
 	parse_policy(&ctx, &the_policy);
 	policy_parse_path = NULL;
 
@@ -508,7 +587,7 @@ void textil_ext_policy_init(void)
 	policy_active = 1;
 	trace_printf_key(&trace_textil_ext,
 			 "textil-ext: policy loaded from '%s' (%d rules)\n",
-			 env_path, the_policy.nr_rules);
+			 loaded_from, the_policy.nr_rules);
 }
 
 int textil_ext_policy_is_active(void)

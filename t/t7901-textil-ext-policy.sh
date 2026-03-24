@@ -33,9 +33,22 @@ test_expect_success 'no env vars: git operates normally' '
 	git init normal-repo &&
 	(
 		cd normal-repo &&
+		unset TEXTIL_GIT_EXT_POLICY_JSON &&
+		unset TEXTIL_GIT_EXT_POLICY_B64 &&
 		unset TEXTIL_GIT_EXT_POLICY_PATH &&
 		unset TEXTIL_GIT_EXT_POLICY_VERSION &&
 		git status
+	)
+'
+
+test_expect_success 'only JSON set: fatal error' '
+	git init only-json &&
+	(
+		cd only-json &&
+		test_must_fail env \
+			TEXTIL_GIT_EXT_POLICY_JSON="{\"version\":\"v1\",\"rules\":[]}" \
+			git status 2>err &&
+		grep "policy source env is set but TEXTIL_GIT_EXT_POLICY_VERSION is not" err
 	)
 '
 
@@ -47,7 +60,7 @@ test_expect_success 'only PATH set: fatal error' '
 		test_must_fail env \
 			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy.json" \
 			git status 2>err &&
-		grep "TEXTIL_GIT_EXT_POLICY_PATH.*set but.*TEXTIL_GIT_EXT_POLICY_VERSION.*not" err
+		grep "policy source env is set but TEXTIL_GIT_EXT_POLICY_VERSION is not" err
 	)
 '
 
@@ -58,7 +71,7 @@ test_expect_success 'only VERSION set: fatal error' '
 		test_must_fail env \
 			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
 			git status 2>err &&
-		grep "TEXTIL_GIT_EXT_POLICY_VERSION.*set but.*TEXTIL_GIT_EXT_POLICY_PATH.*not" err
+		grep "TEXTIL_GIT_EXT_POLICY_VERSION is set but no policy source env is set" err
 	)
 '
 
@@ -108,7 +121,18 @@ test_expect_success 'valid policy: git operates normally' '
 		cd valid-policy &&
 		write_valid_policy ../policy-ok.json &&
 		env \
-			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-ok.json" \
+			TEXTIL_GIT_EXT_POLICY_JSON="$(tr -d '\''\n\t '\'' < ../policy-ok.json)" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			git status
+	)
+'
+
+test_expect_success 'valid base64 policy: git operates normally' '
+	git init valid-policy-b64 &&
+	(
+		cd valid-policy-b64 &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_B64=eyJ2ZXJzaW9uIjoidjEiLCJydWxlcyI6W3siaWQiOiJsZnMtdGFrZW92ZXIiLCJwaGFzZXMiOlsibWF0ZXJpYWxpemUiLCJjaGVja2luX2NvbnZlcnQiXSwic2VsZWN0b3IiOnsiYXR0cl9maWx0ZXJfZXF1YWxzIjoibGZzIiwicmVndWxhcl9maWxlX29ubHkiOnRydWV9LCJhY3Rpb24iOiJ0YWtlb3ZlciIsInN0cmljdCI6dHJ1ZSwiZmFsbGJhY2siOiJkZW55IiwicmVxdWlyZWRfY2FwYWJpbGl0aWVzIjpbImxmcy1wcmVmbGlnaHQiLCJsZnMtbWF0ZXJpYWxpemUiLCJsZnMtY2hlY2tpbi1jb252ZXJ0Il19XX0= \
 			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
 			git status
 	)
@@ -120,10 +144,10 @@ test_expect_success 'valid policy: trace shows loaded with rule count' '
 		cd trace-check &&
 		write_valid_policy ../policy-trace.json &&
 		GIT_TRACE_TEXTIL_EXT=1 env \
-			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-trace.json" \
+			TEXTIL_GIT_EXT_POLICY_JSON="$(tr -d '\''\n\t '\'' < ../policy-trace.json)" \
 			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
 			git status 2>trace_out &&
-		grep "policy loaded" trace_out &&
+		grep "policy loaded from '\''env:TEXTIL_GIT_EXT_POLICY_JSON'\''" trace_out &&
 		grep "1 rules" trace_out
 	)
 '
@@ -132,10 +156,36 @@ test_expect_success 'no env: trace shows disabled message' '
 	git init trace-disabled &&
 	(
 		cd trace-disabled &&
+		unset TEXTIL_GIT_EXT_POLICY_JSON &&
+		unset TEXTIL_GIT_EXT_POLICY_B64 &&
 		unset TEXTIL_GIT_EXT_POLICY_PATH &&
 		unset TEXTIL_GIT_EXT_POLICY_VERSION &&
 		GIT_TRACE_TEXTIL_EXT=1 git status 2>trace_out &&
 		grep "policy disabled" trace_out
+	)
+'
+
+test_expect_success 'reject: invalid base64 payload' '
+	git init reject-bad-b64 &&
+	(
+		cd reject-bad-b64 &&
+		test_must_fail env \
+			TEXTIL_GIT_EXT_POLICY_B64="not-base64***" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			git status 2>err &&
+		grep "invalid base64 policy payload" err
+	)
+'
+
+test_expect_success 'reject: malformed direct JSON payload' '
+	git init reject-bad-json-env &&
+	(
+		cd reject-bad-json-env &&
+		test_must_fail env \
+			TEXTIL_GIT_EXT_POLICY_JSON="{\"version\":\"v1\",\"rules\":[}" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			git status 2>err &&
+		grep "parse error" err
 	)
 '
 

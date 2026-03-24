@@ -2,17 +2,18 @@
 #define TEXTIL_EXT_EXECUTOR_H
 
 #include "strbuf.h"
+#include "string-list.h"
 
 /*
- * Textil Git Extension Takeover Executor
+ * Textil Git Extension Controller Client
  *
  * Phase1-7: batch payload contract.
  * Phase1-8a: IPC transport via Git's simple-ipc API.
  * Phase1-8c: pkt-line v1 payload (replaced JSON).
  *
- * The executor receives a batch of takeover candidates collected
- * during preflight, encodes them as pkt-line v1, and sends them to the
- * Textil backend controller via simple-ipc.
+ * The executor receives a batch of takeover candidates collected during
+ * preflight, encodes them as pkt-line v1, and sends them to the Textil
+ * backend controller via simple-ipc.
  *
  * Env contract:
  *   TEXTIL_GIT_EXT_ENDPOINT - path to the IPC socket/pipe.
@@ -100,25 +101,53 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 	const struct textil_ext_takeover_batch *batch,
 	struct strbuf *err);
 
-struct string_list; /* forward declaration */
 struct textil_ext_eval_result; /* forward declaration (textil-ext-policy.h) */
 struct object_id; /* forward declaration (hash.h) */
+struct strbuf; /* forward declaration */
 
 /*
- * Execute a materialize takeover batch and return src_paths.
+ * Ordered materialize resolution result.
  *
- * Like textil_ext_execute_takeover_batch(), but for the materialize
- * phase.  On OK, src_paths_out is populated with one absolute path
- * per batch item.  The caller must verify src_paths_out->nr ==
- * batch->nr_items (mismatch is an error).
+ * `src_paths` is owned by the result object and preserves the same order as
+ * the batch items that were sent to the backend. The executor validates that
+ * the reply count matches the batch count before returning OK.
  *
- * src_paths_out must be initialized by the caller (STRING_LIST_INIT_DUP).
- * The caller is responsible for calling string_list_clear() on it.
+ * Lifetime:
+ *   - initialize with textil_ext_materialize_batch_result_init()
+ *   - release with textil_ext_materialize_batch_result_release()
+ */
+struct textil_ext_materialize_batch_result {
+	struct string_list src_paths;
+};
+
+void textil_ext_materialize_batch_result_init(
+	struct textil_ext_materialize_batch_result *result);
+void textil_ext_materialize_batch_result_release(
+	struct textil_ext_materialize_batch_result *result);
+
+/*
+ * Resolve materialize src_paths for a batch.
+ *
+ * This is the primary hot-path materialize executor API. It sends one batch
+ * request over IPC, parses one ordered batch reply, and returns one src_path
+ * per batch item in the same order as the request.
  *
  * Preconditions:
  *   - batch->phase == TEXTIL_EXT_EXEC_PHASE_MATERIALIZE
  *   - batch->nr_items > 0
- *   - src_paths_out is initialized
+ *   - result_out is initialized with
+ *     textil_ext_materialize_batch_result_init()
+ */
+enum textil_ext_executor_status textil_ext_resolve_materialize_batch(
+	const struct textil_ext_takeover_batch *batch,
+	struct textil_ext_materialize_batch_result *result_out,
+	struct strbuf *err);
+
+/*
+ * Compatibility adapter: forwards to the batch-first controller resolution
+ * API and copies the ordered src_paths into the caller-owned string_list.
+ *
+ * This helper is not the conceptual center of the design.
  */
 enum textil_ext_executor_status textil_ext_execute_materialize_batch(
 	const struct textil_ext_takeover_batch *batch,
@@ -126,8 +155,11 @@ enum textil_ext_executor_status textil_ext_execute_materialize_batch(
 	struct strbuf *err);
 
 /*
- * Inspect a blob object and report whether its content is a valid Git LFS
- * pointer blob.
+ * Compatibility helper retained for downstream checkout callers that have not
+ * migrated to generic takeover handling yet.
+ *
+ * This helper is not used by preflight collection or the executor's generic
+ * production flow in this file.
  *
  * Returns 0 on success and sets *is_pointer to 1 or 0.
  * Returns -1 on object read/type failure and appends a diagnostic to err.
@@ -138,11 +170,11 @@ int textil_ext_blob_oid_is_lfs_pointer(
 	struct strbuf *err);
 
 /*
- * High-level helper: materialize a single file to an open fd.
+ * High-level helper: resolve and copy a single file to an open fd.
  *
- * Builds a 1-item materialize batch from the eval_result and file
- * metadata, calls textil_ext_execute_materialize_batch(), opens the
- * returned src_path, and copies content to out_fd via copy_fd().
+ * Builds a 1-item materialize batch from the eval_result and file metadata,
+ * calls the batch-first materialize resolution API, opens the returned
+ * src_path, and copies content to out_fd via copy_fd().
  * All internal resources (batch, string_list, strbuf) are cleaned up.
  *
  * Returns 0 on success, -1 on any failure (error() already emitted).
@@ -161,9 +193,8 @@ int textil_ext_materialize_one_to_fd(
  * Execute a checkin_convert takeover batch and return src_paths.
  *
  * Like textil_ext_execute_materialize_batch(), but for the checkin_convert
- * phase.  The backend reads the input file (item->input_path), generates
- * the converted output (e.g. LFS pointer), writes it to a temp file, and
- * returns the src_path.
+ * phase.  The backend reads the input file (item->input_path), writes the
+ * converted output to a temp file, and returns the src_path.
  *
  * Preconditions:
  *   - batch->phase == TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT
@@ -234,12 +265,12 @@ void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch);
 struct index_state; /* forward declaration */
 
 /*
- * Scan the index for checkout candidates matching a takeover policy rule
- * and collect them into batch_out.
+ * Scan the index for checkout candidates matching a takeover policy rule and
+ * collect them into batch_out.
  *
  * Only considers entries with CE_UPDATE flag (checkout candidates) that
- * are regular files.  Evaluates the preflight policy for each candidate;
- * items whose matched rule action is takeover are added to the batch.
+ * are regular files. Evaluates the preflight policy for each candidate; items
+ * whose matched rule action is takeover are added to the batch in index order.
  *
  * batch_out must be zero-initialized by the caller.
  * On return, batch_out->items is heap-allocated (caller must free).

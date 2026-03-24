@@ -8,10 +8,13 @@
  * Phase1-4: strict JSON parse + typed structs + rule evaluation
  *
  * Env contract:
+ *   TEXTIL_GIT_EXT_POLICY_JSON    - policy.v1.json payload
+ *   TEXTIL_GIT_EXT_POLICY_B64     - base64-encoded policy.v1.json payload
  *   TEXTIL_GIT_EXT_POLICY_PATH    - absolute path to policy.v1.json
  *   TEXTIL_GIT_EXT_POLICY_VERSION - must be "v1"
  *
- * Both must be set or both unset.  Partial configuration is a fatal error.
+ * Exactly one policy source env and TEXTIL_GIT_EXT_POLICY_VERSION must be set.
+ * All unset disables the subsystem. Partial or conflicting configuration is fatal.
  */
 
 /* --- Enums ------------------------------------------------------------ */
