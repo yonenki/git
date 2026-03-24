@@ -19,10 +19,12 @@
 #include "textil-ext-executor.h"
 #include "thread-utils.h"
 #include "trace2.h"
+#include "copy.h"
 
 struct pc_worker {
 	struct child_process cp;
-	size_t next_item_to_complete, nr_items_to_complete;
+	size_t *item_ids;
+	size_t next_result_index, nr_items_to_complete;
 };
 
 struct parallel_checkout {
@@ -190,6 +192,20 @@ static void advance_progress_meter(void)
 	}
 }
 
+struct pc_takeover_candidate {
+	size_t item_id;
+	struct textil_ext_eval_result eval_result;
+};
+
+static int pc_item_is_takeover_candidate(struct parallel_checkout_item *pc_item,
+					 struct textil_ext_eval_result *ext_result)
+{
+	textil_ext_evaluate_for_checkout(
+		conv_attrs_filter_name(&pc_item->ca), 1, ext_result);
+	return ext_result->matched &&
+		ext_result->action == TEXTIL_ACTION_TAKEOVER;
+}
+
 static int handle_results(struct checkout *state)
 {
 	int ret = 0;
@@ -268,6 +284,26 @@ static int reset_fd(int fd, const char *path)
 	return 0;
 }
 
+static int copy_materialized_src_path_to_fd(const char *src_path, int out_fd,
+					    const char *path)
+{
+	int src_fd = open(src_path, O_RDONLY);
+
+	if (src_fd < 0)
+		return error_errno("textil-ext: cannot open src_path '%s'",
+				   src_path);
+	if (copy_fd(src_fd, out_fd)) {
+		close(src_fd);
+		return error("textil-ext: copy_fd failed for '%s'", path);
+	}
+	if (close(src_fd))
+		return error_errno("textil-ext: cannot close src_path '%s'",
+				   src_path);
+	return 0;
+}
+
+static int close_and_clear(int *fd);
+
 static int write_pc_item_to_fd(struct parallel_checkout_item *pc_item, int fd,
 			       const char *path)
 {
@@ -280,50 +316,6 @@ static int write_pc_item_to_fd(struct parallel_checkout_item *pc_item, int fd,
 
 	/* Sanity check */
 	ASSERT(is_eligible_for_parallel_checkout(pc_item->ce, &pc_item->ca));
-
-	{
-		struct textil_ext_eval_result ext_result;
-		textil_ext_evaluate_for_checkout(
-			conv_attrs_filter_name(&pc_item->ca), 1, &ext_result);
-
-		if (ext_result.matched &&
-		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
-			struct strbuf pointer_err = STRBUF_INIT;
-			int is_pointer = 0;
-
-			if (textil_ext_blob_oid_is_lfs_pointer(&pc_item->ce->oid,
-							       &is_pointer,
-							       &pointer_err)) {
-				error("%s", pointer_err.buf);
-				strbuf_release(&pointer_err);
-				return -1;
-			}
-			strbuf_release(&pointer_err);
-			if (!is_pointer)
-				goto no_takeover;
-
-			/* Materialize via executor helper */
-			struct strbuf mat_err = STRBUF_INIT;
-			int ret;
-
-			{
-				struct strbuf main_wt = STRBUF_INIT;
-				textil_ext_resolve_main_worktree(&main_wt);
-				ret = textil_ext_materialize_one_to_fd(
-					pc_item->ce->name, &pc_item->ce->oid,
-					conv_attrs_filter_name(&pc_item->ca),
-					&ext_result,
-					main_wt.buf,
-					fd, &mat_err);
-				strbuf_release(&main_wt);
-			}
-			strbuf_release(&mat_err);
-			return ret;
-		}
-	}
-
-no_takeover:
-
 	filter = get_stream_filter_ca(&pc_item->ca, &pc_item->ce->oid);
 	if (filter) {
 		if (odb_stream_blob_to_fd(the_repository->objects, fd,
@@ -363,6 +355,65 @@ no_takeover:
 		return error("unable to write file '%s'", path);
 
 	return 0;
+}
+
+static void write_pc_item_from_materialized_path(struct parallel_checkout_item *pc_item,
+						 struct checkout *state,
+						 const char *src_path)
+{
+	unsigned int mode = (pc_item->ce->ce_mode & 0100) ? 0777 : 0666;
+	int fd = -1, fstat_done = 0;
+	struct strbuf path = STRBUF_INIT;
+	const char *dir_sep;
+
+	strbuf_add(&path, state->base_dir, state->base_dir_len);
+	strbuf_add(&path, pc_item->ce->name, pc_item->ce->ce_namelen);
+
+	dir_sep = find_last_dir_sep(path.buf);
+	if (dir_sep && !has_dirs_only_path(path.buf, dir_sep - path.buf,
+					   state->base_dir_len)) {
+		pc_item->status = PC_ITEM_COLLIDED;
+		trace2_data_string("pcheckout", NULL, "collision/dirname", path.buf);
+		goto out;
+	}
+
+	fd = open(path.buf, O_WRONLY | O_CREAT | O_EXCL, mode);
+	if (fd < 0) {
+		if (errno == EEXIST || errno == EISDIR) {
+			pc_item->status = PC_ITEM_COLLIDED;
+			trace2_data_string("pcheckout", NULL,
+					   "collision/basename", path.buf);
+		} else {
+			error_errno("failed to open file '%s'", path.buf);
+			pc_item->status = PC_ITEM_FAILED;
+		}
+		goto out;
+	}
+
+	if (copy_materialized_src_path_to_fd(src_path, fd, path.buf)) {
+		pc_item->status = PC_ITEM_FAILED;
+		close_and_clear(&fd);
+		unlink(path.buf);
+		goto out;
+	}
+
+	fstat_done = fstat_checkout_output(fd, state, &pc_item->st);
+	if (close_and_clear(&fd)) {
+		error_errno("unable to close file '%s'", path.buf);
+		pc_item->status = PC_ITEM_FAILED;
+		goto out;
+	}
+
+	if (state->refresh_cache && !fstat_done && lstat(path.buf, &pc_item->st) < 0) {
+		error_errno("unable to stat just-written file '%s'", path.buf);
+		pc_item->status = PC_ITEM_FAILED;
+		goto out;
+	}
+
+	pc_item->status = PC_ITEM_WRITTEN;
+
+out:
+	strbuf_release(&path);
 }
 
 static int close_and_clear(int *fd)
@@ -452,11 +503,12 @@ out:
 	strbuf_release(&path);
 }
 
-static void send_one_item(int fd, struct parallel_checkout_item *pc_item)
+static void send_one_item(int fd, size_t item_id)
 {
 	size_t len_data;
 	char *data, *variant;
 	struct pc_item_fixed_portion *fixed_portion;
+	struct parallel_checkout_item *pc_item = &parallel_checkout.items[item_id];
 	const char *working_tree_encoding = pc_item->ca.working_tree_encoding;
 	size_t name_len = pc_item->ce->ce_namelen;
 	size_t working_tree_encoding_len = working_tree_encoding ?
@@ -492,57 +544,218 @@ static void send_one_item(int fd, struct parallel_checkout_item *pc_item)
 	free(data);
 }
 
-static void send_batch(int fd, size_t start, size_t nr)
+static void send_batch(int fd, const size_t *item_ids, size_t nr)
 {
 	size_t i;
 	sigchain_push(SIGPIPE, SIG_IGN);
 	for (i = 0; i < nr; i++)
-		send_one_item(fd, &parallel_checkout.items[start + i]);
+		send_one_item(fd, item_ids[i]);
 	packet_flush(fd);
 	sigchain_pop(SIGPIPE);
 }
 
-static struct pc_worker *setup_workers(struct checkout *state, int num_workers)
+static int resolve_takeover_batch(
+	const struct pc_takeover_candidate *candidates, size_t nr_candidates,
+	struct textil_ext_materialize_batch_result *result,
+	struct strbuf *err)
+{
+	struct textil_ext_takeover_batch batch;
+	struct textil_ext_takeover_item *items;
+	struct strbuf main_wt = STRBUF_INIT;
+	enum textil_ext_executor_status status;
+	size_t i;
+
+	memset(&batch, 0, sizeof(batch));
+	CALLOC_ARRAY(items, nr_candidates);
+
+	for (i = 0; i < nr_candidates; i++) {
+		const struct parallel_checkout_item *pc_item =
+			&parallel_checkout.items[candidates[i].item_id];
+		const struct textil_ext_eval_result *ext_result =
+			&candidates[i].eval_result;
+
+		items[i].path = xstrdup(pc_item->ce->name);
+		items[i].rule_id = ext_result->rule_id;
+		items[i].attr_filter = conv_attrs_filter_name(&pc_item->ca) ?
+			xstrdup(conv_attrs_filter_name(&pc_item->ca)) : NULL;
+		items[i].blob_oid = xstrdup(oid_to_hex(&pc_item->ce->oid));
+		items[i].is_regular_file = 1;
+		items[i].strict = ext_result->strict;
+		items[i].capabilities = ext_result->capabilities;
+		items[i].nr_capabilities = ext_result->nr_capabilities;
+	}
+
+	textil_ext_resolve_main_worktree(&main_wt);
+	batch.phase = TEXTIL_EXT_EXEC_PHASE_MATERIALIZE;
+	batch.operation = "checkout";
+	batch.repo_root = main_wt.buf;
+	batch.items = items;
+	batch.nr_items = (int)nr_candidates;
+
+	status = textil_ext_resolve_materialize_batch(&batch, result, err);
+	strbuf_release(&main_wt);
+	textil_ext_takeover_batch_release(&batch);
+	free(items);
+
+	return status == TEXTIL_EXT_EXECUTOR_OK ? 0 : -1;
+}
+
+static void mark_takeover_batch_failed(
+	const struct pc_takeover_candidate *candidates, size_t nr_candidates)
+{
+	size_t i;
+
+	for (i = 0; i < nr_candidates; i++) {
+		struct parallel_checkout_item *pc_item =
+			&parallel_checkout.items[candidates[i].item_id];
+		pc_item->status = PC_ITEM_FAILED;
+		advance_progress_meter();
+	}
+}
+
+static int materialize_takeover_batch(
+	const struct pc_takeover_candidate *candidates, size_t nr_candidates,
+	struct checkout *state)
+{
+	struct textil_ext_materialize_batch_result result;
+	struct strbuf err = STRBUF_INIT;
+	size_t i;
+	int ret = 0;
+
+	textil_ext_materialize_batch_result_init(&result);
+	if (resolve_takeover_batch(candidates, nr_candidates, &result, &err)) {
+		error("textil-ext: materialize batch failed: %s", err.buf);
+		strbuf_release(&err);
+		textil_ext_materialize_batch_result_release(&result);
+		mark_takeover_batch_failed(candidates, nr_candidates);
+		return -1;
+	}
+	strbuf_release(&err);
+
+	if (result.src_paths.nr != nr_candidates)
+		BUG("materialize batch returned %lu src_paths for %d checkout items",
+		    (unsigned long)result.src_paths.nr, (int)nr_candidates);
+
+	for (i = 0; i < nr_candidates; i++) {
+		struct parallel_checkout_item *pc_item =
+			&parallel_checkout.items[candidates[i].item_id];
+		write_pc_item_from_materialized_path(pc_item, state,
+						     result.src_paths.items[i].string);
+		if (pc_item->status != PC_ITEM_COLLIDED)
+			advance_progress_meter();
+		if (pc_item->status == PC_ITEM_FAILED)
+			ret = -1;
+	}
+
+	textil_ext_materialize_batch_result_release(&result);
+	return ret;
+}
+
+static int range_has_takeover_candidates(size_t start, size_t end)
+{
+	size_t item_id;
+
+	for (item_id = start; item_id < end; item_id++) {
+		struct textil_ext_eval_result ext_result;
+		if (pc_item_is_takeover_candidate(&parallel_checkout.items[item_id],
+						  &ext_result))
+			return 1;
+	}
+
+	return 0;
+}
+
+static void write_range_in_order(struct checkout *state, size_t start, size_t end)
+{
+	size_t item_id = start;
+
+	while (item_id < end) {
+		struct parallel_checkout_item *pc_item = &parallel_checkout.items[item_id];
+		struct textil_ext_eval_result ext_result;
+
+		if (pc_item_is_takeover_candidate(pc_item, &ext_result)) {
+			struct pc_takeover_candidate *takeovers = NULL;
+			size_t takeovers_nr = 0, takeovers_alloc = 0;
+
+			do {
+				ALLOC_GROW(takeovers, takeovers_nr + 1, takeovers_alloc);
+				takeovers[takeovers_nr].item_id = item_id;
+				takeovers[takeovers_nr].eval_result = ext_result;
+				takeovers_nr++;
+				item_id++;
+			} while (item_id < end &&
+				 pc_item_is_takeover_candidate(
+					 &parallel_checkout.items[item_id], &ext_result));
+
+			materialize_takeover_batch(takeovers, takeovers_nr, state);
+			free(takeovers);
+			continue;
+		}
+
+		write_pc_item(pc_item, state);
+		if (pc_item->status != PC_ITEM_COLLIDED)
+			advance_progress_meter();
+		item_id++;
+	}
+}
+
+static struct pc_worker *setup_workers(struct checkout *state, int num_workers,
+				       int *active_workers_out)
 {
 	struct pc_worker *workers;
-	int i, workers_with_one_extra_item;
+	int i, active_workers = 0, workers_with_one_extra_item;
 	size_t base_batch_size, batch_beginning = 0;
 
 	ALLOC_ARRAY(workers, num_workers);
-
-	for (i = 0; i < num_workers; i++) {
-		struct child_process *cp = &workers[i].cp;
-
-		child_process_init(cp);
-		cp->git_cmd = 1;
-		cp->in = -1;
-		cp->out = -1;
-		cp->clean_on_exit = 1;
-		strvec_push(&cp->args, "checkout--worker");
-		if (state->base_dir_len)
-			strvec_pushf(&cp->args, "--prefix=%s", state->base_dir);
-		if (start_command(cp))
-			die("failed to spawn checkout worker");
-	}
+	memset(workers, 0, sizeof(*workers) * num_workers);
 
 	base_batch_size = parallel_checkout.nr / num_workers;
 	workers_with_one_extra_item = parallel_checkout.nr % num_workers;
 
 	for (i = 0; i < num_workers; i++) {
-		struct pc_worker *worker = &workers[i];
 		size_t batch_size = base_batch_size;
+		size_t batch_end;
+		size_t *worker_item_ids = NULL;
+		size_t worker_nr = 0, worker_alloc = 0;
 
 		/* distribute the extra work evenly */
 		if (i < workers_with_one_extra_item)
 			batch_size++;
+		batch_end = batch_beginning + batch_size;
 
-		send_batch(worker->cp.in, batch_beginning, batch_size);
-		worker->next_item_to_complete = batch_beginning;
-		worker->nr_items_to_complete = batch_size;
+		if (range_has_takeover_candidates(batch_beginning, batch_end)) {
+			write_range_in_order(state, batch_beginning, batch_end);
+		} else if (batch_size) {
+			struct pc_worker *worker = &workers[active_workers];
+			struct child_process *cp = &worker->cp;
+			size_t item_id;
 
+			for (item_id = batch_beginning; item_id < batch_end; item_id++) {
+				ALLOC_GROW(worker_item_ids, worker_nr + 1, worker_alloc);
+				worker_item_ids[worker_nr++] = item_id;
+			}
+
+			child_process_init(cp);
+			cp->git_cmd = 1;
+			cp->in = -1;
+			cp->out = -1;
+			cp->clean_on_exit = 1;
+			strvec_push(&cp->args, "checkout--worker");
+			if (state->base_dir_len)
+				strvec_pushf(&cp->args, "--prefix=%s", state->base_dir);
+			if (start_command(cp))
+				die("failed to spawn checkout worker");
+
+			send_batch(worker->cp.in, worker_item_ids, worker_nr);
+			worker->item_ids = worker_item_ids;
+			worker->next_result_index = 0;
+			worker->nr_items_to_complete = worker_nr;
+			active_workers++;
+		}
 		batch_beginning += batch_size;
 	}
 
+	*active_workers_out = active_workers;
 	return workers;
 }
 
@@ -574,6 +787,8 @@ static void finish_workers(struct pc_worker *workers, int num_workers)
 		}
 	}
 
+	for (i = 0; i < num_workers; i++)
+		free(workers[i].item_ids);
 	free(workers);
 }
 
@@ -610,11 +825,12 @@ static void parse_and_save_result(const char *buffer, int len,
 
 	if (!worker->nr_items_to_complete)
 		BUG("received result from supposedly finished checkout worker");
-	if (res->id != worker->next_item_to_complete)
+	if (res->id != worker->item_ids[worker->next_result_index])
 		BUG("unexpected item id from checkout worker (got %"PRIuMAX", exp %"PRIuMAX")",
-		    (uintmax_t)res->id, (uintmax_t)worker->next_item_to_complete);
+		    (uintmax_t)res->id,
+		    (uintmax_t)worker->item_ids[worker->next_result_index]);
 
-	worker->next_item_to_complete++;
+	worker->next_result_index++;
 	worker->nr_items_to_complete--;
 
 	pc_item = &parallel_checkout.items[res->id];
@@ -683,14 +899,7 @@ static void gather_results_from_workers(struct pc_worker *workers,
 
 static void write_items_sequentially(struct checkout *state)
 {
-	size_t i;
-
-	for (i = 0; i < parallel_checkout.nr; i++) {
-		struct parallel_checkout_item *pc_item = &parallel_checkout.items[i];
-		write_pc_item(pc_item, state);
-		if (pc_item->status != PC_ITEM_COLLIDED)
-			advance_progress_meter();
-	}
+	write_range_in_order(state, 0, parallel_checkout.nr);
 }
 
 int run_parallel_checkout(struct checkout *state, int num_workers, int threshold,
@@ -711,9 +920,15 @@ int run_parallel_checkout(struct checkout *state, int num_workers, int threshold
 	if (num_workers <= 1 || parallel_checkout.nr < threshold) {
 		write_items_sequentially(state);
 	} else {
-		struct pc_worker *workers = setup_workers(state, num_workers);
-		gather_results_from_workers(workers, num_workers);
-		finish_workers(workers, num_workers);
+		int active_workers;
+		struct pc_worker *workers =
+			setup_workers(state, num_workers, &active_workers);
+		if (active_workers) {
+			gather_results_from_workers(workers, active_workers);
+			finish_workers(workers, active_workers);
+		} else {
+			free(workers);
+		}
 	}
 
 	ret = handle_results(state);

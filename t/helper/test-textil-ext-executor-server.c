@@ -59,6 +59,8 @@ enum reply_mode {
 	REPLY_MATERIALIZE_SRC_PATH_WITH_STATUS_ERROR,
 	REPLY_MATERIALIZE_OK_WITHOUT_SRC_PATH,
 	REPLY_MATERIALIZE_OK_WITH_MESSAGE,
+	REPLY_MATERIALIZE_SRC_PATH_WINDOWS_VERBATIM,
+	REPLY_MATERIALIZE_SRC_PATH_WINDOWS_UNC,
 	REPLY_MATERIALIZE_CHECKOUT,
 	REPLY_MATERIALIZE_COUNT_MISMATCH,
 	REPLY_VALIDATE_REQUEST_MATERIALIZE,
@@ -76,6 +78,29 @@ static struct {
 	.mode = REPLY_OK,
 	.nr_threads = 1,
 	.max_wait_sec = 30,
+};
+
+/* send-preflight のオプション値。トップレベルで解析する。 */
+static struct {
+	const char *path;
+	int path_inject_lf;
+	const char *rule_id;
+	const char *attr_filter;
+	const char *blob_oid;
+	const char *operation;
+	const char *repo_root;
+	int strict;
+	int regular_file;
+} preflight_args = {
+	.path = NULL,
+	.path_inject_lf = 0,
+	.rule_id = "lfs-takeover",
+	.attr_filter = "lfs",
+	.blob_oid = "aabbccdd00112233445566778899aabbccddeeff",
+	.operation = "checkout",
+	.repo_root = "/tmp/fake-repo",
+	.strict = 1,
+	.regular_file = 1,
 };
 
 static enum reply_mode parse_reply_mode(const char *s)
@@ -126,6 +151,10 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_MATERIALIZE_OK_WITHOUT_SRC_PATH;
 	if (!strcmp(s, "materialize-ok-with-message"))
 		return REPLY_MATERIALIZE_OK_WITH_MESSAGE;
+	if (!strcmp(s, "materialize-src-path-windows-verbatim"))
+		return REPLY_MATERIALIZE_SRC_PATH_WINDOWS_VERBATIM;
+	if (!strcmp(s, "materialize-src-path-windows-unc"))
+		return REPLY_MATERIALIZE_SRC_PATH_WINDOWS_UNC;
 	if (!strcmp(s, "materialize-checkout"))
 		return REPLY_MATERIALIZE_CHECKOUT;
 	if (!strcmp(s, "materialize-count-mismatch"))
@@ -720,6 +749,26 @@ static int app_cb(void *application_data UNUSED,
 		strbuf_release(&reply);
 		return ret;
 
+	case REPLY_MATERIALIZE_SRC_PATH_WINDOWS_VERBATIM:
+		packet_buf_write(&reply, "status=ok\n");
+		packet_buf_delim(&reply);
+		packet_buf_write(&reply,
+				 "src_path=\\\\?\\C:\\textil\\materialize\\aa\\bb\\aabb1234.bin\n");
+		packet_buf_flush(&reply);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
+	case REPLY_MATERIALIZE_SRC_PATH_WINDOWS_UNC:
+		packet_buf_write(&reply, "status=ok\n");
+		packet_buf_delim(&reply);
+		packet_buf_write(&reply,
+				 "src_path=\\\\server\\share\\textil\\materialize\\aa\\bb\\aabb1234.bin\n");
+		packet_buf_flush(&reply);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
 	case REPLY_MATERIALIZE_CHECKOUT: {
 		/*
 		 * Parse request to extract item paths, create temp files
@@ -1145,6 +1194,24 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 			    N_("server threads")),
 		OPT_INTEGER(0, "max-wait", &server_args.max_wait_sec,
 			    N_("seconds to wait")),
+		OPT_STRING(0, "path", &preflight_args.path, N_("path"),
+			   N_("repo-relative path (send-preflight)")),
+		OPT_BOOL(0, "path-inject-lf", &preflight_args.path_inject_lf,
+			 N_("inject LF into path for validation testing")),
+		OPT_STRING(0, "rule-id", &preflight_args.rule_id, N_("id"),
+			   N_("matched rule id (send-preflight)")),
+		OPT_STRING(0, "attr-filter", &preflight_args.attr_filter,
+			   N_("val"), N_("gitattributes filter (send-preflight)")),
+		OPT_STRING(0, "blob-oid", &preflight_args.blob_oid, N_("hex"),
+			   N_("blob object id hex (send-preflight)")),
+		OPT_STRING(0, "operation", &preflight_args.operation,
+			   N_("name"), N_("operation name (send-preflight)")),
+		OPT_STRING(0, "repo-root", &preflight_args.repo_root,
+			   N_("dir"), N_("worktree root (send-preflight)")),
+		OPT_BOOL(0, "strict", &preflight_args.strict,
+			 N_("rule.strict flag (send-preflight)")),
+		OPT_BOOL(0, "regular-file", &preflight_args.regular_file,
+			 N_("is regular file (send-preflight)")),
 		OPT_END()
 	};
 
@@ -1176,6 +1243,79 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		if (client__probe_server())
 			return 1;
 		return !!client__stop_server();
+	}
+
+	/*
+	 * send-preflight: invoke textil_ext_execute_takeover_batch() with
+	 * a 1-item PREFLIGHT batch constructed from parse-options inputs.
+	 * Uses TEXTIL_GIT_EXT_ENDPOINT from env.
+	 * stdout contract mirrors send-materialize / send-checkin-convert:
+	 *   status=ok|rejected|error|not-implemented
+	 *   message=<err> (if any)
+	 * Non-OK returns nonzero.
+	 */
+	if (!strcmp(subcmd, "send-preflight")) {
+		struct textil_ext_takeover_batch batch;
+		struct textil_ext_takeover_item item;
+		struct strbuf err_buf = STRBUF_INIT;
+		enum textil_ext_executor_status st;
+
+		if (!preflight_args.path && !preflight_args.path_inject_lf)
+			die("send-preflight requires --path or --path-inject-lf");
+
+		memset(&batch, 0, sizeof(batch));
+		memset(&item, 0, sizeof(item));
+
+		if (preflight_args.path_inject_lf) {
+			/* pathにLFを含む文字列を内部生成する */
+			struct strbuf lf_path = STRBUF_INIT;
+			strbuf_addstr(&lf_path, preflight_args.path
+				      ? preflight_args.path : "bad");
+			strbuf_addch(&lf_path, '\n');
+			strbuf_addstr(&lf_path, "file.bin");
+			item.path = strbuf_detach(&lf_path, NULL);
+		} else {
+			item.path = xstrdup(preflight_args.path);
+		}
+		item.rule_id = preflight_args.rule_id;
+		item.attr_filter = xstrdup(preflight_args.attr_filter);
+		item.blob_oid = xstrdup(preflight_args.blob_oid);
+		item.input_path = NULL;
+		item.is_regular_file = preflight_args.regular_file;
+		item.strict = preflight_args.strict;
+		item.capabilities = NULL;
+		item.nr_capabilities = 0;
+
+		batch.phase = TEXTIL_EXT_EXEC_PHASE_PREFLIGHT;
+		batch.operation = preflight_args.operation;
+		batch.repo_root = preflight_args.repo_root;
+		batch.items = &item;
+		batch.nr_items = 1;
+
+		st = textil_ext_execute_takeover_batch(&batch, &err_buf);
+
+		switch (st) {
+		case TEXTIL_EXT_EXECUTOR_OK:
+			printf("status=ok\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_REJECTED:
+			printf("status=rejected\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_NOT_IMPLEMENTED:
+			printf("status=not-implemented\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_ERROR:
+			printf("status=error\n");
+			break;
+		}
+		if (err_buf.len)
+			printf("message=%s\n", err_buf.buf);
+
+		free(item.path);
+		free(item.attr_filter);
+		free(item.blob_oid);
+		strbuf_release(&err_buf);
+		return (st != TEXTIL_EXT_EXECUTOR_OK) ? 1 : 0;
 	}
 
 	/*

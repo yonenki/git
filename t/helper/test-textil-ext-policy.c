@@ -6,7 +6,7 @@
  * test-tool textil-ext-policy evaluate <phase> <attr_filter|-> <is_regular_file>
  *
  * Evaluates the loaded policy and prints the result.
- * Requires TEXTIL_GIT_EXT_POLICY_PATH and TEXTIL_GIT_EXT_POLICY_VERSION
+ * Requires a policy source env plus TEXTIL_GIT_EXT_POLICY_VERSION
  * to be set (policy_init is called by init_git via common-init.c).
  *
  * Output format (one field per line):

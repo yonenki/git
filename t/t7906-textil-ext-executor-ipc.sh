@@ -475,6 +475,26 @@ test_expect_success 'materialize-src-path-relative: C-side validates absolute pa
 	grep "^status=error$" out
 '
 
+test_expect_success MINGW 'materialize-src-path-windows-verbatim: C-side accepts verbatim drive path' '
+	restart_server materialize-src-path-windows-verbatim &&
+	env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize \
+			--name="$IPC_PATH" >out &&
+	grep "^status=ok$" out &&
+	grep "^src_path=\\\\\\\\?\\\\C:\\\\textil\\\\materialize\\\\aa\\\\bb\\\\aabb1234.bin$" out
+'
+
+test_expect_success MINGW 'materialize-src-path-windows-unc: C-side accepts UNC path' '
+	restart_server materialize-src-path-windows-unc &&
+	env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize \
+			--name="$IPC_PATH" >out &&
+	grep "^status=ok$" out &&
+	grep "^src_path=\\\\\\\\server\\\\share\\\\textil\\\\materialize\\\\aa\\\\bb\\\\aabb1234.bin$" out
+'
+
 test_expect_success 'materialize-ok-without-src-path: ok with zero src_paths is invalid' '
 	restart_server materialize-ok-without-src-path &&
 	test_must_fail env \
