@@ -481,12 +481,30 @@ static int check_updates(struct unpack_trees_options *o,
 			pf_status = textil_ext_execute_takeover_batch(
 				&pf_batch, &pf_err);
 
+		if (pf_status != TEXTIL_EXT_EXECUTOR_OK) {
+			textil_ext_takeover_batch_release(&pf_batch);
+			free(pf_batch.items);
+			strbuf_release(&main_wt);
+			die("%s", pf_err.buf);
+		}
+
+		/*
+		 * Batch-first materialize: pre-resolve ALL src_paths in one
+		 * IPC roundtrip before the per-file checkout loop in entry.c.
+		 * entry.c looks up pre-resolved paths from this cache.
+		 */
+		if (pf_batch.nr_items > 0) {
+			struct strbuf mat_err = STRBUF_INIT;
+			if (textil_ext_preresolve_materialize_cache(
+				    &pf_batch, &mat_err))
+				die("textil-ext: materialize pre-resolution failed: %s",
+				    mat_err.buf);
+			strbuf_release(&mat_err);
+		}
+
 		textil_ext_takeover_batch_release(&pf_batch);
 		free(pf_batch.items);
 		strbuf_release(&main_wt);
-
-		if (pf_status != TEXTIL_EXT_EXECUTOR_OK)
-			die("%s", pf_err.buf);
 		strbuf_release(&pf_err);
 	}
 
@@ -539,6 +557,9 @@ static int check_updates(struct unpack_trees_options *o,
 	stop_progress(&progress);
 	errs |= finish_delayed_checkout(&state, o->verbose_update);
 	git_attr_set_direction(GIT_ATTR_CHECKIN);
+
+	/* checkout wave 完了後にキャッシュを解放する */
+	textil_ext_materialize_cache_clear();
 
 	if (o->clone)
 		report_collided_checkout(index);

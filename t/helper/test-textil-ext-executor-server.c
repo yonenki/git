@@ -66,6 +66,7 @@ enum reply_mode {
 	REPLY_VALIDATE_REQUEST_MATERIALIZE,
 	REPLY_CHECKIN_CONVERT_CHECKIN,
 	REPLY_VALIDATE_REQUEST_CHECKIN_CONVERT,
+	REPLY_BATCH_CHECKOUT,
 };
 
 static struct {
@@ -73,12 +74,16 @@ static struct {
 	enum reply_mode mode;
 	int nr_threads;
 	int max_wait_sec;
+	const char *trace_log_path;
 } server_args = {
 	.path = "textil-executor-test",
 	.mode = REPLY_OK,
 	.nr_threads = 1,
 	.max_wait_sec = 30,
+	.trace_log_path = NULL,
 };
+
+static int trace_request_seq;
 
 /* send-preflight のオプション値。トップレベルで解析する。 */
 static struct {
@@ -157,6 +162,8 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_MATERIALIZE_SRC_PATH_WINDOWS_UNC;
 	if (!strcmp(s, "materialize-checkout"))
 		return REPLY_MATERIALIZE_CHECKOUT;
+	if (!strcmp(s, "batch-checkout"))
+		return REPLY_BATCH_CHECKOUT;
 	if (!strcmp(s, "materialize-count-mismatch"))
 		return REPLY_MATERIALIZE_COUNT_MISMATCH;
 	if (!strcmp(s, "validate-request-materialize"))
@@ -1057,6 +1064,130 @@ static int app_cb(void *application_data UNUSED,
 		strbuf_release(&reply);
 		return ret;
 	}
+
+	case REPLY_BATCH_CHECKOUT: {
+		/*
+		 * Dual-phase handler for batch-first checkout proof.
+		 * Detects the phase from the request header:
+		 *   preflight → status=ok
+		 *   materialize → status=ok + src_paths (same as materialize-checkout)
+		 * This mode exercises the full preflight→preresolve→checkout flow.
+		 */
+		size_t pos = 0;
+		int in_header = 1;
+		int is_materialize = 0;
+		int nr_items = 0;
+		struct strbuf *item_paths = NULL;
+		int alloc_items = 0;
+		struct strbuf cur_path = STRBUF_INIT;
+
+		/* First pass: detect phase and collect item paths */
+		for (;;) {
+			const char *line;
+			size_t line_len;
+			enum pktline_mem_status st;
+			const char *key, *val;
+			size_t key_len, val_len;
+
+			st = pktline_read_mem(request, request_len,
+					      &pos, &line, &line_len);
+			if (st == PKTLINE_MEM_FLUSH || st == PKTLINE_MEM_ERROR)
+				break;
+			if (st == PKTLINE_MEM_DELIM) {
+				if (!in_header && cur_path.len) {
+					ALLOC_GROW(item_paths, nr_items + 1,
+						   alloc_items);
+					strbuf_init(&item_paths[nr_items], 0);
+					strbuf_addbuf(&item_paths[nr_items],
+						      &cur_path);
+					nr_items++;
+				}
+				in_header = 0;
+				strbuf_reset(&cur_path);
+				continue;
+			}
+			if (st != PKTLINE_MEM_DATA)
+				continue;
+			if (in_header) {
+				if (!parse_kv(line, line_len, &key, &key_len,
+					      &val, &val_len) &&
+				    kv_matches(key, key_len, "phase") &&
+				    !strncmp(val, "materialize", val_len))
+					is_materialize = 1;
+				continue;
+			}
+			if (!parse_kv(line, line_len, &key, &key_len,
+				      &val, &val_len) &&
+			    kv_matches(key, key_len, "path"))
+				strbuf_add(&cur_path, val, val_len);
+		}
+		if (!in_header && cur_path.len) {
+			ALLOC_GROW(item_paths, nr_items + 1, alloc_items);
+			strbuf_init(&item_paths[nr_items], 0);
+			strbuf_addbuf(&item_paths[nr_items], &cur_path);
+			nr_items++;
+		}
+		strbuf_release(&cur_path);
+
+		/* trace-log に request shape を記録する */
+		if (server_args.trace_log_path) {
+			FILE *fp = fopen(server_args.trace_log_path, "a");
+			if (fp) {
+				int seq = trace_request_seq++;
+				fprintf(fp,
+					"{\"seq\":%d,\"phase\":\"%s\","
+					"\"items\":%d}\n",
+					seq,
+					is_materialize ? "materialize"
+						       : "preflight",
+					nr_items);
+				fclose(fp);
+			}
+		}
+
+		if (!is_materialize) {
+			/* preflight: just return ok */
+			int i;
+			build_ok_reply(&reply);
+			for (i = 0; i < nr_items; i++)
+				strbuf_release(&item_paths[i]);
+			free(item_paths);
+			ret = reply_cb(reply_data, reply.buf, reply.len);
+			strbuf_release(&reply);
+			return ret;
+		}
+
+		/* materialize: return ok + src_paths with temp files */
+		{
+			int i;
+			packet_buf_write(&reply, "status=ok\n");
+			for (i = 0; i < nr_items; i++) {
+				struct strbuf tmp_path = STRBUF_INIT;
+				int tmp_fd;
+				strbuf_addf(&tmp_path, "%s/batch-mat-XXXXXX",
+					    getenv("TMPDIR") ? getenv("TMPDIR")
+							     : "/tmp");
+				tmp_fd = mkstemp(tmp_path.buf);
+				if (tmp_fd >= 0) {
+					const char *content =
+						"materialized-by-textil-batch\n";
+					write_in_full(tmp_fd, content,
+						      strlen(content));
+					close(tmp_fd);
+				}
+				packet_buf_delim(&reply);
+				packet_buf_write(&reply, "src_path=%s\n",
+						 tmp_path.buf);
+				strbuf_release(&tmp_path);
+				strbuf_release(&item_paths[i]);
+			}
+			packet_buf_flush(&reply);
+			free(item_paths);
+			ret = reply_cb(reply_data, reply.buf, reply.len);
+			strbuf_release(&reply);
+			return ret;
+		}
+	}
 	}
 
 	BUG("unhandled reply_mode");
@@ -1106,6 +1237,9 @@ static int daemon__start_server(const char *reply_mode_str)
 	strvec_pushf(&cp.args, "--threads=%d", server_args.nr_threads);
 	if (reply_mode_str)
 		strvec_pushf(&cp.args, "--reply-mode=%s", reply_mode_str);
+	if (server_args.trace_log_path)
+		strvec_pushf(&cp.args, "--trace-log=%s",
+			     server_args.trace_log_path);
 
 	cp.no_stdin = 1;
 	cp.no_stdout = 1;
@@ -1192,6 +1326,9 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 			   N_("ok, rejected, error, invalid-pkt, echo, validate-request")),
 		OPT_INTEGER(0, "threads", &server_args.nr_threads,
 			    N_("server threads")),
+		OPT_STRING(0, "trace-log", &server_args.trace_log_path,
+			   N_("path"),
+			   N_("NDJSON request-shape log (batch-checkout mode)")),
 		OPT_INTEGER(0, "max-wait", &server_args.max_wait_sec,
 			    N_("seconds to wait")),
 		OPT_STRING(0, "path", &preflight_args.path, N_("path"),
