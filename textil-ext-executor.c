@@ -1070,6 +1070,125 @@ void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch)
 	}
 }
 
+/* --- Materialize pre-resolution cache ----------------------------------- */
+
+#include "strmap.h"
+
+/*
+ * Global cache: "path\toid" → src_path (xstrdup'd).
+ * Populated once before the sequential checkout loop, looked up per-file.
+ */
+static struct strmap materialize_cache = STRMAP_INIT;
+static int materialize_cache_populated;
+
+static char *make_cache_key(const char *path, const char *oid_hex)
+{
+	struct strbuf key = STRBUF_INIT;
+	strbuf_addstr(&key, path);
+	strbuf_addch(&key, '\t');
+	strbuf_addstr(&key, oid_hex);
+	return strbuf_detach(&key, NULL);
+}
+
+int textil_ext_preresolve_materialize_cache(
+	const struct textil_ext_takeover_batch *preflight_batch,
+	struct strbuf *err)
+{
+	struct textil_ext_takeover_batch mat_batch;
+	struct textil_ext_takeover_item *items;
+	struct textil_ext_materialize_batch_result result;
+	struct strbuf main_wt = STRBUF_INIT;
+	enum textil_ext_executor_status status;
+	int i;
+
+	if (materialize_cache_populated)
+		return 0;
+	if (!preflight_batch || preflight_batch->nr_items <= 0)
+		return 0;
+
+	/* materialize batch を preflight batch と同じ候補で構築する */
+	CALLOC_ARRAY(items, preflight_batch->nr_items);
+	for (i = 0; i < preflight_batch->nr_items; i++) {
+		const struct textil_ext_takeover_item *src = &preflight_batch->items[i];
+		items[i].path = xstrdup(src->path);
+		items[i].rule_id = src->rule_id;
+		items[i].attr_filter = src->attr_filter ? xstrdup(src->attr_filter) : NULL;
+		items[i].blob_oid = src->blob_oid ? xstrdup(src->blob_oid) : NULL;
+		items[i].is_regular_file = src->is_regular_file;
+		items[i].strict = src->strict;
+		items[i].capabilities = src->capabilities;
+		items[i].nr_capabilities = src->nr_capabilities;
+	}
+
+	textil_ext_resolve_main_worktree(&main_wt);
+	memset(&mat_batch, 0, sizeof(mat_batch));
+	mat_batch.phase = TEXTIL_EXT_EXEC_PHASE_MATERIALIZE;
+	mat_batch.operation = "checkout";
+	mat_batch.repo_root = main_wt.buf;
+	mat_batch.items = items;
+	mat_batch.nr_items = preflight_batch->nr_items;
+
+	textil_ext_materialize_batch_result_init(&result);
+	status = textil_ext_resolve_materialize_batch(&mat_batch, &result, err);
+
+	if (status != TEXTIL_EXT_EXECUTOR_OK) {
+		textil_ext_materialize_batch_result_release(&result);
+		strbuf_release(&main_wt);
+		textil_ext_takeover_batch_release(&mat_batch);
+		free(items);
+		return -1;
+	}
+
+	if (result.src_paths.nr != preflight_batch->nr_items)
+		BUG("preresolve: batch returned %lu src_paths for %d items",
+		    (unsigned long)result.src_paths.nr, preflight_batch->nr_items);
+
+	/* cache にストアする */
+	for (i = 0; i < preflight_batch->nr_items; i++) {
+		char *key = make_cache_key(
+			preflight_batch->items[i].path,
+			preflight_batch->items[i].blob_oid);
+		strmap_put(&materialize_cache, key,
+			   xstrdup(result.src_paths.items[i].string));
+		free(key);
+	}
+	materialize_cache_populated = 1;
+
+	textil_ext_materialize_batch_result_release(&result);
+	strbuf_release(&main_wt);
+	textil_ext_takeover_batch_release(&mat_batch);
+	free(items);
+	return 0;
+}
+
+const char *textil_ext_materialize_cache_lookup(
+	const char *path, const char *blob_oid_hex)
+{
+	char *key;
+	const char *value;
+
+	if (!materialize_cache_populated)
+		return NULL;
+
+	key = make_cache_key(path, blob_oid_hex);
+	value = strmap_get(&materialize_cache, key);
+	free(key);
+	return value;
+}
+
+void textil_ext_materialize_cache_clear(void)
+{
+	struct hashmap_iter iter;
+	struct strmap_entry *entry;
+
+	hashmap_for_each_entry(&materialize_cache.map, &iter, entry,
+			       ent) {
+		free(entry->value);
+	}
+	strmap_clear(&materialize_cache, 0);
+	materialize_cache_populated = 0;
+}
+
 /* --- Materialize one-to-fd helper --------------------------------------- */
 
 int textil_ext_materialize_one_to_fd(

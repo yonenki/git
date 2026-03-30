@@ -260,6 +260,47 @@ void textil_ext_resolve_main_worktree(struct strbuf *out);
  */
 void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch);
 
+/* --- Materialize pre-resolution cache ----------------------------------- */
+
+/*
+ * Batch-first materialize cache.
+ *
+ * Pre-resolves all materialize src_paths in a single IPC roundtrip before
+ * the per-file checkout loop. entry.c looks up pre-resolved paths here
+ * instead of issuing per-file IPC.
+ *
+ * Lifecycle: create after preflight, populate with preresolve, lookup during
+ * checkout, destroy after the checkout wave completes.
+ */
+
+/*
+ * Populate the global materialize cache from a preflight batch.
+ *
+ * Builds a materialize-phase batch from the same items used for preflight,
+ * resolves all src_paths in one IPC call, and stores them keyed by
+ * "path\0oid" for O(1) lookup during sequential checkout.
+ *
+ * Returns 0 on success. On failure, returns -1 and appends to err.
+ * If the cache is already populated, this is a no-op (returns 0).
+ */
+int textil_ext_preresolve_materialize_cache(
+	const struct textil_ext_takeover_batch *preflight_batch,
+	struct strbuf *err);
+
+/*
+ * Look up a pre-resolved src_path for the given (path, blob_oid) pair.
+ *
+ * Returns the src_path string (owned by the cache) or NULL if not found.
+ */
+const char *textil_ext_materialize_cache_lookup(
+	const char *path, const char *blob_oid_hex);
+
+/*
+ * Release all resources held by the global materialize cache.
+ * Safe to call when the cache is empty or not populated.
+ */
+void textil_ext_materialize_cache_clear(void);
+
 /* --- Preflight collection ----------------------------------------------- */
 
 struct index_state; /* forward declaration */

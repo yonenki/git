@@ -21,70 +21,46 @@
 #include "convert.h"
 #include "copy.h"
 
-static int textil_ext_materialize_batch_to_fd(const char *ce_name,
-					      const struct object_id *ce_oid,
-					      const char *attr_filter,
-					      const struct textil_ext_eval_result *eval_result,
-					      int out_fd,
-					      struct strbuf *err)
+/*
+ * Materialize a single file to an open fd.
+ *
+ * Batch-first: looks up the pre-resolved cache first. Falls back to
+ * single-item IPC only if the cache has no entry (non-wave single-file
+ * checkout). The hot checkout wave path always hits the cache.
+ */
+static int textil_ext_materialize_to_fd(const char *ce_name,
+					const struct object_id *ce_oid,
+					const char *attr_filter,
+					const struct textil_ext_eval_result *eval_result,
+					int out_fd,
+					struct strbuf *err)
 {
-	struct textil_ext_takeover_batch batch;
-	struct textil_ext_takeover_item item;
-	struct textil_ext_materialize_batch_result result;
-	struct strbuf main_wt = STRBUF_INIT;
-	enum textil_ext_executor_status status;
-	int src_fd, ret = -1;
+	const char *cached_src_path;
+	int src_fd;
 
-	memset(&batch, 0, sizeof(batch));
-	memset(&item, 0, sizeof(item));
-	textil_ext_materialize_batch_result_init(&result);
-
-	item.path = xstrdup(ce_name);
-	item.rule_id = eval_result->rule_id;
-	item.attr_filter = attr_filter ? xstrdup(attr_filter) : NULL;
-	item.blob_oid = xstrdup(oid_to_hex(ce_oid));
-	item.is_regular_file = 1;
-	item.strict = eval_result->strict;
-	item.capabilities = eval_result->capabilities;
-	item.nr_capabilities = eval_result->nr_capabilities;
-
-	textil_ext_resolve_main_worktree(&main_wt);
-	batch.phase = TEXTIL_EXT_EXEC_PHASE_MATERIALIZE;
-	batch.operation = "checkout";
-	batch.repo_root = main_wt.buf;
-	batch.items = &item;
-	batch.nr_items = 1;
-
-	status = textil_ext_resolve_materialize_batch(&batch, &result, err);
-	if (status != TEXTIL_EXT_EXECUTOR_OK) {
-		error("textil-ext: materialize failed for '%s': %s",
-		      ce_name, err->buf);
-		goto cleanup;
-	}
-	if (result.src_paths.nr != 1)
-		BUG("materialize batch returned %lu src_paths for single checkout item",
-		    (unsigned long)result.src_paths.nr);
-
-	src_fd = open(result.src_paths.items[0].string, O_RDONLY);
-	if (src_fd < 0) {
-		error_errno("textil-ext: cannot open src_path '%s'",
-			    result.src_paths.items[0].string);
-		goto cleanup;
-	}
-
-	if (copy_fd(src_fd, out_fd)) {
+	/* batch-first: pre-resolved cache から O(1) で取得する */
+	cached_src_path = textil_ext_materialize_cache_lookup(
+		ce_name, oid_to_hex(ce_oid));
+	if (cached_src_path) {
+		src_fd = open(cached_src_path, O_RDONLY);
+		if (src_fd < 0) {
+			error_errno("textil-ext: cannot open cached src_path '%s'",
+				    cached_src_path);
+			return -1;
+		}
+		if (copy_fd(src_fd, out_fd)) {
+			close(src_fd);
+			error("textil-ext: copy_fd failed for '%s'", ce_name);
+			return -1;
+		}
 		close(src_fd);
-		error("textil-ext: copy_fd failed for '%s'", ce_name);
-		goto cleanup;
+		return 0;
 	}
-	close(src_fd);
-	ret = 0;
 
-cleanup:
-	strbuf_release(&main_wt);
-	textil_ext_takeover_batch_release(&batch);
-	textil_ext_materialize_batch_result_release(&result);
-	return ret;
+	/* cache miss: 単発の checkout（wave 外）向け single-item fallback */
+	return textil_ext_materialize_one_to_fd(
+		ce_name, ce_oid, attr_filter, eval_result,
+		NULL, out_fd, err);
 }
 
 static void create_directories(const char *path, int path_len,
@@ -391,7 +367,7 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 
 			{
 				int mat_rc;
-				mat_rc = textil_ext_materialize_batch_to_fd(
+				mat_rc = textil_ext_materialize_to_fd(
 				    ce->name, &ce->oid,
 				    conv_attrs_filter_name(ca),
 				    &ext_result,
