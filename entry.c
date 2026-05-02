@@ -58,9 +58,17 @@ static int textil_ext_materialize_to_fd(const char *ce_name,
 	}
 
 	/* cache miss: 単発の checkout（wave 外）向け single-item fallback */
-	return textil_ext_materialize_one_to_fd(
-		ce_name, ce_oid, attr_filter, eval_result,
-		NULL, out_fd, err);
+	{
+		struct strbuf main_wt = STRBUF_INIT;
+		int ret;
+
+		textil_ext_resolve_main_worktree(&main_wt);
+		ret = textil_ext_materialize_one_to_fd(
+			ce_name, ce_oid, attr_filter, eval_result,
+			main_wt.buf, out_fd, err);
+		strbuf_release(&main_wt);
+		return ret;
+	}
 }
 
 static void create_directories(const char *path, int path_len,

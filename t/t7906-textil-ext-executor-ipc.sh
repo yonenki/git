@@ -26,6 +26,14 @@ restart_server () {
 		--name="$IPC_PATH"
 }
 
+restart_server_with_trace () {
+	stop_executor_server &&
+	test-tool textil-ext-executor-server start-daemon \
+		--name="$IPC_PATH" --reply-mode="$1" --trace-log="$2" &&
+	test-tool textil-ext-executor-server is-active \
+		--name="$IPC_PATH"
+}
+
 # Helper: write policy to absolute path and export env
 setup_policy () {
 	cat >"$1" &&
@@ -608,6 +616,27 @@ test_expect_success 'materialize E2E: parallel checkout writes src_path content'
 		grep "materialized-by-textil" a.bin &&
 		grep "materialized-by-textil" b.bin
 	)
+'
+
+test_expect_success 'materialize E2E: path checkout fallback includes repo_root' '
+	trace_log="$(pwd)/path-checkout-materialize-trace.ndjson" &&
+	rm -f "$trace_log" &&
+	test_when_finished stop_executor_server &&
+	restart_server_with_trace batch-checkout "$trace_log" &&
+	(
+		cd executor-ipc-repo &&
+		git checkout -f main &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-ipc-mat-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git checkout with-lfs -- a.bin &&
+		test -f a.bin &&
+		grep "materialized-by-textil-batch" a.bin
+	) &&
+	grep "\"phase\":\"materialize\"" "$trace_log" &&
+	grep "\"items\":1" "$trace_log" &&
+	grep "\"repo_root_present\":true" "$trace_log"
 '
 
 # === Checkin convert phase tests ===
