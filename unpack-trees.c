@@ -494,11 +494,17 @@ static int check_updates(struct unpack_trees_options *o,
 		 * entry.c looks up pre-resolved paths from this cache.
 		 */
 		if (pf_batch.nr_items > 0) {
+			struct textil_ext_takeover_batch mat_batch = {0};
 			struct strbuf mat_err = STRBUF_INIT;
-			if (textil_ext_preresolve_materialize_cache(
-				    &pf_batch, &mat_err))
+			textil_ext_collect_materialize_takeover_batch(
+				index, "checkout", main_wt.buf, &mat_batch);
+			if (mat_batch.nr_items > 0 &&
+			    textil_ext_preresolve_materialize_cache(
+				    &mat_batch, &mat_err))
 				die("textil-ext: materialize pre-resolution failed: %s",
 				    mat_err.buf);
+			textil_ext_takeover_batch_release(&mat_batch);
+			free(mat_batch.items);
 			strbuf_release(&mat_err);
 		}
 

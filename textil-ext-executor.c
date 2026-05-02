@@ -162,7 +162,9 @@ static const char *phase_to_string(enum textil_ext_executor_phase phase)
  *
  * Rejects characters that would break pkt-line framing or cause
  * protocol confusion: NUL (truncation), LF (line injection),
- * CR (line injection), and DEL (0x7F).
+ * CR (line injection), and DEL (0x7F). Git for Windows may present
+ * LF/CR in path names as U+F00A/U+F00D private-use code points; those
+ * are rejected as LF/CR equivalents.
  * TAB and other control characters are permitted for Git path
  * compatibility (Git allows TAB in filenames).
  *
@@ -183,6 +185,16 @@ static int validate_request_value(const char *key, const char *value,
 				_("textil-ext: request value for '%s' contains "
 				  "forbidden character 0x%02x at byte %lu"),
 				key, (unsigned)*p,
+				(unsigned long)(p - (const unsigned char *)value));
+			return -1;
+		}
+		if (p[1] && p[2] &&
+		    *p == 0xEF && p[1] == 0x80 &&
+		    (p[2] == 0x8A || p[2] == 0x8D)) {
+			strbuf_addf(err,
+				_("textil-ext: request value for '%s' contains "
+				  "forbidden character U+F00%X at byte %lu"),
+				key, (unsigned)(p[2] & 0x0F),
 				(unsigned long)(p - (const unsigned char *)value));
 			return -1;
 		}
@@ -820,17 +832,18 @@ int textil_ext_blob_oid_is_lfs_pointer(
 	return 0;
 }
 
-void textil_ext_collect_preflight_takeover_batch(
+static void textil_ext_collect_takeover_batch(
 	struct index_state *index,
 	const char *operation,
 	const char *repo_root,
+	enum textil_ext_executor_phase phase,
 	struct textil_ext_takeover_batch *batch_out)
 {
 	int i;
 	int alloc = 0;
 
 	memset(batch_out, 0, sizeof(*batch_out));
-	batch_out->phase = TEXTIL_EXT_EXEC_PHASE_PREFLIGHT;
+	batch_out->phase = phase;
 	batch_out->operation = operation;
 	batch_out->repo_root = repo_root;
 
@@ -848,8 +861,15 @@ void textil_ext_collect_preflight_takeover_batch(
 
 		convert_attrs(index, &ca, ce->name);
 		filter_name = conv_attrs_filter_name(&ca);
-		textil_ext_evaluate_for_preflight(
-			filter_name, 1, &ext_result);
+		if (phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT)
+			textil_ext_evaluate_for_preflight(
+				filter_name, 1, &ext_result);
+		else if (phase == TEXTIL_EXT_EXEC_PHASE_MATERIALIZE)
+			textil_ext_evaluate_for_checkout(
+				filter_name, 1, &ext_result);
+		else
+			BUG("unsupported checkout batch collection phase: %d",
+			    phase);
 
 		if (!ext_result.matched ||
 		    ext_result.action != TEXTIL_ACTION_TAKEOVER)
@@ -869,6 +889,28 @@ void textil_ext_collect_preflight_takeover_batch(
 		item->capabilities = ext_result.capabilities;
 		item->nr_capabilities = ext_result.nr_capabilities;
 	}
+}
+
+void textil_ext_collect_preflight_takeover_batch(
+	struct index_state *index,
+	const char *operation,
+	const char *repo_root,
+	struct textil_ext_takeover_batch *batch_out)
+{
+	textil_ext_collect_takeover_batch(index, operation, repo_root,
+					  TEXTIL_EXT_EXEC_PHASE_PREFLIGHT,
+					  batch_out);
+}
+
+void textil_ext_collect_materialize_takeover_batch(
+	struct index_state *index,
+	const char *operation,
+	const char *repo_root,
+	struct textil_ext_takeover_batch *batch_out)
+{
+	textil_ext_collect_takeover_batch(index, operation, repo_root,
+					  TEXTIL_EXT_EXEC_PHASE_MATERIALIZE,
+					  batch_out);
 }
 
 /* --- Executor ----------------------------------------------------------- */
