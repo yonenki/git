@@ -1076,6 +1076,7 @@ static int app_cb(void *application_data UNUSED,
 		size_t pos = 0;
 		int in_header = 1;
 		int is_materialize = 0;
+		int has_repo_root = 0;
 		int nr_items = 0;
 		struct strbuf *item_paths = NULL;
 		int alloc_items = 0;
@@ -1110,10 +1111,15 @@ static int app_cb(void *application_data UNUSED,
 				continue;
 			if (in_header) {
 				if (!parse_kv(line, line_len, &key, &key_len,
-					      &val, &val_len) &&
-				    kv_matches(key, key_len, "phase") &&
-				    !strncmp(val, "materialize", val_len))
-					is_materialize = 1;
+					      &val, &val_len)) {
+					if (kv_matches(key, key_len, "phase") &&
+					    !strncmp(val, "materialize", val_len))
+						is_materialize = 1;
+					else if (kv_matches(key, key_len,
+							    "repo_root") &&
+						 val_len)
+						has_repo_root = 1;
+				}
 				continue;
 			}
 			if (!parse_kv(line, line_len, &key, &key_len,
@@ -1136,11 +1142,13 @@ static int app_cb(void *application_data UNUSED,
 				int seq = trace_request_seq++;
 				fprintf(fp,
 					"{\"seq\":%d,\"phase\":\"%s\","
-					"\"items\":%d}\n",
+					"\"items\":%d,"
+					"\"repo_root_present\":%s}\n",
 					seq,
 					is_materialize ? "materialize"
 						       : "preflight",
-					nr_items);
+					nr_items,
+					has_repo_root ? "true" : "false");
 				fclose(fp);
 			}
 		}
