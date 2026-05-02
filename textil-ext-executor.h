@@ -323,4 +323,10 @@ void textil_ext_collect_preflight_takeover_batch(
 	const char *repo_root,
 	struct textil_ext_takeover_batch *batch_out);
 
+void textil_ext_collect_materialize_takeover_batch(
+	struct index_state *index,
+	const char *operation,
+	const char *repo_root,
+	struct textil_ext_takeover_batch *batch_out);
+
 #endif /* TEXTIL_EXT_EXECUTOR_H */
