@@ -1478,7 +1478,7 @@ int convert_to_git(struct index_state *istate,
 		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
 			struct strbuf main_wt = STRBUF_INIT;
 			struct strbuf cc_err = STRBUF_INIT;
-			textil_ext_resolve_main_worktree(&main_wt);
+			textil_ext_resolve_worktree_root(&main_wt);
 			if (textil_ext_checkin_convert_one_to_buf(
 				    path, src, len,
 				    conv_attrs_filter_name(&ca),
@@ -1550,7 +1550,7 @@ void convert_to_git_filter_fd(struct index_state *istate,
 		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
 			struct strbuf main_wt = STRBUF_INIT;
 			struct strbuf cc_err = STRBUF_INIT;
-			textil_ext_resolve_main_worktree(&main_wt);
+			textil_ext_resolve_worktree_root(&main_wt);
 			if (textil_ext_checkin_convert_fd_to_buf(
 				    path, fd,
 				    conv_attrs_filter_name(&ca),

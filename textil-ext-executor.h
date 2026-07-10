@@ -251,7 +251,7 @@ int textil_ext_checkin_convert_fd_to_buf(
  *
  * Requires USE_THE_REPOSITORY_VARIABLE.  Caller must release the strbuf.
  */
-void textil_ext_resolve_main_worktree(struct strbuf *out);
+void textil_ext_resolve_worktree_root(struct strbuf *out);
 
 /*
  * Release owned fields (path, attr_filter, blob_oid, input_path) in each

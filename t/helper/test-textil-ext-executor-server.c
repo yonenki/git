@@ -22,6 +22,7 @@
 #include "alloc.h"
 #include "string-list.h"
 #include "write-or-die.h"
+#include "setup.h"
 
 #ifndef SUPPORTS_SIMPLE_IPC
 int cmd__textil_ext_executor_server(int argc, const char **argv)
@@ -1383,6 +1384,16 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 
 	if (!strcmp(subcmd, "is-active"))
 		return !!client__probe_server();
+
+	if (!strcmp(subcmd, "resolve-worktree-root")) {
+		struct strbuf root = STRBUF_INIT;
+
+		setup_git_directory();
+		textil_ext_resolve_worktree_root(&root);
+		printf("%s\n", root.buf);
+		strbuf_release(&root);
+		return 0;
+	}
 
 	if (!strcmp(subcmd, "stop-daemon")) {
 		if (client__probe_server())
