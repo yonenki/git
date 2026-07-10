@@ -1083,11 +1083,25 @@ done:
 	return status;
 }
 
-void textil_ext_resolve_main_worktree(struct strbuf *out)
+void textil_ext_resolve_worktree_root(struct strbuf *out)
 {
 	struct strbuf realdir = STRBUF_INIT;
+	const char *worktree = repo_get_work_tree(the_repository);
 	const char *last_slash;
 
+	/*
+	 * The controller request belongs to the Git process' active worktree.
+	 * Textil projects deliberately keep the common Git directory at
+	 * <project>/.bare and the primary worktree at <project>/default; deriving
+	 * a path by stripping ".bare" therefore names a non-repository project
+	 * container.  Linked worktrees have the same authority requirement.
+	 */
+	if (worktree && *worktree) {
+		strbuf_realpath(out, worktree, 1);
+		return;
+	}
+
+	/* Bare/no-worktree callers retain the common-dir parent fallback. */
 	strbuf_realpath(&realdir, the_repository->commondir, 1);
 	last_slash = strrchr(realdir.buf, '/');
 	if (last_slash && last_slash > realdir.buf)
@@ -1162,7 +1176,7 @@ int textil_ext_preresolve_materialize_cache(
 		items[i].nr_capabilities = src->nr_capabilities;
 	}
 
-	textil_ext_resolve_main_worktree(&main_wt);
+	textil_ext_resolve_worktree_root(&main_wt);
 	memset(&mat_batch, 0, sizeof(mat_batch));
 	mat_batch.phase = TEXTIL_EXT_EXEC_PHASE_MATERIALIZE;
 	mat_batch.operation = "checkout";

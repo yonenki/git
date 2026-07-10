@@ -585,7 +585,7 @@ static int resolve_takeover_batch(
 		items[i].nr_capabilities = ext_result->nr_capabilities;
 	}
 
-	textil_ext_resolve_main_worktree(&main_wt);
+	textil_ext_resolve_worktree_root(&main_wt);
 	batch.phase = TEXTIL_EXT_EXEC_PHASE_MATERIALIZE;
 	batch.operation = "checkout";
 	batch.repo_root = main_wt.buf;

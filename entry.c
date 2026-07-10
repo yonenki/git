@@ -62,7 +62,7 @@ static int textil_ext_materialize_to_fd(const char *ce_name,
 		struct strbuf main_wt = STRBUF_INIT;
 		int ret;
 
-		textil_ext_resolve_main_worktree(&main_wt);
+		textil_ext_resolve_worktree_root(&main_wt);
 		ret = textil_ext_materialize_one_to_fd(
 			ce_name, ce_oid, attr_filter, eval_result,
 			main_wt.buf, out_fd, err);

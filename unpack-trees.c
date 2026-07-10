@@ -472,7 +472,7 @@ static int check_updates(struct unpack_trees_options *o,
 		enum textil_ext_executor_status pf_status =
 			TEXTIL_EXT_EXECUTOR_OK;
 
-		textil_ext_resolve_main_worktree(&main_wt);
+		textil_ext_resolve_worktree_root(&main_wt);
 		textil_ext_collect_preflight_takeover_batch(
 			index, "checkout",
 			main_wt.buf, &pf_batch);

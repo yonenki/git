@@ -59,6 +59,25 @@ test_expect_success 'setup: policy for checkin_convert takeover' '
 	EOF
 '
 
+test_expect_success 'repo_root uses the active worktree in Textil bare layout' '
+	git init authority-seed &&
+	(
+		cd authority-seed &&
+		echo seed >seed.txt &&
+		git add seed.txt &&
+		git commit -m seed
+	) &&
+	git clone --bare authority-seed authority-project/.bare &&
+	git --git-dir="$TRASH_DIRECTORY/authority-project/.bare" \
+		worktree add "$TRASH_DIRECTORY/authority-project/default" HEAD &&
+	(
+		cd authority-project/default &&
+		test-tool textil-ext-executor-server resolve-worktree-root >actual &&
+		printf "%s\n" "$(pwd -P)" >expect &&
+		test_cmp expect actual
+	)
+'
+
 test_expect_success 'setup: create repo with pointer in index' '
 	restart_server checkin-convert-checkin &&
 	git init canon-repo &&
