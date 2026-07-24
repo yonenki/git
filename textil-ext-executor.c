@@ -853,6 +853,8 @@ static void textil_ext_collect_takeover_batch(
 		struct textil_ext_eval_result ext_result;
 		const char *filter_name;
 		struct textil_ext_takeover_item *item;
+		struct strbuf pointer_err = STRBUF_INIT;
+		int is_pointer = 0;
 
 		if (!(ce->ce_flags & CE_UPDATE))
 			continue;
@@ -873,6 +875,13 @@ static void textil_ext_collect_takeover_batch(
 
 		if (!ext_result.matched ||
 		    ext_result.action != TEXTIL_ACTION_TAKEOVER)
+			continue;
+
+		if (textil_ext_blob_oid_is_lfs_pointer(&ce->oid, &is_pointer,
+						       &pointer_err))
+			die("%s", pointer_err.buf);
+		strbuf_release(&pointer_err);
+		if (!is_pointer)
 			continue;
 
 		ALLOC_GROW(batch_out->items,

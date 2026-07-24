@@ -40,6 +40,14 @@ setup_policy () {
 	POLICY_PATH="$1"
 }
 
+write_pointer () {
+	cat <<-EOF
+	version https://git-lfs.github.com/spec/v1
+	oid sha256:$1
+	size $2
+	EOF
+}
+
 # === Setup ===
 
 test_expect_success 'setup: create repo with lfs-tracked files' '
@@ -52,8 +60,8 @@ test_expect_success 'setup: create repo with lfs-tracked files' '
 		git commit -m "base" &&
 		git branch -M master main &&
 		git checkout -b with-lfs &&
-		echo "binary-a" >a.bin &&
-		echo "binary-b" >b.bin &&
+		write_pointer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 9 >a.bin &&
+		write_pointer bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 9 >b.bin &&
 		git add a.bin b.bin &&
 		git commit -m "add lfs files" &&
 		git checkout main
@@ -442,7 +450,7 @@ test_expect_success 'request validation: LF in path rejects before IPC' '
 		git branch -M master main &&
 		git checkout -b with-lf-path &&
 		LF_NAME=$(printf "bad\nfile.bin") &&
-		printf "binary-data" >"$LF_NAME" &&
+		write_pointer cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc 11 >"$LF_NAME" &&
 		git add -A &&
 		git commit -m "add file with LF in path" &&
 		git checkout main &&

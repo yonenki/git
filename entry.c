@@ -363,8 +363,21 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 
 		if (ext_result.matched &&
 		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
+			struct strbuf pointer_err = STRBUF_INIT;
+			int is_pointer = 0;
 			struct strbuf mat_err = STRBUF_INIT;
 			int out_fd;
+
+			if (textil_ext_blob_oid_is_lfs_pointer(&ce->oid,
+							       &is_pointer,
+							       &pointer_err)) {
+				error("%s", pointer_err.buf);
+				strbuf_release(&pointer_err);
+				return -1;
+			}
+			strbuf_release(&pointer_err);
+			if (!is_pointer)
+				goto no_takeover;
 
 			out_fd = open_output_fd(path, ce, to_tempfile);
 			if (out_fd < 0) {
@@ -393,6 +406,8 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 			strbuf_release(&mat_err);
 			goto finish;
 		}
+
+no_takeover:
 
 		filter = get_stream_filter_ca(ca, &ce->oid);
 		if (filter &&
