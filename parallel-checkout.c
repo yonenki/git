@@ -200,10 +200,20 @@ struct pc_takeover_candidate {
 static int pc_item_is_takeover_candidate(struct parallel_checkout_item *pc_item,
 					 struct textil_ext_eval_result *ext_result)
 {
+	struct strbuf pointer_err = STRBUF_INIT;
+	int is_pointer = 0;
+
 	textil_ext_evaluate_for_checkout(
 		conv_attrs_filter_name(&pc_item->ca), 1, ext_result);
-	return ext_result->matched &&
-		ext_result->action == TEXTIL_ACTION_TAKEOVER;
+	if (!ext_result->matched ||
+	    ext_result->action != TEXTIL_ACTION_TAKEOVER)
+		return 0;
+
+	if (textil_ext_blob_oid_is_lfs_pointer(&pc_item->ce->oid, &is_pointer,
+					       &pointer_err))
+		die("%s", pointer_err.buf);
+	strbuf_release(&pointer_err);
+	return is_pointer;
 }
 
 static int handle_results(struct checkout *state)

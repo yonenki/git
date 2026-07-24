@@ -81,22 +81,33 @@ test_expect_success 'setup: materialize-only takeover policy' '
 	EOF
 '
 
-test_expect_success 'merge conflict: non-pointer merge result keeps stage 2/3 entries' '
+test_expect_success 'merge conflict: synthesized non-pointer result bypasses takeover and keeps stages' '
 	test_atexit stop_executor_server &&
-	restart_server materialize-checkout &&
+	restart_server materialize-rejected &&
 	(
 		cd merge-stage-repo &&
+		rm -f controller-trace.jsonl &&
 		test_must_fail env \
 			TEXTIL_GIT_EXT_POLICY_PATH="$POLICY_PATH" \
 			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
 			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			TEXTIL_GIT_EXT_TRACE_FILE="$PWD/controller-trace.jsonl" \
+			TEXTIL_GIT_EXT_OPERATION_ID=merge-conflict \
 			git merge theirs >out 2>err &&
+		test_path_is_missing controller-trace.jsonl &&
+		! grep "textil-ext.*takeover" err &&
 		! grep "invalid LFS pointer" err &&
-		git ls-files -u >unmerged &&
-		test_file_not_empty unmerged &&
-		grep "checkout_to.bin" unmerged &&
+		cat >expect-stages <<-\EOF &&
+		1 checkout_to.bin
+		2 checkout_to.bin
+		3 checkout_to.bin
+		EOF
+		git ls-files -u --format="%(stage) %(path)" >actual-stages &&
+		test_cmp expect-stages actual-stages &&
+		git cat-file -p :1:checkout_to.bin >base-stage &&
 		git cat-file -p :2:checkout_to.bin >ours-stage &&
 		git cat-file -p :3:checkout_to.bin >theirs-stage &&
+		grep "oid sha256:0000000000000000000000000000000000000000000000000000000000000000" base-stage &&
 		grep "oid sha256:1111111111111111111111111111111111111111111111111111111111111111" ours-stage &&
 		grep "oid sha256:2222222222222222222222222222222222222222222222222222222222222222" theirs-stage
 	)
