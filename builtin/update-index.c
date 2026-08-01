@@ -49,6 +49,10 @@ static int mark_valid_only;
 static int mark_skip_worktree_only;
 static int mark_fsmonitor_only;
 static int ignore_skip_worktree_entries;
+static int textil_materialized;
+#ifndef USE_NSEC
+static time_t textil_materialized_latest_mtime;
+#endif
 #define MARK_FLAG 1
 #define UNMARK_FLAG 2
 static struct strbuf mtime_dir = STRBUF_INIT;
@@ -254,6 +258,34 @@ static int mark_ce_flags(const char *path, int flag, int mark)
 		return 0;
 	}
 	return -1;
+}
+
+/*
+ * Record the worktree stat produced by Textil's clone materializer without
+ * converting or reading the file contents again.  The caller owns the list
+ * of paths it has just materialized; this command only completes the same
+ * index bookkeeping that checkout normally performs after a successful
+ * write.
+ */
+static int mark_textil_materialized(const char *path, struct stat *st)
+{
+	int pos = index_name_pos(the_repository->index, path, strlen(path));
+	struct cache_entry *ce;
+
+	if (pos < 0)
+		return error("%s: not a stage-0 index entry", path);
+
+	ce = the_repository->index->cache[pos];
+	fill_stat_cache_info(the_repository->index, ce, st);
+#ifndef USE_NSEC
+	if (textil_materialized_latest_mtime < st->st_mtime)
+		textil_materialized_latest_mtime = st->st_mtime;
+#endif
+	ce->ce_flags &= ~CE_SKIP_WORKTREE;
+	ce->ce_flags |= CE_UPDATE_IN_BASE;
+	mark_fsmonitor_invalid(the_repository->index, ce);
+	the_repository->index->cache_changed |= CE_ENTRY_CHANGED;
+	return 0;
 }
 
 static int remove_one_path(const char *path)
@@ -474,6 +506,15 @@ static void update_one(const char *path)
 
 	if (!verify_path(path, st.st_mode)) {
 		fprintf(stderr, "Ignoring path %s\n", path);
+		return;
+	}
+	if (textil_materialized) {
+		if (stat_errno) {
+			errno = stat_errno;
+			die_errno("Unable to stat materialized file %s", path);
+		}
+		if (mark_textil_materialized(path, &st))
+			die("Unable to mark materialized file %s", path);
 		return;
 	}
 	if (mark_valid_only) {
@@ -1008,6 +1049,8 @@ int cmd_update_index(int argc,
 		},
 		OPT_BOOL(0, "ignore-skip-worktree-entries", &ignore_skip_worktree_entries,
 			 N_("do not touch index-only entries")),
+		OPT_BOOL(0, "textil-materialized", &textil_materialized,
+			 N_("record stat information for Textil-materialized files")),
 		OPT_SET_INT(0, "info-only", &info_only,
 			N_("add to index only; do not add content to object database"), 1),
 		OPT_SET_INT(0, "force-remove", &force_remove,
@@ -1304,6 +1347,17 @@ int cmd_update_index(int argc,
 	}
 
 	if (the_repository->index->cache_changed || force_write) {
+#ifndef USE_NSEC
+		/*
+		 * A second-resolution index would consider files written in the
+		 * current second racily clean and read their contents on the next
+		 * status.  Wait only when this materialized batch actually needs the
+		 * timestamp boundary; the work remains independent of file size.
+		 */
+		if (textil_materialized &&
+		    time(NULL) <= textil_materialized_latest_mtime)
+			sleep(1);
+#endif
 		if (newfd < 0) {
 			if (refresh_args.flags & REFRESH_QUIET)
 				exit(128);
