@@ -17,6 +17,14 @@ run_with_policy () {
 		"$@"
 }
 
+write_pointer () {
+	cat <<-EOF
+	version https://git-lfs.github.com/spec/v1
+	oid sha256:$1
+	size $2
+	EOF
+}
+
 # === Setup ===
 
 test_expect_success 'setup: create repo with lfs-tracked files' '
@@ -29,9 +37,9 @@ test_expect_success 'setup: create repo with lfs-tracked files' '
 		git commit -m "base" &&
 		git branch -M master main &&
 		git checkout -b with-lfs &&
-		echo "binary-a" >a.bin &&
-		echo "binary-b" >b.bin &&
-		echo "binary-c" >c.bin &&
+		write_pointer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 8 >a.bin &&
+		write_pointer bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 8 >b.bin &&
+		write_pointer cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc 8 >c.bin &&
 		git add a.bin b.bin c.bin &&
 		git commit -m "add lfs files" &&
 		git checkout main
@@ -194,7 +202,7 @@ test_expect_success 'setup: branch with single lfs file' '
 	(
 		cd executor-repo &&
 		git checkout -b with-one-lfs main &&
-		echo "single-bin" >single.bin &&
+		write_pointer dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd 10 >single.bin &&
 		git add single.bin &&
 		git commit -m "add single lfs file" &&
 		git checkout main

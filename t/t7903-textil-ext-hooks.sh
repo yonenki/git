@@ -23,6 +23,14 @@ run_with_policy () {
 		"$@"
 }
 
+write_pointer () {
+	cat <<-EOF
+	version https://git-lfs.github.com/spec/v1
+	oid sha256:$1
+	size $2
+	EOF
+}
+
 # === Setup ===
 
 test_expect_success 'setup: create repo with lfs-tracked file' '
@@ -31,7 +39,7 @@ test_expect_success 'setup: create repo with lfs-tracked file' '
 		cd hook-repo &&
 		echo "*.bin filter=lfs diff=lfs merge=lfs -text" >.gitattributes &&
 		echo "initial" >file.txt &&
-		echo "binary-data" >file.bin &&
+		write_pointer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 11 >file.bin &&
 		git add .gitattributes file.txt file.bin &&
 		git commit -m "initial"
 	)
@@ -384,9 +392,9 @@ test_expect_success 'setup: create repo with multiple lfs-tracked files' '
 	(
 		cd pc-repo &&
 		echo "*.bin filter=lfs diff=lfs merge=lfs -text" >.gitattributes &&
-		echo "data-a" >a.bin &&
-		echo "data-b" >b.bin &&
-		echo "data-c" >c.bin &&
+		write_pointer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 6 >a.bin &&
+		write_pointer bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 6 >b.bin &&
+		write_pointer cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc 6 >c.bin &&
 		echo "plain" >file.txt &&
 		git add .gitattributes a.bin b.bin c.bin file.txt &&
 		git commit -m "initial"

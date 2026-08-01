@@ -1,3 +1,5 @@
+#define USE_THE_REPOSITORY_VARIABLE
+
 /*
  * test-textil-ext-executor-server.c: mock IPC server for executor tests.
  *
@@ -22,6 +24,7 @@
 #include "alloc.h"
 #include "string-list.h"
 #include "write-or-die.h"
+#include "repository.h"
 #include "setup.h"
 
 #ifndef SUPPORTS_SIMPLE_IPC
@@ -1388,7 +1391,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 	if (!strcmp(subcmd, "resolve-worktree-root")) {
 		struct strbuf root = STRBUF_INIT;
 
-		setup_git_directory();
+		setup_git_directory(the_repository);
 		textil_ext_resolve_worktree_root(&root);
 		printf("%s\n", root.buf);
 		strbuf_release(&root);

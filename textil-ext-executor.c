@@ -800,7 +800,7 @@ int textil_ext_blob_oid_is_lfs_pointer(
 	struct strbuf *err)
 {
 	enum object_type type;
-	unsigned long size;
+	size_t size;
 	void *blob;
 
 	if (!oid || !is_pointer || !err)
