@@ -501,6 +501,13 @@ void write_pc_item(struct parallel_checkout_item *pc_item,
 		goto out;
 	}
 
+	/*
+	 * Flush the Windows fscache so that the lstat() below sees the
+	 * file we just wrote. Without this, the cached parent directory
+	 * listing may not yet include the new file entry.
+	 */
+	flush_fscache();
+
 	if (state->refresh_cache && !fstat_done && lstat(path.buf, &pc_item->st) < 0) {
 		error_errno("unable to stat just-written file '%s'",  path.buf);
 		pc_item->status = PC_ITEM_FAILED;
@@ -909,6 +916,7 @@ static void gather_results_from_workers(struct pc_worker *workers,
 
 static void write_items_sequentially(struct checkout *state)
 {
+	flush_fscache();
 	write_range_in_order(state, 0, parallel_checkout.nr);
 }
 
