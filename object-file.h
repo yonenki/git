@@ -18,6 +18,10 @@ enum {
 };
 
 int index_fd(struct index_state *istate, struct object_id *oid, int fd, struct stat *st, enum object_type type, const char *path, unsigned flags);
+int index_fd_with_input_path(struct index_state *istate, struct object_id *oid,
+			     int fd, struct stat *st, enum object_type type,
+			     const char *path, unsigned flags,
+			     const char *input_path);
 int index_path(struct index_state *istate, struct object_id *oid, const char *path, struct stat *st, unsigned flags);
 
 struct object_info;

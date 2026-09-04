@@ -1356,11 +1356,11 @@ static int odb_transaction_files_write_object_stream(struct odb_transaction *bas
 	return 0;
 }
 
-static int index_fd_with_input_path(struct index_state *istate,
-				    struct object_id *oid, int fd,
-				    struct stat *st, enum object_type type,
-				    const char *path, unsigned flags,
-				    const char *input_path)
+int index_fd_with_input_path(struct index_state *istate,
+			     struct object_id *oid, int fd,
+			     struct stat *st, enum object_type type,
+			     const char *path, unsigned flags,
+			     const char *input_path)
 {
 	int ret;
 

@@ -315,6 +315,13 @@ test_expect_success SIMPLE_IPC \
 			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
 			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
 			git -c core.bigFileThreshold=1 add large.bin &&
+		git commit -m "tracked streaming takeover" &&
+		printf "tracked streaming takeover\n" >large.bin &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$POLICY_PATH" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git -c core.bigFileThreshold=1 add large.bin &&
 		git show :large.bin >../large-staged &&
 		grep "version https://git-lfs.github.com/spec/v1" \
 			../large-staged
