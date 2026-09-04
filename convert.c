@@ -1411,8 +1411,14 @@ void reset_parsed_attributes(void)
 int would_convert_to_git_filter_fd(struct index_state *istate, const char *path)
 {
 	struct conv_attrs ca;
+	struct textil_ext_eval_result ext_result;
 
 	convert_attrs(istate, &ca, path);
+	textil_ext_evaluate_for_checkin(
+		conv_attrs_filter_name(&ca), 1, &ext_result);
+	if (ext_result.matched &&
+	    ext_result.action == TEXTIL_ACTION_TAKEOVER)
+		return 1;
 	if (!ca.drv)
 		return 0;
 
@@ -1527,7 +1533,7 @@ int convert_to_git(struct index_state *istate,
 
 void convert_to_git_filter_fd(struct index_state *istate,
 			      const char *path, int fd, struct strbuf *dst,
-			      int conv_flags)
+			      int conv_flags, const char *input_path)
 {
 	struct conv_attrs ca;
 	convert_attrs(istate, &ca, path);
@@ -1552,7 +1558,7 @@ void convert_to_git_filter_fd(struct index_state *istate,
 			struct strbuf cc_err = STRBUF_INIT;
 			textil_ext_resolve_worktree_root(&main_wt);
 			if (textil_ext_checkin_convert_fd_to_buf(
-				    path, fd,
+				    path, fd, input_path,
 				    conv_attrs_filter_name(&ca),
 				    &ext_result,
 				    main_wt.buf,
@@ -1564,6 +1570,14 @@ void convert_to_git_filter_fd(struct index_state *istate,
 					die(_("textil-ext: checkin_convert failed for '%s': %s"),
 					    path, cc_err.buf);
 				strbuf_release(&cc_err);
+				if (!ca.drv) {
+					/* An LFS pointer is never empty. Do not
+					 * Do not reread it just to report it
+					 * dirty while the controller is down.
+					 */
+					strbuf_reset(dst);
+					return;
+				}
 			} else {
 				strbuf_release(&main_wt);
 				strbuf_release(&cc_err);

@@ -151,7 +151,7 @@ static inline int would_convert_to_git(struct index_state *istate,
 void convert_to_git_filter_fd(struct index_state *istate,
 			      const char *path, int fd,
 			      struct strbuf *dst,
-			      int conv_flags);
+			      int conv_flags, const char *input_path);
 int would_convert_to_git_filter_fd(struct index_state *istate,
 				   const char *path);
 

@@ -304,6 +304,23 @@ test_expect_success SIMPLE_IPC 'checkin: checkin_convert works in linked worktre
 	)
 '
 
+test_expect_success SIMPLE_IPC \
+	'checkin: takeover streams files above Git big-file threshold' '
+	restart_server checkin-convert-checkin &&
+	(
+		cd hook-repo &&
+		printf "streaming-takeover\n" >large.bin &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$POLICY_PATH" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git -c core.bigFileThreshold=1 add large.bin &&
+		git show :large.bin >../large-staged &&
+		grep "version https://git-lfs.github.com/spec/v1" \
+			../large-staged
+	)
+'
+
 test_expect_success 'checkin: observe policy allows git add' '
 	setup_policy "$(pwd)/policy-checkin-observe.json" <<-\EOF &&
 	{

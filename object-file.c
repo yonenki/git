@@ -1028,6 +1028,7 @@ static int index_stream_convert_blob(struct index_state *istate,
 				     struct object_id *oid,
 				     int fd,
 				     const char *path,
+				     const char *input_path,
 				     unsigned flags)
 {
 	int ret = 0;
@@ -1038,7 +1039,7 @@ static int index_stream_convert_blob(struct index_state *istate,
 	ASSERT(would_convert_to_git_filter_fd(istate, path));
 
 	convert_to_git_filter_fd(istate, path, fd, &sbuf,
-				 get_conv_flags(flags));
+				 get_conv_flags(flags), input_path);
 
 	if (write_object)
 		ret = odb_write_object(istate->repo->objects, sbuf.buf, sbuf.len, OBJ_BLOB,
@@ -1355,9 +1356,11 @@ static int odb_transaction_files_write_object_stream(struct odb_transaction *bas
 	return 0;
 }
 
-int index_fd(struct index_state *istate, struct object_id *oid,
-	     int fd, struct stat *st,
-	     enum object_type type, const char *path, unsigned flags)
+static int index_fd_with_input_path(struct index_state *istate,
+				    struct object_id *oid, int fd,
+				    struct stat *st, enum object_type type,
+				    const char *path, unsigned flags,
+				    const char *input_path)
 {
 	int ret;
 
@@ -1366,7 +1369,8 @@ int index_fd(struct index_state *istate, struct object_id *oid,
 	 * die() for large files.
 	 */
 	if (type == OBJ_BLOB && path && would_convert_to_git_filter_fd(istate, path)) {
-		ret = index_stream_convert_blob(istate, oid, fd, path, flags);
+		ret = index_stream_convert_blob(istate, oid, fd, path,
+					input_path, flags);
 	} else if (!S_ISREG(st->st_mode)) {
 		ret = index_pipe(istate, oid, fd, type, path, flags);
 	} else if ((st->st_size >= 0 &&
@@ -1401,6 +1405,14 @@ int index_fd(struct index_state *istate, struct object_id *oid,
 	return ret;
 }
 
+int index_fd(struct index_state *istate, struct object_id *oid,
+	     int fd, struct stat *st,
+	     enum object_type type, const char *path, unsigned flags)
+{
+	return index_fd_with_input_path(istate, oid, fd, st, type, path,
+					flags, NULL);
+}
+
 int index_path(struct index_state *istate, struct object_id *oid,
 	       const char *path, struct stat *st, unsigned flags)
 {
@@ -1413,7 +1425,8 @@ int index_path(struct index_state *istate, struct object_id *oid,
 		fd = open(path, O_RDONLY);
 		if (fd < 0)
 			return error_errno("open(\"%s\")", path);
-		if (index_fd(istate, oid, fd, st, OBJ_BLOB, path, flags) < 0)
+		if (index_fd_with_input_path(istate, oid, fd, st, OBJ_BLOB,
+					     path, flags, path) < 0)
 			return error(_("%s: failed to insert into database"),
 				     path);
 		break;

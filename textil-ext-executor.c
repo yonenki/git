@@ -1438,6 +1438,7 @@ cleanup:
 int textil_ext_checkin_convert_fd_to_buf(
 	const char *path,
 	int input_fd,
+	const char *input_path,
 	const char *attr_filter,
 	const struct textil_ext_eval_result *eval_result,
 	const char *repo_root,
@@ -1449,32 +1450,39 @@ int textil_ext_checkin_convert_fd_to_buf(
 	struct string_list src_paths = STRING_LIST_INIT_DUP;
 	enum textil_ext_executor_status st;
 	struct strbuf tmp_path = STRBUF_INIT;
-	int tmp_fd, src_fd, ret = -1;
+	int tmp_fd = -1, src_fd, ret = -1;
+	int remove_input_path = 0;
 
 	memset(&batch, 0, sizeof(batch));
 	memset(&item, 0, sizeof(item));
 
-	/*
-	 * Stream fd content directly to a temp file — avoids loading
-	 * the entire input into memory (important for large binaries).
-	 * Absolutize gitdir so backend can always resolve the path.
+	/* index_path() names the exact file backing input_fd. The backend can
+	 * stream that file directly instead of duplicating large assets in the
+	 * Git directory. Other callers retain the snapshot temp file.
 	 */
-	strbuf_add_absolute_path(&tmp_path, repo_get_git_dir(the_repository));
-	strbuf_addstr(&tmp_path, "/textil-tmp-XXXXXX");
-	tmp_fd = git_mkstemp_mode(tmp_path.buf, 0600);
-	if (tmp_fd < 0) {
-		error_errno("textil-ext: cannot create temp file for checkin");
-		strbuf_release(&tmp_path);
-		return -1;
-	}
-	if (copy_fd(input_fd, tmp_fd)) {
-		error("textil-ext: failed to stream input to temp file");
+	if (input_path) {
+		strbuf_add_absolute_path(&tmp_path, input_path);
+	} else {
+		strbuf_add_absolute_path(&tmp_path,
+					 repo_get_git_dir(the_repository));
+		strbuf_addstr(&tmp_path, "/textil-tmp-XXXXXX");
+		tmp_fd = git_mkstemp_mode(tmp_path.buf, 0600);
+		if (tmp_fd < 0) {
+			error_errno("textil-ext: cannot create "
+				    "checkin temp file");
+			strbuf_release(&tmp_path);
+			return -1;
+		}
+		remove_input_path = 1;
+		if (copy_fd(input_fd, tmp_fd)) {
+			error("textil-ext: cannot stream input to temp file");
+			close(tmp_fd);
+			unlink(tmp_path.buf);
+			strbuf_release(&tmp_path);
+			return -1;
+		}
 		close(tmp_fd);
-		unlink(tmp_path.buf);
-		strbuf_release(&tmp_path);
-		return -1;
 	}
-	close(tmp_fd);
 
 	item.path = xstrdup(path);
 	item.rule_id = eval_result->rule_id;
@@ -1517,7 +1525,7 @@ int textil_ext_checkin_convert_fd_to_buf(
 	ret = 0;
 
 cleanup:
-	if (item.input_path)
+	if (remove_input_path && item.input_path)
 		unlink(item.input_path);
 	textil_ext_takeover_batch_release(&batch);
 	string_list_clear(&src_paths, 0);

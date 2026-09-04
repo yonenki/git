@@ -227,15 +227,17 @@ int textil_ext_checkin_convert_one_to_buf(
 /*
  * High-level helper: checkin_convert from an fd to a strbuf.
  *
- * Streams the fd content directly to a temp file (no full-memory copy),
- * builds a 1-item checkin_convert batch, calls the executor, reads
- * the returned src_path content into dst.
+ * When input_path names the file backing fd, passes that absolute path
+ * directly to the backend. Otherwise streams fd to a temp file. Builds a
+ * 1-item checkin_convert batch, calls the executor, and reads the returned
+ * src_path content into dst.
  *
  * Returns 0 on success, -1 on any failure (error() already emitted).
  */
 int textil_ext_checkin_convert_fd_to_buf(
 	const char *path,
 	int input_fd,
+	const char *input_path,
 	const char *attr_filter,
 	const struct textil_ext_eval_result *eval_result,
 	const char *repo_root,
