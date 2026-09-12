@@ -45,4 +45,28 @@ test_expect_success 'missing index entry fails' '
 	test_must_fail git update-index --textil-materialized -z --stdin <paths
 '
 
+test_expect_success 'future materialized timestamp still checks equal-size edits' '
+	printf original >plain &&
+	git add plain &&
+	stamp=$(test-tool chmtime --get =+60 plain) &&
+	git update-index --textil-materialized plain &&
+	printf modified >plain &&
+	test-tool chmtime "=$stamp" plain &&
+	git diff-files --name-only -- plain >actual &&
+	echo plain >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success 'coarse materialized timestamps retain racy content checks' '
+	printf original >coarse &&
+	git add coarse &&
+	stamp=$(test-tool chmtime --get =+0 coarse) &&
+	git update-index --textil-materialized coarse &&
+	printf modified >coarse &&
+	test-tool chmtime "=$stamp" coarse .git/index &&
+	git diff-files --name-only -- coarse >actual &&
+	echo coarse >expect &&
+	test_cmp expect actual
+'
+
 test_done
