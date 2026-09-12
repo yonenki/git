@@ -359,9 +359,12 @@ static int is_racy_stat(const struct index_state *istate,
 	return (istate->timestamp.sec &&
 #ifdef USE_NSEC
 		 /* nanosecond timestamped files can also be racy! */
+		 /* A rounded file time, or minimal stat comparison, only proves seconds. */
 		(istate->timestamp.sec < sd->sd_mtime.sec ||
 		 (istate->timestamp.sec == sd->sd_mtime.sec &&
-		  istate->timestamp.nsec <= sd->sd_mtime.nsec))
+		  (!sd->sd_mtime.nsec ||
+		   !repo_config_values(the_repository)->check_stat ||
+		   istate->timestamp.nsec <= sd->sd_mtime.nsec)))
 #else
 		istate->timestamp.sec <= sd->sd_mtime.sec
 #endif

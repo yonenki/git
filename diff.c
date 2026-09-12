@@ -4578,17 +4578,33 @@ int diff_populate_filespec(struct repository *r,
 		fd = open(s->path, O_RDONLY);
 		if (fd < 0)
 			goto err_empty;
+#ifdef GIT_WINDOWS_NATIVE
+		/*
+		 * A Windows file mapping prevents editors from truncating the
+		 * worktree file while a clean filter or diff consumes it. Keep
+		 * private bytes instead; immutable object storage can still use
+		 * mappings. This also gives conversion a stable input buffer.
+		 */
+		if (strbuf_read(&buf, fd, s->size) < 0) {
+			close(fd);
+			strbuf_release(&buf);
+			goto err_empty;
+		}
+		close(fd);
+		s->data = strbuf_detach(&buf, &s->size);
+		s->should_free = 1;
+#else
 		s->data = xmmap(NULL, s->size, PROT_READ, MAP_PRIVATE, fd, 0);
 		close(fd);
 		s->should_munmap = 1;
+#endif
 
 		/*
 		 * Convert from working tree format to canonical git format
 		 */
 		if (convert_to_git(r->index, s->path, s->data, s->size, &buf, conv_flags)) {
 			size_t size = 0;
-			munmap(s->data, s->size);
-			s->should_munmap = 0;
+			diff_free_filespec_blob(s);
 			s->data = strbuf_detach(&buf, &size);
 			s->size = size;
 			s->should_free = 1;
