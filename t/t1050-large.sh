@@ -91,7 +91,7 @@ test_expect_success 'checkout a large file' '
 	large1=$(git rev-parse :large1) &&
 	git update-index --add --cacheinfo 100644 $large1 another &&
 	git checkout another &&
-	test_cmp large1 another
+	cmp large1 another
 '
 
 test_expect_success 'packsize limit' '
@@ -193,7 +193,7 @@ test_expect_success 'pack-objects with large loose object' '
 	test_create_repo packed &&
 	mv pack-* packed/.git/objects/pack &&
 	GIT_DIR=packed/.git git cat-file blob $SHA1 >actual &&
-	test_cmp huge actual
+	cmp huge actual
 '
 
 test_expect_success 'tar archiving' '
@@ -262,7 +262,7 @@ do
 				GIT_ALLOC_LIMIT=1m GIT_MMAP_LIMIT=1m TMPDIR="$PWD/scratch" \
 					git -c core.bigFileThreshold=1g -c core.packedGitWindowSize=1g \
 					cat-file blob "$oid" >actual &&
-				test_cmp "$input" actual &&
+				cmp "$input" actual &&
 				test_dir_is_empty scratch || return 1
 				i=$((i + 1))
 			done <oids

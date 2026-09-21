@@ -60,6 +60,20 @@ static int quick_has_loose(struct odb_source_loose *loose,
 	return !!oidtree_contains(odb_source_loose_cache(loose, oid), oid);
 }
 
+static enum unpack_loose_header_result read_loose_stream_header(
+	struct odb_inflate_reader *reader, char *hdr, size_t len)
+{
+	size_t used;
+
+	for (used = 0; used < len; used++) {
+		if (odb_inflate_reader_read(reader, hdr + used, 1) != 1)
+			return ULHR_BAD;
+		if (!hdr[used])
+			return ULHR_OK;
+	}
+	return ULHR_TOO_LONG;
+}
+
 /* Consumes fd on both success and failure. */
 static struct odb_read_stream *open_loose_read_stream(int fd, off_t end);
 
@@ -77,6 +91,7 @@ static int read_object_info_from_path(struct odb_source_loose *loose,
 	char hdr[MAX_HEADER_LEN];
 	size_t size_scratch;
 	enum object_type type_scratch;
+	enum unpack_loose_header_result header_result;
 	struct stat st;
 
 	/*
@@ -138,31 +153,24 @@ static int read_object_info_from_path(struct odb_source_loose *loose,
 		*oi->mtimep = st.st_mtime;
 
 	if (!oi->contentp) {
-		struct odb_read_stream *reader = open_loose_read_stream(fd, st.st_size);
-		if (!reader) {
-			ret = error(_("unable to unpack %s header"), oid_to_hex(oid));
-			goto corrupt;
+		struct odb_inflate_reader reader;
+
+		odb_inflate_reader_init(&reader, fd, 0, st.st_size);
+		header_result = read_loose_stream_header(&reader, hdr, sizeof(hdr));
+		odb_inflate_reader_release(&reader);
+		close(fd);
+	} else {
+		map = xmmap(NULL, mapsize, PROT_READ, MAP_PRIVATE, fd, 0);
+		close(fd);
+		if (!map) {
+			ret = -1;
+			goto out;
 		}
-		if (oi->sizep)
-			*oi->sizep = reader->size;
-		if (oi->typep)
-			*oi->typep = reader->type;
-		odb_read_stream_close(reader);
-		ret = 0;
-		goto out;
+		stream_to_end = &stream;
+		header_result = unpack_loose_header(&stream, map, mapsize, hdr, sizeof(hdr));
 	}
 
-	map = xmmap(NULL, mapsize, PROT_READ, MAP_PRIVATE, fd, 0);
-	close(fd);
-	if (!map) {
-		ret = -1;
-		goto out;
-	}
-
-
-	stream_to_end = &stream;
-
-	switch (unpack_loose_header(&stream, map, mapsize, hdr, sizeof(hdr))) {
+	switch (header_result) {
 	case ULHR_OK:
 		if (!oi->sizep)
 			oi->sizep = &size_scratch;
@@ -306,19 +314,13 @@ static struct odb_read_stream *open_loose_read_stream(int fd, off_t end)
 	struct odb_loose_read_stream *st;
 	struct object_info oi = OBJECT_INFO_INIT;
 	char hdr[MAX_HEADER_LEN];
-	size_t used;
 
 	CALLOC_ARRAY(st, 1);
 	odb_inflate_reader_init(&st->reader, fd, 0, end);
-	for (used = 0; used < sizeof(hdr); used++) {
-		if (odb_inflate_reader_read(&st->reader, hdr + used, 1) != 1)
-			goto error;
-		if (!hdr[used])
-			break;
-	}
 	oi.sizep = &st->base.size;
 	oi.typep = &st->base.type;
-	if (used == sizeof(hdr) || parse_loose_header(hdr, &oi) < 0 ||
+	if (read_loose_stream_header(&st->reader, hdr, sizeof(hdr)) != ULHR_OK ||
+	    parse_loose_header(hdr, &oi) < 0 ||
 	    st->base.type <= OBJ_NONE)
 		goto error;
 
