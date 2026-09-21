@@ -6,6 +6,7 @@
 
 #include "object.h"
 #include "odb.h"
+#include "git-zlib.h"
 
 struct object_database;
 struct odb_read_stream;
@@ -35,6 +36,10 @@ struct odb_read_stream *odb_read_stream_open(struct object_database *odb,
 					     const struct object_id *oid,
 					     struct stream_filter *filter);
 
+/* Internal dependency reads must not apply refs/replace to a delta base. */
+struct odb_read_stream *odb_read_stream_open_raw(struct object_database *odb,
+						 const struct object_id *oid);
+
 /*
  * Close the given read stream and release all resources associated with it.
  * Returns 0 on success, a negative error code otherwise.
@@ -47,6 +52,24 @@ int odb_read_stream_close(struct odb_read_stream *stream);
  * the stream fails.
  */
 ssize_t odb_read_stream_read(struct odb_read_stream *stream, void *buf, size_t len);
+
+/*
+ * Bounded compressed-file input shared by loose and packed object streams.
+ * The caller owns fd; no mapped window or payload-sized allocation is retained.
+ */
+struct odb_inflate_reader {
+	git_zstream z;
+	int fd;
+	int status;
+	off_t pos, end;
+	unsigned char input[16384];
+};
+
+void odb_inflate_reader_init(struct odb_inflate_reader *reader, int fd,
+			     off_t offset, off_t end);
+ssize_t odb_inflate_reader_read(struct odb_inflate_reader *reader, void *buf,
+				size_t len);
+void odb_inflate_reader_release(struct odb_inflate_reader *reader);
 
 /*
  * A stream that provides an object to be written to the object database without
