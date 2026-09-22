@@ -10,6 +10,9 @@
 #include "odb/source.h"
 #include "odb/streaming.h"
 #include "replace-object.h"
+#include "object-file.h"
+#include "object-file-convert.h"
+#include "hex.h"
 
 #define FILTER_BUFFER (1024*16)
 
@@ -113,65 +116,64 @@ static struct odb_read_stream *attach_stream_filter(struct odb_read_stream *st,
 	return &fs->base;
 }
 
-/*****************************************************************
- *
- * In-core stream
- *
- *****************************************************************/
-
-struct odb_incore_read_stream {
-	struct odb_read_stream base;
-	char *buf; /* from odb_read_object_info_extended() */
-	unsigned long read_ptr;
-};
-
-static int close_istream_incore(struct odb_read_stream *_st)
+void odb_inflate_reader_init(struct odb_inflate_reader *reader, int fd,
+			     off_t offset, off_t end)
 {
-	struct odb_incore_read_stream *st = (struct odb_incore_read_stream *)_st;
-	free(st->buf);
-	return 0;
+	memset(reader, 0, sizeof(*reader));
+	reader->fd = fd;
+	reader->pos = offset;
+	reader->end = end;
+	reader->status = Z_OK;
+	git_inflate_init(&reader->z);
 }
 
-static ssize_t read_istream_incore(struct odb_read_stream *_st, char *buf, size_t sz)
+ssize_t odb_inflate_reader_read(struct odb_inflate_reader *reader, void *buf,
+				size_t len)
 {
-	struct odb_incore_read_stream *st = (struct odb_incore_read_stream *)_st;
-	size_t read_size = sz;
-	size_t remainder = st->base.size - st->read_ptr;
+	size_t total = 0;
 
-	if (remainder <= read_size)
-		read_size = remainder;
-	if (read_size) {
-		memcpy(buf, st->buf + st->read_ptr, read_size);
-		st->read_ptr += read_size;
+	if (!len || reader->status == Z_STREAM_END)
+		return 0;
+	if (reader->status != Z_OK)
+		return -1;
+	while (total < len) {
+		size_t before_in, before_out;
+		int status;
+
+		if (!reader->z.avail_in && reader->pos < reader->end) {
+			size_t n = sizeof(reader->input);
+			if ((uintmax_t)(reader->end - reader->pos) < n)
+				n = reader->end - reader->pos;
+			if (pread_in_full(reader->fd, reader->input, n, reader->pos) != (ssize_t)n)
+				goto bad;
+			reader->pos += n;
+			reader->z.next_in = reader->input;
+			reader->z.avail_in = n;
+		}
+		reader->z.next_out = (unsigned char *)buf + total;
+		reader->z.avail_out = len - total;
+		before_in = reader->z.avail_in;
+		before_out = reader->z.avail_out;
+		status = git_inflate(&reader->z, Z_NO_FLUSH);
+		total += before_out - reader->z.avail_out;
+		if (status == Z_STREAM_END) {
+			reader->status = status;
+			return total;
+		}
+		if ((status != Z_OK && status != Z_BUF_ERROR) ||
+		    (before_in == reader->z.avail_in &&
+		     before_out == reader->z.avail_out))
+			goto bad;
 	}
-	return read_size;
+	return total;
+bad:
+	reader->status = Z_DATA_ERROR;
+	return -1;
 }
 
-static int open_istream_incore(struct odb_read_stream **out,
-			       struct object_database *odb,
-			       const struct object_id *oid)
+void odb_inflate_reader_release(struct odb_inflate_reader *reader)
 {
-	struct object_info oi = OBJECT_INFO_INIT;
-	struct odb_incore_read_stream stream = {
-		.base.close = close_istream_incore,
-		.base.read = read_istream_incore,
-	};
-	struct odb_incore_read_stream *st;
-	int ret;
-
-	oi.typep = &stream.base.type;
-	oi.sizep = &stream.base.size;
-	oi.contentp = (void **)&stream.buf;
-	ret = odb_read_object_info_extended(odb, oid, &oi,
-					    OBJECT_INFO_DIE_IF_CORRUPT);
-	if (ret)
-		return ret;
-
-	CALLOC_ARRAY(st, 1);
-	*st = stream;
-	*out = &st->base;
-
-	return 0;
+	git_inflate_end(&reader->z);
 }
 
 /*****************************************************************************
@@ -180,16 +182,31 @@ static int open_istream_incore(struct odb_read_stream **out,
 
 static int istream_source(struct odb_read_stream **out,
 			  struct object_database *odb,
-			  const struct object_id *oid)
+			  const struct object_id *oid, unsigned flags)
 {
 	struct odb_source *source;
+	struct object_info oi = OBJECT_INFO_INIT;
 
+	if (!odb_source_read_object_stream(out, odb->inmemory_objects, oid))
+		return 0;
 	odb_prepare_alternates(odb);
 	for (source = odb->sources; source; source = source->next)
 		if (!odb_source_read_object_stream(out, source, oid))
 			return 0;
 
-	return open_istream_incore(out, odb, oid);
+	/*
+	 * Retain ODB reprepare, alternates, promisor and corruption handling,
+	 * but request discovery only. Never retry with oi.contentp: that used
+	 * to silently turn a streaming read into a full incore allocation.
+	 */
+	if (odb_read_object_info_extended(odb, oid, &oi, flags))
+		return -1;
+	if (!odb_source_read_object_stream(out, odb->inmemory_objects, oid))
+		return 0;
+	for (source = odb->sources; source; source = source->next)
+		if (!odb_source_read_object_stream(out, source, oid))
+			return 0;
+	return -1;
 }
 
 /****************************************************************
@@ -208,15 +225,32 @@ ssize_t odb_read_stream_read(struct odb_read_stream *st, void *buf, size_t sz)
 	return st->read(st, buf, sz);
 }
 
+static struct odb_read_stream *open_istream_raw(struct object_database *odb,
+					       const struct object_id *oid, unsigned flags)
+{
+	struct odb_read_stream *st;
+	struct object_id storage_oid;
+
+	if (repo_oid_to_algop(odb->repo, oid, odb->repo->hash_algo, &storage_oid) ||
+	    istream_source(&st, odb, &storage_oid, flags))
+		return NULL;
+	return st;
+}
+
+struct odb_read_stream *odb_read_stream_open_raw(struct object_database *odb,
+						 const struct object_id *oid)
+{
+	return open_istream_raw(odb, oid, 0);
+}
+
 struct odb_read_stream *odb_read_stream_open(struct object_database *odb,
 					     const struct object_id *oid,
 					     struct stream_filter *filter)
 {
-	struct odb_read_stream *st;
 	const struct object_id *real = lookup_replace_object(odb->repo, oid);
-	int ret = istream_source(&st, odb, real);
+	struct odb_read_stream *st = open_istream_raw(odb, real, OBJECT_INFO_DIE_IF_CORRUPT);
 
-	if (ret)
+	if (!st)
 		return NULL;
 
 	if (filter) {
@@ -251,6 +285,11 @@ int odb_stream_blob_to_fd(struct object_database *odb,
 	struct odb_read_stream *st;
 	ssize_t kept = 0;
 	int result = -1;
+	struct git_hash_ctx hash;
+	struct object_id actual;
+	const struct object_id *real = lookup_replace_object(odb->repo, oid);
+	const struct git_hash_algo *algo = &hash_algos[real->algo];
+	char header[MAX_HEADER_LEN];
 
 	st = odb_read_stream_open(odb, oid, filter);
 	if (!st) {
@@ -260,6 +299,12 @@ int odb_stream_blob_to_fd(struct object_database *odb,
 	}
 	if (st->type != OBJ_BLOB)
 		goto close_and_exit;
+	if (!filter) {
+		int header_len = format_object_header(header, sizeof(header),
+						      OBJ_BLOB, st->size);
+		algo->init_fn(&hash);
+		git_hash_update(&hash, header, header_len);
+	}
 	for (;;) {
 		char buf[1024 * 16];
 		ssize_t wrote, holeto;
@@ -269,6 +314,8 @@ int odb_stream_blob_to_fd(struct object_database *odb,
 			goto close_and_exit;
 		if (!readlen)
 			break;
+		if (!filter)
+			git_hash_update(&hash, buf, readlen);
 		if (can_seek && sizeof(buf) == readlen) {
 			for (holeto = 0; holeto < readlen; holeto++)
 				if (buf[holeto])
@@ -291,6 +338,13 @@ int odb_stream_blob_to_fd(struct object_database *odb,
 	if (kept && (lseek(fd, kept - 1, SEEK_CUR) == (off_t) -1 ||
 		     xwrite(fd, "", 1) != 1))
 		goto close_and_exit;
+	if (!filter) {
+		git_hash_final_oid(&actual, &hash);
+		if (!oideq(&actual, real)) {
+			error("blob %s has incorrect object hash", oid_to_hex(real));
+			goto close_and_exit;
+		}
+	}
 	result = 0;
 
  close_and_exit:

@@ -79,6 +79,20 @@ void *patch_delta(const void *src_buf, size_t src_size,
 		  const void *delta_buf, size_t delta_size,
 		  size_t *dst_size);
 
+struct odb_read_stream;
+enum patch_delta_result {
+	PATCH_DELTA_OK = 0,
+	PATCH_DELTA_INVALID = -1,
+	PATCH_DELTA_IO = -2,
+};
+/*
+ * Apply the same delta encoding with bounded buffers and file-backed base/result.
+ * The caller owns the descriptors and removes partial output on failure.
+ */
+enum patch_delta_result patch_delta_to_file(int base_fd, size_t base_size,
+			struct odb_read_stream *delta, int result_fd,
+			size_t *result_size);
+
 /* the smallest possible delta size is 4 bytes */
 #define DELTA_SIZE_MIN	4
 

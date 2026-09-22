@@ -26,6 +26,7 @@
 #include "pack-revindex.h"
 #include "promisor-remote.h"
 #include "pack-mtimes.h"
+#include "tempfile.h"
 
 char *odb_pack_name(struct repository *r, struct strbuf *buf,
 		    const unsigned char *hash, const char *ext)
@@ -1134,6 +1135,41 @@ out:
 	return ret;
 }
 
+/*
+ * Object headers and streaming compressed input must not pin a configured
+ * pack window (which can be the entire pack). Keep index/resolver authority,
+ * but read object bytes through a bounded descriptor instead.
+ */
+static ssize_t read_pack_bytes(struct packed_git *p, off_t offset,
+			       void *buf, size_t len)
+{
+	off_t end;
+
+	if (p->pack_fd == -1 && open_packed_git(p))
+		return -1;
+	end = p->pack_size - p->repo->hash_algo->rawsz;
+	if (offset < sizeof(struct pack_header) || offset >= end)
+		return error("offset beyond end of packfile (truncated pack?)");
+	if (end - offset < len)
+		len = end - offset;
+	return pread_in_full(p->pack_fd, buf, len, offset);
+}
+
+static int duplicate_pack_fd(struct packed_git *pack)
+{
+	int fd, flags;
+
+	if (pack->pack_fd == -1 && open_packed_git(pack))
+		return -1;
+	fd = dup(pack->pack_fd);
+	if (fd < 0)
+		return -1;
+	flags = fcntl(fd, F_GETFD);
+	if (flags >= 0)
+		fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+	return fd;
+}
+
 unsigned long unpack_object_header_buffer(const unsigned char *buf,
 		unsigned long len, enum object_type *type, size_t *sizep)
 {
@@ -1168,83 +1204,57 @@ unsigned long unpack_object_header_buffer(const unsigned char *buf,
  * and return the size of the result object (the post-application target).
  */
 size_t get_size_from_delta(struct packed_git *p,
-			   struct pack_window **w_curs,
+			   struct pack_window **w_curs UNUSED,
 			   off_t curpos)
 {
-	const unsigned char *data;
-	unsigned char delta_head[20], *in;
-	git_zstream stream;
-	int st;
+	struct odb_inflate_reader reader;
+	unsigned char header[20];
+	const unsigned char *data = header, *top;
+	ssize_t n;
+	int fd = duplicate_pack_fd(p);
 
-	memset(&stream, 0, sizeof(stream));
-	stream.next_out = delta_head;
-	stream.avail_out = sizeof(delta_head);
-
-	git_inflate_init(&stream);
-	do {
-		in = use_pack(p, w_curs, curpos, &stream.avail_in);
-		stream.next_in = in;
-		/*
-		 * Note: the window section returned by use_pack() must be
-		 * available throughout git_inflate()'s unlocked execution. To
-		 * ensure no other thread will modify the window in the
-		 * meantime, we rely on the packed_window.inuse_cnt. This
-		 * counter is incremented before window reading and checked
-		 * before window disposal.
-		 *
-		 * Other worrying sections could be the call to close_pack_fd(),
-		 * which can close packs even with in-use windows, and to
-		 * odb_reprepare(). Regarding the former, mmap doc says:
-		 * "closing the file descriptor does not unmap the region". And
-		 * for the latter, it won't re-open already available packs.
-		 */
-		obj_read_unlock();
-		st = git_inflate(&stream, Z_FINISH);
-		obj_read_lock();
-		curpos += stream.next_in - in;
-	} while ((st == Z_OK || st == Z_BUF_ERROR) &&
-		 stream.total_out < sizeof(delta_head));
-	git_inflate_end(&stream);
-	if ((st != Z_STREAM_END) && stream.total_out != sizeof(delta_head)) {
-		error("delta data unpack-initial failed");
+	if (fd < 0)
 		return 0;
+	odb_inflate_reader_init(&reader, fd, curpos,
+				p->pack_size - p->repo->hash_algo->rawsz);
+	n = odb_inflate_reader_read(&reader, header, sizeof(header));
+	odb_inflate_reader_release(&reader);
+	close(fd);
+	if (n < 2)
+		goto bad;
+	top = header + n;
+	/* Prove that both varints terminate before using the shared decoder. */
+	for (int field = 0; field < 2; field++) {
+		const unsigned char *start = data;
+		while (data < top && (*data++ & 0x80))
+			;
+		if (data == start || (data[-1] & 0x80))
+			goto bad;
 	}
-
-	/* Examine the initial part of the delta to figure out
-	 * the result size.
-	 */
-	data = delta_head;
-
-	/* ignore base size */
-	get_delta_hdr_size(&data, delta_head+sizeof(delta_head));
-
-	/* Read the result size */
-	return get_delta_hdr_size(&data, delta_head+sizeof(delta_head));
+	data = header;
+	get_delta_hdr_size(&data, top);
+	return get_delta_hdr_size(&data, top);
+bad:
+	error("delta data unpack-initial failed");
+	return 0;
 }
 
 int unpack_object_header(struct packed_git *p,
-			 struct pack_window **w_curs,
+			 struct pack_window **w_curs UNUSED,
 			 off_t *curpos,
 			 size_t *sizep)
 {
-	unsigned char *base;
-	size_t left;
+	unsigned char header[GIT_MAX_RAWSZ];
+	ssize_t len = read_pack_bytes(p, *curpos, header, sizeof(header));
 	unsigned long used;
 	enum object_type type;
 
-	/* use_pack() assures us we have [base, base + 20) available
-	 * as a range that we can look at.  (Its actually the hash
-	 * size that is assured.)  With our object header encoding
-	 * the maximum deflated object size is 2^137, which is just
-	 * insane, so we know won't exceed what we have been given.
-	 */
-	base = use_pack(p, w_curs, *curpos, &left);
-	used = unpack_object_header_buffer(base, left, &type, sizep);
-	if (!used) {
-		type = OBJ_BAD;
-	} else
-		*curpos += used;
-
+	if (len <= 0)
+		return OBJ_BAD;
+	used = unpack_object_header_buffer(header, len, &type, sizep);
+	if (!used)
+		return OBJ_BAD;
+	*curpos += used;
 	return type;
 }
 
@@ -1271,28 +1281,25 @@ const struct packed_git *has_packed_and_bad(struct repository *r,
 }
 
 off_t get_delta_base(struct packed_git *p,
-		     struct pack_window **w_curs,
+		     struct pack_window **w_curs UNUSED,
 		     off_t *curpos,
 		     enum object_type type,
 		     off_t delta_obj_offset)
 {
-	unsigned char *base_info = use_pack(p, w_curs, *curpos, NULL);
+	unsigned char base_info[GIT_MAX_RAWSZ];
+	ssize_t len = read_pack_bytes(p, *curpos, base_info, sizeof(base_info));
 	off_t base_offset;
 
-	/* use_pack() assured us we have [base_info, base_info + 20)
-	 * as a range that we can look at without walking off the
-	 * end of the mapped window.  Its actually the hash size
-	 * that is assured.  An OFS_DELTA longer than the hash size
-	 * is stupid, as then a REF_DELTA would be smaller to store.
-	 */
+	if (len <= 0)
+		return 0;
 	if (type == OBJ_OFS_DELTA) {
 		unsigned used = 0;
 		unsigned char c = base_info[used++];
 		base_offset = c & 127;
 		while (c & 128) {
 			base_offset += 1;
-			if (!base_offset || MSB(base_offset, 7))
-				return 0;  /* overflow */
+			if (!base_offset || MSB(base_offset, 7) || used >= len)
+				return 0;  /* overflow or truncated offset */
 			c = base_info[used++];
 			base_offset = (base_offset << 7) + (c & 127);
 		}
@@ -1303,6 +1310,8 @@ off_t get_delta_base(struct packed_git *p,
 	} else if (type == OBJ_REF_DELTA) {
 		/* The base entry _must_ be in the same pack */
 		struct object_id oid;
+		if (len < p->repo->hash_algo->rawsz)
+			return 0;
 		oidread(&oid, base_info, p->repo->hash_algo);
 		base_offset = find_pack_entry_one(&oid, p);
 		*curpos += p->repo->hash_algo->rawsz;
@@ -1371,22 +1380,31 @@ static enum object_type packed_to_object_type(struct repository *r,
 					      struct pack_window **w_curs,
 					      off_t curpos)
 {
-	off_t small_poi_stack[POI_STACK_PREALLOC];
-	off_t *poi_stack = small_poi_stack;
-	int poi_stack_nr = 0, poi_stack_alloc = POI_STACK_PREALLOC;
+	off_t poi_stack[POI_STACK_PREALLOC];
+	struct tempfile *overflow = NULL;
+	size_t poi_stack_nr = 0;
 
 	while (type == OBJ_OFS_DELTA || type == OBJ_REF_DELTA) {
 		off_t base_offset;
 		size_t size;
-		/* Push the object we're going to leave behind */
-		if (poi_stack_nr >= poi_stack_alloc && poi_stack == small_poi_stack) {
-			poi_stack_alloc = alloc_nr(poi_stack_nr);
-			ALLOC_ARRAY(poi_stack, poi_stack_alloc);
-			COPY_ARRAY(poi_stack, small_poi_stack, poi_stack_nr);
-		} else {
-			ALLOC_GROW(poi_stack, poi_stack_nr+1, poi_stack_alloc);
+		if (poi_stack_nr >= p->num_objects) {
+			error("cycle in packed delta chain");
+			goto unwind;
 		}
-		poi_stack[poi_stack_nr++] = obj_offset;
+		/* Keep ordinary chains cheap; spill deeper metadata rather than growing RAM. */
+		if (poi_stack_nr < ARRAY_SIZE(poi_stack)) {
+			poi_stack[poi_stack_nr] = obj_offset;
+		} else {
+			if (!overflow)
+				overflow = mks_tempfile_t("git-delta-metadata-XXXXXX");
+			if (!overflow ||
+			    write_in_full(get_tempfile_fd(overflow), &obj_offset, sizeof(obj_offset)) != sizeof(obj_offset)) {
+				error_errno("unable to spool packed delta metadata");
+				type = OBJ_BAD;
+				goto out;
+			}
+		}
+		poi_stack_nr++;
 		/* If parsing the base offset fails, just unwind */
 		base_offset = get_delta_base(p, w_curs, &curpos, type, obj_offset);
 		if (!base_offset)
@@ -1417,13 +1435,22 @@ static enum object_type packed_to_object_type(struct repository *r,
 	}
 
 out:
-	if (poi_stack != small_poi_stack)
-		free(poi_stack);
+	delete_tempfile(&overflow);
 	return type;
 
 unwind:
 	while (poi_stack_nr) {
-		obj_offset = poi_stack[--poi_stack_nr];
+		poi_stack_nr--;
+		if (poi_stack_nr < ARRAY_SIZE(poi_stack)) {
+			obj_offset = poi_stack[poi_stack_nr];
+		} else {
+			off_t pos = (poi_stack_nr - ARRAY_SIZE(poi_stack)) * sizeof(obj_offset);
+			if (pread_in_full(get_tempfile_fd(overflow), &obj_offset, sizeof(obj_offset), pos) != sizeof(obj_offset)) {
+				error_errno("unable to read packed delta metadata");
+				type = OBJ_BAD;
+				goto out;
+			}
+		}
 		type = retry_bad_packed_offset(r, p, obj_offset);
 		if (type > OBJ_NONE)
 			goto out;
@@ -2851,83 +2878,124 @@ void packfile_store_close(struct packfile_store *store)
 
 struct odb_packed_read_stream {
 	struct odb_read_stream base;
-	struct packed_git *pack;
-	git_zstream z;
-	enum {
-		ODB_PACKED_READ_STREAM_UNINITIALIZED,
-		ODB_PACKED_READ_STREAM_INUSE,
-		ODB_PACKED_READ_STREAM_DONE,
-		ODB_PACKED_READ_STREAM_ERROR,
-	} z_state;
-	off_t pos;
+	struct odb_inflate_reader reader;
+	size_t remaining;
 };
 
 static ssize_t read_istream_pack_non_delta(struct odb_read_stream *_st, char *buf,
 					   size_t sz)
 {
 	struct odb_packed_read_stream *st = (struct odb_packed_read_stream *)_st;
-	size_t total_read = 0;
+	size_t want = sz < st->remaining ? sz : st->remaining;
+	ssize_t n;
+	unsigned char extra;
 
-	switch (st->z_state) {
-	case ODB_PACKED_READ_STREAM_UNINITIALIZED:
-		memset(&st->z, 0, sizeof(st->z));
-		git_inflate_init(&st->z);
-		st->z_state = ODB_PACKED_READ_STREAM_INUSE;
-		break;
-	case ODB_PACKED_READ_STREAM_DONE:
+	if (!sz)
 		return 0;
-	case ODB_PACKED_READ_STREAM_ERROR:
+	n = odb_inflate_reader_read(&st->reader, buf, want);
+	if (n < 0 || n != want)
 		return -1;
-	case ODB_PACKED_READ_STREAM_INUSE:
-		break;
-	}
-
-	while (total_read < sz) {
-		int status;
-		struct pack_window *window = NULL;
-		unsigned char *mapped;
-
-		mapped = use_pack(st->pack, &window,
-				  st->pos, &st->z.avail_in);
-
-		st->z.next_out = (unsigned char *)buf + total_read;
-		st->z.avail_out = sz - total_read;
-		st->z.next_in = mapped;
-		status = git_inflate(&st->z, Z_FINISH);
-
-		st->pos += st->z.next_in - mapped;
-		total_read = st->z.next_out - (unsigned char *)buf;
-		unuse_pack(&window);
-
-		if (status == Z_STREAM_END) {
-			git_inflate_end(&st->z);
-			st->z_state = ODB_PACKED_READ_STREAM_DONE;
-			break;
-		}
-
-		/*
-		 * Unlike the loose object case, we do not have to worry here
-		 * about running out of input bytes and spinning infinitely. If
-		 * we get Z_BUF_ERROR due to too few input bytes, then we'll
-		 * replenish them in the next use_pack() call when we loop. If
-		 * we truly hit the end of the pack (i.e., because it's corrupt
-		 * or truncated), then use_pack() catches that and will die().
-		 */
-		if (status != Z_OK && status != Z_BUF_ERROR) {
-			git_inflate_end(&st->z);
-			st->z_state = ODB_PACKED_READ_STREAM_ERROR;
-			return -1;
-		}
-	}
-	return total_read;
+	st->remaining -= n;
+	if (!st->remaining && odb_inflate_reader_read(&st->reader, &extra, 1) != 0)
+		return -1;
+	return n;
 }
 
 static int close_istream_pack_non_delta(struct odb_read_stream *_st)
 {
 	struct odb_packed_read_stream *st = (struct odb_packed_read_stream *)_st;
-	if (st->z_state == ODB_PACKED_READ_STREAM_INUSE)
-		git_inflate_end(&st->z);
+
+	odb_inflate_reader_release(&st->reader);
+	return close(st->reader.fd);
+}
+
+static struct odb_read_stream *open_pack_inflate_stream(struct packed_git *pack,
+							enum object_type type,
+							size_t size, off_t pos)
+{
+	struct odb_packed_read_stream *st;
+	int fd = duplicate_pack_fd(pack);
+
+	if (fd < 0)
+		return NULL;
+	CALLOC_ARRAY(st, 1);
+	st->base.close = close_istream_pack_non_delta;
+	st->base.read = read_istream_pack_non_delta;
+	st->base.type = type;
+	st->base.size = st->remaining = size;
+	odb_inflate_reader_init(&st->reader, fd, pos,
+				pack->pack_size - pack->repo->hash_algo->rawsz);
+	return &st->base;
+}
+
+struct odb_packed_file_stream {
+	struct odb_read_stream base;
+	struct tempfile *payload;
+	size_t pos;
+};
+
+static ssize_t read_istream_pack_file(struct odb_read_stream *_st, char *buf, size_t sz)
+{
+	struct odb_packed_file_stream *st = (struct odb_packed_file_stream *)_st;
+	size_t n = st->base.size - st->pos;
+	ssize_t read;
+
+	if (n > sz)
+		n = sz;
+	if (!n)
+		return 0;
+	read = pread_in_full(get_tempfile_fd(st->payload), buf, n, st->pos);
+	if (read < 0 || read != n)
+		return -1;
+	st->pos += read;
+	return read;
+}
+
+static int close_istream_pack_file(struct odb_read_stream *_st)
+{
+	struct odb_packed_file_stream *st = (struct odb_packed_file_stream *)_st;
+	return delete_tempfile(&st->payload);
+}
+
+static int spool_pack_stream(struct odb_read_stream *stream, struct tempfile *file)
+{
+	char buf[16384];
+	ssize_t n;
+
+	while ((n = odb_read_stream_read(stream, buf, sizeof(buf))) > 0)
+		if (write_in_full(get_tempfile_fd(file), buf, n) != n) {
+			error_errno("unable to spool packed object");
+			return PATCH_DELTA_IO;
+		}
+	return n < 0 ? PATCH_DELTA_INVALID : PATCH_DELTA_OK;
+}
+
+struct packed_delta_step {
+	off_t object_offset, pos;
+	size_t size;
+	enum object_type type;
+};
+
+static int pop_delta_step(struct tempfile *chain, size_t *depth,
+			  struct packed_delta_step *step)
+{
+	off_t pos = (--*depth) * sizeof(*step);
+
+	if (pread_in_full(get_tempfile_fd(chain), step, sizeof(*step), pos) != sizeof(*step))
+		return error_errno("unable to read delta chain spool");
 	return 0;
+}
+
+static struct odb_read_stream *retry_packed_stream(struct packed_git *pack, off_t offset)
+{
+	struct object_id oid;
+	uint32_t pos;
+
+	if (offset_to_pack_pos(pack, offset, &pos) < 0 ||
+	    nth_packed_object_id(&oid, pack, pack_pos_to_index(pack, pos)))
+		return NULL;
+	mark_bad_packed_object(pack, &oid);
+	return odb_read_stream_open_raw(pack->repo->objects, &oid);
 }
 
 int packfile_read_object_stream(struct odb_read_stream **out,
@@ -2935,42 +3003,164 @@ int packfile_read_object_stream(struct odb_read_stream **out,
 				struct packed_git *pack,
 				off_t offset)
 {
-	struct odb_packed_read_stream *stream;
-	struct pack_window *window = NULL;
-	enum object_type in_pack_type;
-	size_t size;
+	struct tempfile *chain = NULL, *base = NULL, *result = NULL;
+	struct odb_read_stream *input = NULL;
+	struct odb_packed_file_stream *stream;
+	enum object_type type;
+	size_t size, depth = 0;
+	off_t object_offset = offset;
+	int ret = -1, decoded;
 
-	in_pack_type = unpack_object_header(pack, &window, &offset, &size);
-	unuse_pack(&window);
+	*out = NULL;
+	/*
+	 * The chain is file-backed too: deep deltas need neither a growing
+	 * heap buffer nor a recursive decode stack. Pack entries bound the
+	 * number of steps, including malformed REF_DELTA cycles.
+	 */
+	for (;;) {
+		off_t base_offset;
+		struct packed_delta_step step;
 
-	if (repo_settings_get_big_file_threshold(pack->repo) >= size)
-		return -1;
-
-	switch (in_pack_type) {
-	default:
-		return -1; /* we do not do deltas for now */
-	case OBJ_BAD:
-		mark_bad_packed_object(pack, oid);
-		return -1;
-	case OBJ_COMMIT:
-	case OBJ_TREE:
-	case OBJ_BLOB:
-	case OBJ_TAG:
-		break;
+		type = unpack_object_header(pack, NULL, &offset, &size);
+		if (type != OBJ_OFS_DELTA && type != OBJ_REF_DELTA)
+			break;
+		if (depth >= pack->num_objects) {
+			error("cycle in packed delta chain");
+			goto recover;
+		}
+		base_offset = get_delta_base(pack, NULL, &offset, type, object_offset);
+		if (!base_offset)
+			goto recover;
+		step = (struct packed_delta_step) {
+			.object_offset = object_offset, .pos = offset, .size = size, .type = type,
+		};
+		if (!chain) {
+			chain = mks_tempfile_t("git-delta-chain-XXXXXX");
+			if (!chain) {
+				error_errno("unable to create delta chain spool");
+				goto out;
+			}
+		}
+		if (write_in_full(get_tempfile_fd(chain), &step, sizeof(step)) != sizeof(step)) {
+			error_errno("unable to write delta chain spool");
+			goto out;
+		}
+		depth++;
+		object_offset = offset = base_offset;
 	}
+	if (type < OBJ_COMMIT || type > OBJ_TAG)
+		goto recover;
+	input = open_pack_inflate_stream(pack, type, size, offset);
+	if (!input)
+		goto out;
+	base = mks_tempfile_t("git-delta-base-XXXXXX");
+	if (!base) {
+		error_errno("unable to create object spool");
+		goto out;
+	}
+	decoded = spool_pack_stream(input, base);
+	if (decoded == PATCH_DELTA_INVALID)
+		goto recover;
+	if (decoded)
+		goto out;
+	if (odb_read_stream_close(input)) {
+		input = NULL;
+		goto out;
+	}
+	input = NULL;
 
+apply_deltas:
+	while (depth) {
+		struct packed_delta_step step;
+		size_t result_size;
+
+		if (pop_delta_step(chain, &depth, &step))
+			goto out;
+		object_offset = step.object_offset;
+		input = open_pack_inflate_stream(pack, step.type, step.size, step.pos);
+		if (!input)
+			goto out;
+		result = mks_tempfile_t("git-delta-result-XXXXXX");
+		if (!result) {
+			error_errno("unable to create delta result spool");
+			goto out;
+		}
+		decoded = patch_delta_to_file(get_tempfile_fd(base), size, input,
+					      get_tempfile_fd(result), &result_size);
+		if (decoded == PATCH_DELTA_INVALID)
+			goto recover;
+		if (decoded)
+			goto out;
+		if (odb_read_stream_close(input)) {
+			input = NULL;
+			goto out;
+		}
+		input = NULL;
+		delete_tempfile(&base);
+		base = result;
+		result = NULL;
+		size = result_size;
+	}
 	CALLOC_ARRAY(stream, 1);
-	stream->base.close = close_istream_pack_non_delta;
-	stream->base.read = read_istream_pack_non_delta;
-	stream->base.type = in_pack_type;
+	stream->base.close = close_istream_pack_file;
+	stream->base.read = read_istream_pack_file;
+	stream->base.type = type;
 	stream->base.size = size;
-	stream->z_state = ODB_PACKED_READ_STREAM_UNINITIALIZED;
-	stream->pack = pack;
-	stream->pos = offset;
-
+	stream->payload = base;
+	base = NULL;
 	*out = &stream->base;
+	ret = 0;
+	goto out;
 
-	return 0;
+recover:
+	/*
+	 * Keep redundant-object recovery, including an intact loose copy of
+	 * an intermediate delta. Only decoding failures enter this path:
+	 * a full spool disk is an IO failure, not a corrupt/missing object.
+	 */
+	if (input) {
+		odb_read_stream_close(input);
+		input = NULL;
+	}
+	delete_tempfile(&base);
+	delete_tempfile(&result);
+	for (;;) {
+		struct packed_delta_step step;
+
+		input = retry_packed_stream(pack, object_offset);
+		if (input) {
+			base = mks_tempfile_t("git-delta-base-XXXXXX");
+			if (!base) {
+				error_errno("unable to create recovered object spool");
+				goto out;
+			}
+			type = input->type;
+			size = input->size;
+			decoded = spool_pack_stream(input, base);
+			odb_read_stream_close(input);
+			input = NULL;
+			if (!decoded)
+				goto apply_deltas;
+			if (decoded == PATCH_DELTA_IO)
+				goto out;
+			delete_tempfile(&base);
+		}
+		if (!depth) {
+			mark_bad_packed_object(pack, oid);
+			error("corrupt packed object %s", oid_to_hex(oid));
+			goto out;
+		}
+		if (pop_delta_step(chain, &depth, &step))
+			goto out;
+		object_offset = step.object_offset;
+	}
+out:
+	if (input)
+		odb_read_stream_close(input);
+	delete_tempfile(&chain);
+	delete_tempfile(&base);
+	delete_tempfile(&result);
+	return ret;
 }
 
 int packfile_store_read_object_stream(struct odb_read_stream **out,

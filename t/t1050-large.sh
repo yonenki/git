@@ -91,7 +91,7 @@ test_expect_success 'checkout a large file' '
 	large1=$(git rev-parse :large1) &&
 	git update-index --add --cacheinfo 100644 $large1 another &&
 	git checkout another &&
-	test_cmp large1 another
+	cmp large1 another
 '
 
 test_expect_success 'packsize limit' '
@@ -193,7 +193,7 @@ test_expect_success 'pack-objects with large loose object' '
 	test_create_repo packed &&
 	mv pack-* packed/.git/objects/pack &&
 	GIT_DIR=packed/.git git cat-file blob $SHA1 >actual &&
-	test_cmp huge actual
+	cmp huge actual
 '
 
 test_expect_success 'tar archiving' '
@@ -211,6 +211,79 @@ test_expect_success 'zip archiving, deflate' '
 test_expect_success 'fsck large blobs' '
 	git fsck 2>err &&
 	test_must_be_empty err
+'
+
+test_expect_success 'prepare low-compressibility streaming objects' '
+	test-tool genrandom streaming 8m >stream-base &&
+	cp stream-base stream-target &&
+	echo delta-tail >>stream-target
+'
+
+for storage in loose packed ref-delta ofs-delta
+do
+	test_expect_success "stream $storage below threshold without large allocations or mappings" '
+		test_create_repo "stream-$storage" &&
+		(
+			cd "stream-$storage" &&
+			GIT_ALLOC_LIMIT=0 git -c core.bigFileThreshold=1g \
+				hash-object -w ../stream-base >oids &&
+			GIT_ALLOC_LIMIT=0 git -c core.bigFileThreshold=1g \
+				hash-object -w ../stream-target >>oids &&
+			case "$storage" in
+			loose) ;;
+			*)
+				case "$storage" in
+				packed) pack_args="--window=0" ;;
+				ref-delta) pack_args="--window=10" ;;
+				ofs-delta) pack_args="--window=10 --delta-base-offset" ;;
+				esac &&
+				GIT_ALLOC_LIMIT=0 git -c core.bigFileThreshold=1g \
+					-c pack.compression=0 pack-objects $pack_args \
+					.git/objects/pack/pack <oids &&
+				git prune-packed &&
+				git cat-file --batch-check="%(deltabase)" <oids >bases &&
+				if test "$storage" = packed
+				then
+					printf "%s\n%s\n" "$ZERO_OID" "$ZERO_OID" >expect &&
+					test_cmp expect bases
+				else
+					grep -F -f oids bases
+				fi
+				;;
+			esac &&
+			mkdir scratch &&
+			i=0 &&
+			while read oid
+			do
+				case "$i" in
+				0) input=../stream-base ;;
+				1) input=../stream-target ;;
+				esac &&
+				GIT_ALLOC_LIMIT=1m GIT_MMAP_LIMIT=1m TMPDIR="$PWD/scratch" \
+					git -c core.bigFileThreshold=1g -c core.packedGitWindowSize=1g \
+					cat-file blob "$oid" >actual &&
+				cmp "$input" actual &&
+				test_dir_is_empty scratch || return 1
+				i=$((i + 1))
+			done <oids
+		)
+	'
+done
+
+test_expect_success 'streamed blob rejects a same-size wrong loose identity' '
+	test_create_repo wrong-stream &&
+	(
+		cd wrong-stream &&
+		GIT_ALLOC_LIMIT=0 git -c core.bigFileThreshold=1g hash-object -w ../stream-base >base-oid &&
+		test-tool genrandom different 8m >wrong &&
+		GIT_ALLOC_LIMIT=0 git -c core.bigFileThreshold=1g hash-object -w wrong >wrong-oid &&
+		base_path=$(git rev-parse --git-path objects)/$(test_oid_to_path "$(cat base-oid)") &&
+		wrong_path=$(git rev-parse --git-path objects)/$(test_oid_to_path "$(cat wrong-oid)") &&
+		chmod u+w "$base_path" &&
+		cp "$wrong_path" "$base_path" &&
+		test_must_fail env GIT_ALLOC_LIMIT=1m GIT_MMAP_LIMIT=1m \
+			git cat-file blob "$(cat base-oid)" >actual
+	)
 '
 
 test_done

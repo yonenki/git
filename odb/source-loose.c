@@ -60,6 +60,23 @@ static int quick_has_loose(struct odb_source_loose *loose,
 	return !!oidtree_contains(odb_source_loose_cache(loose, oid), oid);
 }
 
+static enum unpack_loose_header_result read_loose_stream_header(
+	struct odb_inflate_reader *reader, char *hdr, size_t len)
+{
+	size_t used;
+
+	for (used = 0; used < len; used++) {
+		if (odb_inflate_reader_read(reader, hdr + used, 1) != 1)
+			return ULHR_BAD;
+		if (!hdr[used])
+			return ULHR_OK;
+	}
+	return ULHR_TOO_LONG;
+}
+
+/* Consumes fd on both success and failure. */
+static struct odb_read_stream *open_loose_read_stream(int fd, off_t end);
+
 static int read_object_info_from_path(struct odb_source_loose *loose,
 				      const char *path,
 				      const struct object_id *oid,
@@ -68,12 +85,13 @@ static int read_object_info_from_path(struct odb_source_loose *loose,
 {
 	int ret;
 	int fd;
-	unsigned long mapsize;
+	size_t mapsize;
 	void *map = NULL;
 	git_zstream stream, *stream_to_end = NULL;
 	char hdr[MAX_HEADER_LEN];
 	size_t size_scratch;
 	enum object_type type_scratch;
+	enum unpack_loose_header_result header_result;
 	struct stat st;
 
 	/*
@@ -129,21 +147,30 @@ static int read_object_info_from_path(struct odb_source_loose *loose,
 		goto out;
 	}
 
-	map = xmmap(NULL, mapsize, PROT_READ, MAP_PRIVATE, fd, 0);
-	close(fd);
-	if (!map) {
-		ret = -1;
-		goto out;
-	}
-
 	if (oi->disk_sizep)
 		*oi->disk_sizep = mapsize;
 	if (oi->mtimep)
 		*oi->mtimep = st.st_mtime;
 
-	stream_to_end = &stream;
+	if (!oi->contentp) {
+		struct odb_inflate_reader reader;
 
-	switch (unpack_loose_header(&stream, map, mapsize, hdr, sizeof(hdr))) {
+		odb_inflate_reader_init(&reader, fd, 0, st.st_size);
+		header_result = read_loose_stream_header(&reader, hdr, sizeof(hdr));
+		odb_inflate_reader_release(&reader);
+		close(fd);
+	} else {
+		map = xmmap(NULL, mapsize, PROT_READ, MAP_PRIVATE, fd, 0);
+		close(fd);
+		if (!map) {
+			ret = -1;
+			goto out;
+		}
+		stream_to_end = &stream;
+		header_result = unpack_loose_header(&stream, map, mapsize, hdr, sizeof(hdr));
+	}
+
+	switch (header_result) {
 	case ULHR_OK:
 		if (!oi->sizep)
 			oi->sizep = &size_scratch;
@@ -246,94 +273,31 @@ static int open_loose_object(struct odb_source_loose *loose,
 	return -1;
 }
 
-static void *odb_source_loose_map_object(struct odb_source_loose *loose,
-					 const struct object_id *oid,
-					 unsigned long *size)
-{
-	const char *p;
-	int fd = open_loose_object(loose, oid, &p);
-	void *map = NULL;
-	struct stat st;
-
-	if (fd < 0)
-		return NULL;
-
-	if (!fstat(fd, &st)) {
-		*size = xsize_t(st.st_size);
-		if (!*size) {
-			/* mmap() is forbidden on empty files */
-			error(_("object file %s is empty"), p);
-			goto out;
-		}
-
-		map = xmmap(NULL, *size, PROT_READ, MAP_PRIVATE, fd, 0);
-	}
-
-out:
-	close(fd);
-	return map;
-}
-
 struct odb_loose_read_stream {
 	struct odb_read_stream base;
-	git_zstream z;
-	enum {
-		ODB_LOOSE_READ_STREAM_INUSE,
-		ODB_LOOSE_READ_STREAM_DONE,
-		ODB_LOOSE_READ_STREAM_ERROR,
-	} z_state;
-	void *mapped;
-	unsigned long mapsize;
-	char hdr[32];
-	int hdr_avail;
-	int hdr_used;
+	struct odb_inflate_reader reader;
+	size_t remaining;
 };
 
 static ssize_t read_istream_loose(struct odb_read_stream *_st, char *buf, size_t sz)
 {
 	struct odb_loose_read_stream *st =
 		container_of(_st, struct odb_loose_read_stream, base);
-	size_t total_read = 0;
+	size_t want = sz < st->remaining ? sz : st->remaining;
+	ssize_t n;
+	unsigned char extra;
 
-	switch (st->z_state) {
-	case ODB_LOOSE_READ_STREAM_DONE:
+	if (!sz)
 		return 0;
-	case ODB_LOOSE_READ_STREAM_ERROR:
+	n = odb_inflate_reader_read(&st->reader, buf, want);
+	if (n < 0 || (size_t)n != want)
 		return -1;
-	default:
-		break;
-	}
-
-	if (st->hdr_used < st->hdr_avail) {
-		size_t to_copy = st->hdr_avail - st->hdr_used;
-		if (sz < to_copy)
-			to_copy = sz;
-		memcpy(buf, st->hdr + st->hdr_used, to_copy);
-		st->hdr_used += to_copy;
-		total_read += to_copy;
-	}
-
-	while (total_read < sz) {
-		int status;
-
-		st->z.next_out = (unsigned char *)buf + total_read;
-		st->z.avail_out = sz - total_read;
-		status = git_inflate(&st->z, Z_FINISH);
-
-		total_read = st->z.next_out - (unsigned char *)buf;
-
-		if (status == Z_STREAM_END) {
-			git_inflate_end(&st->z);
-			st->z_state = ODB_LOOSE_READ_STREAM_DONE;
-			break;
-		}
-		if (status != Z_OK && (status != Z_BUF_ERROR || total_read < sz)) {
-			git_inflate_end(&st->z);
-			st->z_state = ODB_LOOSE_READ_STREAM_ERROR;
-			return -1;
-		}
-	}
-	return total_read;
+	st->remaining -= n;
+	if (!st->remaining &&
+	    (odb_inflate_reader_read(&st->reader, &extra, 1) != 0 ||
+	     st->reader.z.avail_in || st->reader.pos != st->reader.end))
+		return -1;
+	return n;
 }
 
 static int close_istream_loose(struct odb_read_stream *_st)
@@ -341,10 +305,35 @@ static int close_istream_loose(struct odb_read_stream *_st)
 	struct odb_loose_read_stream *st =
 		container_of(_st, struct odb_loose_read_stream, base);
 
-	if (st->z_state == ODB_LOOSE_READ_STREAM_INUSE)
-		git_inflate_end(&st->z);
-	munmap(st->mapped, st->mapsize);
-	return 0;
+	odb_inflate_reader_release(&st->reader);
+	return close(st->reader.fd);
+}
+
+static struct odb_read_stream *open_loose_read_stream(int fd, off_t end)
+{
+	struct odb_loose_read_stream *st;
+	struct object_info oi = OBJECT_INFO_INIT;
+	char hdr[MAX_HEADER_LEN];
+
+	CALLOC_ARRAY(st, 1);
+	odb_inflate_reader_init(&st->reader, fd, 0, end);
+	oi.sizep = &st->base.size;
+	oi.typep = &st->base.type;
+	if (read_loose_stream_header(&st->reader, hdr, sizeof(hdr)) != ULHR_OK ||
+	    parse_loose_header(hdr, &oi) < 0 ||
+	    st->base.type <= OBJ_NONE)
+		goto error;
+
+	st->remaining = st->base.size;
+	st->base.close = close_istream_loose;
+	st->base.read = read_istream_loose;
+	return &st->base;
+
+error:
+	odb_inflate_reader_release(&st->reader);
+	close(fd);
+	free(st);
+	return NULL;
 }
 
 static int odb_source_loose_read_object_stream(struct odb_read_stream **out,
@@ -352,54 +341,18 @@ static int odb_source_loose_read_object_stream(struct odb_read_stream **out,
 					       const struct object_id *oid)
 {
 	struct odb_source_loose *loose = odb_source_loose_downcast(source);
-	struct object_info oi = OBJECT_INFO_INIT;
-	struct odb_loose_read_stream *st;
-	unsigned long mapsize;
-	void *mapped;
+	const char *path;
+	struct stat st;
+	int fd = open_loose_object(loose, oid, &path);
 
-	mapped = odb_source_loose_map_object(loose, oid, &mapsize);
-	if (!mapped)
+	if (fd < 0)
 		return -1;
-
-	/*
-	 * Note: we must allocate this structure early even though we may still
-	 * fail. This is because we need to initialize the zlib stream, and it
-	 * is not possible to copy the stream around after the fact because it
-	 * has self-referencing pointers.
-	 */
-	CALLOC_ARRAY(st, 1);
-
-	switch (unpack_loose_header(&st->z, mapped, mapsize, st->hdr,
-				    sizeof(st->hdr))) {
-	case ULHR_OK:
-		break;
-	case ULHR_BAD:
-	case ULHR_TOO_LONG:
-		goto error;
+	if (fstat(fd, &st) || st.st_size <= 0) {
+		close(fd);
+		return error(_("unable to read loose object %s"), oid_to_hex(oid));
 	}
-
-	oi.sizep = &st->base.size;
-	oi.typep = &st->base.type;
-
-	if (parse_loose_header(st->hdr, &oi) < 0 || st->base.type < 0)
-		goto error;
-
-	st->mapped = mapped;
-	st->mapsize = mapsize;
-	st->hdr_used = strlen(st->hdr) + 1;
-	st->hdr_avail = st->z.total_out;
-	st->z_state = ODB_LOOSE_READ_STREAM_INUSE;
-	st->base.close = close_istream_loose;
-	st->base.read = read_istream_loose;
-
-	*out = &st->base;
-
-	return 0;
-error:
-	git_inflate_end(&st->z);
-	munmap(mapped, mapsize);
-	free(st);
-	return -1;
+	*out = open_loose_read_stream(fd, st.st_size);
+	return *out ? 0 : -1;
 }
 
 struct for_each_object_wrapper_data {
