@@ -189,6 +189,61 @@ test_expect_success 'git diff --cached: no diff (index unchanged)' '
 	)
 '
 
+test_expect_success 'diff-tree between commits reads blobs, not takeover worktree files' '
+	restart_server checkin-convert-checkin &&
+	(
+		cd canon-repo &&
+		echo "binary-content-b" >b.bin &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-canon.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git add b.bin &&
+		git commit -m "add b.bin via ext" &&
+
+		# Make the index entry stat-clean and not racy, so that
+		# reuse_worktree_file() would pick the working tree file if
+		# the conversion probe claimed "no conversion".
+		test-tool chmtime =-60 b.bin &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-canon.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git update-index --refresh &&
+
+		rm -f ../diff-tree-trace2 &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-canon.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			GIT_TRACE2_EVENT="$(pwd)/../diff-tree-trace2" \
+			git diff-tree --numstat -r HEAD~1 HEAD >../diff-tree-out &&
+
+		# The committed pointer blob is compared, not the file content.
+		git show HEAD:b.bin >../b-pointer &&
+		printf "%d\t0\tb.bin\n" "$(wc -l <../b-pointer)" >../diff-tree-expect &&
+		test_cmp ../diff-tree-expect ../diff-tree-out &&
+		! grep "\"category\":\"textil-ext\"" ../diff-tree-trace2
+	)
+'
+
+test_expect_success 'controller requests are visible as textil-ext trace2 regions' '
+	restart_server checkin-convert-checkin &&
+	(
+		cd canon-repo &&
+		echo "binary-content-c" >c.bin &&
+		rm -f ../add-trace2 &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-canon.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			GIT_TRACE2_EVENT="$(pwd)/../add-trace2" \
+			git add c.bin &&
+		grep "\"event\":\"region_enter\".*\"category\":\"textil-ext\".*\"label\":\"checkin_convert\"" ../add-trace2 &&
+		grep "\"category\":\"textil-ext\",\"key\":\"items\",\"value\":\"1\"" ../add-trace2
+	)
+'
+
 test_expect_success 'cleanup: stop test helper server' '
 	stop_executor_server
 '

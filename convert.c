@@ -1469,13 +1469,25 @@ int convert_to_git(struct index_state *istate,
 	convert_attrs(istate, &ca, path);
 
 	/*
-	 * Textil ext checkin takeover: activate for any real conversion
-	 * (src && dst are non-NULL) but NOT for would_convert_to_git()
-	 * probes which pass src=NULL, dst=NULL.
+	 * Textil ext checkin takeover replaces the clean conversion for
+	 * matching paths.  A would_convert_to_git() probe (src=NULL,
+	 * dst=NULL) must give the same answer as the real conversion
+	 * without contacting the controller: callers such as
+	 * reuse_worktree_file() in diff.c read the working tree file
+	 * instead of the blob only when the probe says "no conversion",
+	 * and then each file would be converted through the controller.
 	 *
-	 * This covers both object-write (CONV_WRITE_OBJECT) and
-	 * canonicalization for status/diff (global_conv_flags_eol).
+	 * The real conversion covers both object-write (CONV_WRITE_OBJECT)
+	 * and canonicalization for status/diff (global_conv_flags_eol).
 	 */
+	if (!src && !dst) {
+		struct textil_ext_eval_result ext_result;
+		textil_ext_evaluate_for_checkin(
+			conv_attrs_filter_name(&ca), 1, &ext_result);
+		if (ext_result.matched &&
+		    ext_result.action == TEXTIL_ACTION_TAKEOVER)
+			return 1;
+	}
 	if (src && dst) {
 		struct textil_ext_eval_result ext_result;
 		textil_ext_evaluate_for_checkin(

@@ -16,6 +16,7 @@
 #include "abspath.h"
 #include "odb.h"
 #include "trace.h"
+#include "trace2.h"
 
 #ifdef SUPPORTS_SIMPLE_IPC
 #include "simple-ipc.h"
@@ -89,6 +90,32 @@ static const char *executor_status_name(enum textil_ext_executor_status status)
 	}
 	return "unknown";
 }
+
+#ifdef SUPPORTS_SIMPLE_IPC
+/*
+ * One controller round trip, visible in trace2 as a "textil-ext" region
+ * named after the phase with the batch size, so request counts and their
+ * cost can be read from GIT_TRACE2_EVENT without the Textil trace file.
+ */
+static int send_controller_request(
+	const struct textil_ext_takeover_batch *batch,
+	const char *endpoint,
+	const struct ipc_client_connect_options *options,
+	const struct strbuf *request,
+	struct strbuf *answer)
+{
+	const char *phase = phase_to_string(batch->phase);
+	int ret;
+
+	trace2_region_enter("textil-ext", phase, the_repository);
+	trace2_data_intmax("textil-ext", the_repository, "items",
+			   batch->nr_items);
+	ret = ipc_client_send_command(endpoint, options,
+				      request->buf, request->len, answer);
+	trace2_region_leave("textil-ext", phase, the_repository);
+	return ret;
+}
+#endif
 
 static void trace_batch_roundtrip(
 	const struct textil_ext_takeover_batch *batch,
@@ -645,9 +672,8 @@ static enum textil_ext_executor_status execute_src_path_batch(
 	options.wait_if_busy = 1;
 	options.wait_if_not_found = 0;
 
-	ipc_ret = ipc_client_send_command(endpoint, &options,
-					  request.buf, request.len,
-					  &answer);
+	ipc_ret = send_controller_request(batch, endpoint, &options,
+					  &request, &answer);
 	if (ipc_ret) {
 		strbuf_addf(err,
 			_("textil-ext: failed to connect to endpoint '%s'"),
@@ -970,9 +996,8 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 	options.wait_if_busy = 1;
 	options.wait_if_not_found = 0;
 
-	ipc_ret = ipc_client_send_command(endpoint, &options,
-					  request.buf, request.len,
-					  &answer);
+	ipc_ret = send_controller_request(batch, endpoint, &options,
+					  &request, &answer);
 	if (ipc_ret) {
 		strbuf_addf(err,
 			_("textil-ext: failed to connect to endpoint '%s'"),
