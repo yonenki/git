@@ -53,6 +53,7 @@ struct textil_ext_takeover_item {
 	const char *rule_id;         /* matched rule id (borrowed) */
 	char *attr_filter;           /* selector input (owned, xstrdup; NULL ok) */
 	char *blob_oid;              /* blob object id hex (owned, xstrdup; NULL for checkin_convert) */
+	char *old_blob_oid;          /* preflight predecessor (owned); NULL for target-only paths */
 	char *input_path;            /* abs path to input file (owned, xstrdup; NULL for preflight/materialize) */
 	int is_regular_file;         /* 0/1 */
 	int strict;                  /* rule.strict */
@@ -313,6 +314,7 @@ struct index_state; /* forward declaration */
  */
 void textil_ext_collect_preflight_takeover_batch(
 	struct index_state *index,
+	struct index_state *source_index,
 	const char *operation,
 	const char *repo_root,
 	struct textil_ext_takeover_batch *batch_out);

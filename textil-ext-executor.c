@@ -472,6 +472,9 @@ static int build_batch_request(
 						   item->blob_oid, err))
 				return -1;
 		}
+		if (item->old_blob_oid &&
+		    validate_request_value("old_blob_oid", item->old_blob_oid, err))
+			return -1;
 		for (j = 0; j < item->nr_capabilities; j++) {
 			if (validate_request_value("capability",
 						   item->capabilities[j], err))
@@ -489,6 +492,8 @@ static int build_batch_request(
 					 item->input_path);
 		else
 			packet_buf_write(out, "blob_oid=%s\n", item->blob_oid);
+		if (item->old_blob_oid)
+			packet_buf_write(out, "old_blob_oid=%s\n", item->old_blob_oid);
 		packet_buf_write(out, "is_regular_file=%s\n",
 				 item->is_regular_file ? "true" : "false");
 		packet_buf_write(out, "strict=%s\n",
@@ -1172,13 +1177,21 @@ static void textil_ext_collect_takeover_batch(
 
 void textil_ext_collect_preflight_takeover_batch(
 	struct index_state *index,
+	struct index_state *source_index,
 	const char *operation,
 	const char *repo_root,
 	struct textil_ext_takeover_batch *batch_out)
 {
+	int i;
 	textil_ext_collect_takeover_batch(index, operation, repo_root,
 					  TEXTIL_EXT_EXEC_PHASE_PREFLIGHT,
 					  batch_out);
+	for (i = 0; i < batch_out->nr_items; i++) {
+		struct textil_ext_takeover_item *item = &batch_out->items[i];
+		int pos = index_name_pos(source_index, item->path, strlen(item->path));
+		if (pos >= 0 && !ce_stage(source_index->cache[pos]))
+			item->old_blob_oid = xstrdup(oid_to_hex(&source_index->cache[pos]->oid));
+	}
 }
 
 void textil_ext_collect_materialize_takeover_batch(
@@ -1379,6 +1392,7 @@ void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch)
 		free(batch->items[i].path);
 		free(batch->items[i].attr_filter);
 		free(batch->items[i].blob_oid);
+		free(batch->items[i].old_blob_oid);
 		free(batch->items[i].input_path);
 	}
 }
