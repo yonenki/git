@@ -504,6 +504,7 @@ static int build_batch_request(
 		if (batch->phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT) {
 			packet_buf_write(out, "checkout_two_tree=%s\n", item->two_tree_checkout ? "true" : "false");
 			packet_buf_write(out, "checkout_verified=%s\n", item->old_worktree_verified ? "true" : "false");
+			packet_buf_write(out, "checkout_absent=%s\n", item->old_worktree_absent ? "true" : "false");
 			packet_buf_write(out, "checkout_overwrite=%s\n", item->overwrite_allowed ? "true" : "false");
 		}
 		packet_buf_write(out, "is_regular_file=%s\n",
@@ -1213,14 +1214,12 @@ void textil_ext_collect_preflight_takeover_batch(
 				S_ISREG(old->ce_mode) && !(old->ce_flags & CE_CONFLICTED) &&
 				!(!options->skip_sparse_checkout && ce_skip_worktree(old) &&
 				  (old->ce_flags & CE_NEW_SKIP_WORKTREE));
+			item->old_worktree_absent = item->old_worktree_verified &&
+				old->textil_worktree_absent;
 		} else if (pos < 0 && two_tree && !item->overwrite_allowed) {
-			struct stat st;
-			/* verify_absent may authorize overwriting an ignored file.
-			 * Only genuine absence grants lazy creation. */
-			if (lstat(item->path, &st) < 0 && errno == ENOENT)
-				item->old_worktree_verified = 1;
-			else
-				item->overwrite_allowed = 1;
+			/* Keep the absence verified by Git, not a later pathname probe. */
+			item->old_worktree_absent = item->checkout_entry->textil_worktree_absent;
+			item->old_worktree_verified = item->old_worktree_absent;
 		}
 	}
 }

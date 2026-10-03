@@ -24,7 +24,8 @@ struct cache_entry {
 	struct stat_data ce_stat_data;
 	unsigned int ce_mode;
 	unsigned int ce_flags;
-	unsigned int mem_pool_allocated;
+	unsigned int mem_pool_allocated : 1;
+	unsigned int textil_worktree_absent : 1; /* transient verify_uptodate proof */
 	unsigned int ce_namelen;
 	unsigned int index;	/* for link extension */
 	struct object_id oid;
