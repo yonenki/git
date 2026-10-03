@@ -531,11 +531,23 @@ static int validate_batch_request(const char *req, size_t req_len,
 
 /* --- Build pkt-line reply helpers --------------------------------------- */
 
-static void build_ok_reply(struct strbuf *out)
+static void build_ok_reply(struct strbuf *out,
+			   const char *request, size_t request_len)
 {
+	size_t pos = 0;
 	packet_buf_write(out, "status=ok\n");
-	packet_buf_delim(out);
-	packet_buf_write(out, "disposition=materialize\n");
+	for (;;) {
+		const char *line;
+		size_t line_len;
+		enum pktline_mem_status status =
+			pktline_read_mem(request, request_len, &pos, &line, &line_len);
+		if (status == PKTLINE_MEM_FLUSH || status == PKTLINE_MEM_ERROR)
+			break;
+		if (status == PKTLINE_MEM_DELIM) {
+			packet_buf_delim(out);
+			packet_buf_write(out, "disposition=materialize\n");
+		}
+	}
 	packet_buf_flush(out);
 }
 
@@ -566,7 +578,7 @@ static int app_cb(void *application_data UNUSED,
 
 	switch (server_args.mode) {
 	case REPLY_OK:
-		build_ok_reply(&reply);
+		build_ok_reply(&reply, request, request_len);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
 		return ret;
@@ -596,7 +608,7 @@ static int app_cb(void *application_data UNUSED,
 
 		if (validate_batch_request(request, request_len,
 					   &reason)) {
-			build_ok_reply(&reply);
+			build_ok_reply(&reply, request, request_len);
 			ret = reply_cb(reply_data, reply.buf, reply.len);
 		} else {
 			build_error_reply(&reply, reason.buf);
@@ -609,7 +621,7 @@ static int app_cb(void *application_data UNUSED,
 
 	case REPLY_TRAILING_AFTER_FLUSH:
 		/* Valid ok reply + extra data after flush */
-		build_ok_reply(&reply);
+		build_ok_reply(&reply, request, request_len);
 		strbuf_addstr(&reply, "GARBAGE");
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
