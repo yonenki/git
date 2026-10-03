@@ -487,6 +487,14 @@ static int check_updates(struct unpack_trees_options *o,
 			strbuf_release(&main_wt);
 			die("%s", pf_err.buf);
 		}
+		for (i = 0; i < pf_batch.nr_items; i++) {
+			struct textil_ext_takeover_item *item = &pf_batch.items[i];
+			if (item->projected) {
+				struct cache_entry *ce = item->checkout_entry;
+				ce->ce_flags |= CE_SKIP_WORKTREE;
+				ce->ce_flags &= ~CE_UPDATE;
+			}
+		}
 
 		/*
 		 * Batch-first materialize: pre-resolve ALL src_paths in one

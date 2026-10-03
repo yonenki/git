@@ -362,19 +362,6 @@ test_expect_success 'key-order: message before status accepted (rejected reply)'
 	)
 '
 
-test_expect_success 'key-order: ok with optional message accepted' '
-	restart_server ok-with-message &&
-	(
-		cd executor-ipc-repo &&
-		env \
-			TEXTIL_GIT_EXT_POLICY_PATH="$POLICY_PATH" \
-			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
-			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			git checkout with-lfs &&
-		test -f a.bin &&
-		git checkout main
-	)
-'
 
 # === Control char rejection ===
 

@@ -53,7 +53,6 @@ enum reply_mode {
 	REPLY_NO_FLUSH,
 	REPLY_MISSING_MESSAGE,
 	REPLY_REORDERED,
-	REPLY_OK_WITH_MESSAGE,
 	REPLY_CONTROL_CHAR,
 	REPLY_UNKNOWN_KEY,
 	REPLY_OVERSIZED,
@@ -142,8 +141,6 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_MISSING_MESSAGE;
 	if (!strcmp(s, "reordered"))
 		return REPLY_REORDERED;
-	if (!strcmp(s, "ok-with-message"))
-		return REPLY_OK_WITH_MESSAGE;
 	if (!strcmp(s, "control-char"))
 		return REPLY_CONTROL_CHAR;
 	if (!strcmp(s, "unknown-key"))
@@ -537,6 +534,8 @@ static int validate_batch_request(const char *req, size_t req_len,
 static void build_ok_reply(struct strbuf *out)
 {
 	packet_buf_write(out, "status=ok\n");
+	packet_buf_delim(out);
+	packet_buf_write(out, "disposition=materialize\n");
 	packet_buf_flush(out);
 }
 
@@ -652,15 +651,6 @@ static int app_cb(void *application_data UNUSED,
 		/* message before status (key-order independence test) */
 		packet_buf_write(&reply, "message=reordered rejection\n");
 		packet_buf_write(&reply, "status=rejected\n");
-		packet_buf_flush(&reply);
-		ret = reply_cb(reply_data, reply.buf, reply.len);
-		strbuf_release(&reply);
-		return ret;
-
-	case REPLY_OK_WITH_MESSAGE:
-		/* status=ok with optional message (should be accepted) */
-		packet_buf_write(&reply, "status=ok\n");
-		packet_buf_write(&reply, "message=extra info\n");
 		packet_buf_flush(&reply);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
@@ -1205,9 +1195,14 @@ static int app_cb(void *application_data UNUSED,
 		}
 
 		if (!is_materialize) {
-			/* preflight: just return ok */
+			/* One disposition per checkout candidate. */
 			int i;
-			build_ok_reply(&reply);
+			packet_buf_write(&reply, "status=ok\n");
+			for (i = 0; i < nr_items; i++) {
+				packet_buf_delim(&reply);
+				packet_buf_write(&reply, "disposition=materialize\n");
+			}
+			packet_buf_flush(&reply);
 			for (i = 0; i < nr_items; i++)
 				strbuf_release(&item_paths[i]);
 			free(item_paths);

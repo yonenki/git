@@ -58,6 +58,8 @@ struct textil_ext_takeover_item {
 	int strict;                  /* rule.strict */
 	const char * const *capabilities; /* required_capabilities (borrowed) */
 	int nr_capabilities;
+	int projected;              /* preflight disposition; suppress checkout payload */
+	struct cache_entry *checkout_entry; /* borrowed checkout candidate, collection only */
 };
 
 /* --- Takeover batch (executor input) ------------------------------------ */
@@ -98,7 +100,7 @@ enum textil_ext_executor_status {
  * For materialize, use textil_ext_resolve_materialize_batch() instead.
  */
 enum textil_ext_executor_status textil_ext_execute_takeover_batch(
-	const struct textil_ext_takeover_batch *batch,
+	struct textil_ext_takeover_batch *batch,
 	struct strbuf *err);
 
 struct textil_ext_eval_result; /* forward declaration (textil-ext-policy.h) */

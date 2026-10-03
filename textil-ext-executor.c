@@ -417,12 +417,16 @@ static int build_batch_request(
 	struct strbuf *err)
 {
 	int i, j;
+	const char *operation_id = getenv("TEXTIL_GIT_EXT_OPERATION_ID");
 
 	/* Validate header values */
 	if (validate_request_value("operation", batch->operation, err))
 		return -1;
 	if (batch->repo_root &&
 	    validate_request_value("repo_root", batch->repo_root, err))
+		return -1;
+	if (operation_id &&
+	    validate_request_value("operation_id", operation_id, err))
 		return -1;
 
 	/* Header fields */
@@ -435,6 +439,8 @@ static int build_batch_request(
 	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_PREFLIGHT &&
 	    append_extension_config_snapshot(out, err))
 		return -1;
+	if (operation_id)
+		packet_buf_write(out, "operation_id=%s\n", operation_id);
 
 	/* Items (delim-separated) */
 	for (i = 0; i < batch->nr_items; i++) {
@@ -650,9 +656,11 @@ static void release_materialize_source(struct string_list_item *item)
 /*
  * Parse a pkt-line v1 executor response.
  *
- * Preflight format:
- *   <pkt> status=ok|rejected|error
- *   <pkt> message=<text>           (required when status != ok)
+ * Preflight success (one ordered disposition per request item):
+ *   <pkt> status=ok
+ *   <delim>
+ *   <pkt> disposition=projected|materialize
+ *   ...
  *   <flush>
  *
  * Materialize format (when src_paths_out is non-NULL):
@@ -670,10 +678,9 @@ static void release_materialize_source(struct string_list_item *item)
  *   <pkt> message=<text>
  *   <flush>
  *
- * When src_paths_out is NULL, delim packets and src_path keys are rejected
- * (preflight mode).  When src_paths_out is non-NULL, delim packets are
- * allowed after status=ok to introduce src_path items.  src_path is
- * forbidden when status != ok.
+ * A successful preflight fills batch item dispositions; materialize fills
+ * src_paths_out. Each item section contains exactly one value. Failed replies
+ * have only status + required message, with no item sections.
  *
  * Key order within a section is independent.  Unknown keys, duplicate
  * keys (within a section), and trailing data after flush are rejected.
@@ -684,12 +691,15 @@ static void release_materialize_source(struct string_list_item *item)
 static int parse_executor_response(const char *buf, size_t len,
 				   struct strbuf *status_out,
 				   struct strbuf *msg_out,
-				   struct string_list *src_paths_out)
+				   struct string_list *src_paths_out,
+				   struct textil_ext_takeover_batch *preflight_batch)
 {
 	size_t pos = 0;
 	int has_status = 0, has_message = 0;
 	int in_src_path_section = 0;
 	int has_src_path = 0, has_cleanup_source = 0, cleanup_source = 0;
+	int disposition_nr = 0;
+	int section_has_value = 0;
 
 	for (;;) {
 		const char *line;
@@ -710,17 +720,17 @@ static int parse_executor_response(const char *buf, size_t len,
 			break;
 		}
 		if (st == PKTLINE_MEM_DELIM) {
-			/*
-			 * Delim is only valid in materialize mode
-			 * (src_paths_out != NULL) after seeing status=ok.
-			 */
-			if (!src_paths_out || !has_status)
+			/* Item sections require a successful batch reply. */
+			if ((!src_paths_out && !preflight_batch) || !has_status)
+				return -1;
+			if (in_src_path_section && !section_has_value)
 				return -1;
 			if (strcmp(status_out->buf, "ok"))
 				return -1; /* delim not allowed for non-ok */
 			if (in_src_path_section && !has_src_path)
 				return -1;
 			has_src_path = has_cleanup_source = cleanup_source = 0;
+			section_has_value = 0;
 			in_src_path_section = 1;
 			continue;
 		}
@@ -741,6 +751,24 @@ static int parse_executor_response(const char *buf, size_t len,
 		}
 
 		if (in_src_path_section) {
+			if (preflight_batch) {
+				int projected;
+				if (section_has_value)
+					return -1;
+				section_has_value = 1;
+				if (key_len != 11 || memcmp(line, "disposition", 11))
+					return -1;
+				if (val_len == 9 && !memcmp(val, "projected", 9))
+					projected = 1;
+				else if (val_len == 11 && !memcmp(val, "materialize", 11))
+					projected = 0;
+				else
+					return -1;
+				if (disposition_nr >= preflight_batch->nr_items)
+					return -1;
+				preflight_batch->items[disposition_nr++].projected = projected;
+				continue;
+			}
 			/* Per-source ownership is explicit; absent means unowned. */
 			if (key_len == 8 && !memcmp(line, "src_path", 8)) {
 				struct strbuf path_buf = STRBUF_INIT;
@@ -781,6 +809,12 @@ static int parse_executor_response(const char *buf, size_t len,
 			return -1; /* unknown key */
 		}
 	}
+
+	if (in_src_path_section && !section_has_value)
+		return -1;
+	if (preflight_batch && !strcmp(status_out->buf, "ok") &&
+	    (disposition_nr != preflight_batch->nr_items || has_message))
+		return -1;
 
 	/* Reject trailing data after flush */
 	if (pos < len)
@@ -875,7 +909,7 @@ static enum textil_ext_executor_status execute_src_path_batch(
 
 	if (parse_executor_response(answer.buf, answer.len,
 				    &status_str, &msg,
-				    src_paths_out)) {
+				    src_paths_out, NULL)) {
 		strbuf_addf(err,
 			_("textil-ext: invalid response from endpoint '%s'"),
 			endpoint);
@@ -1083,7 +1117,7 @@ static void textil_ext_collect_takeover_batch(
 	batch_out->repo_root = repo_root;
 
 	for (i = 0; i < index->cache_nr; i++) {
-		const struct cache_entry *ce = index->cache[i];
+		struct cache_entry *ce = index->cache[i];
 		struct conv_attrs ca;
 		struct textil_ext_eval_result ext_result;
 		const char *filter_name;
@@ -1132,6 +1166,7 @@ static void textil_ext_collect_takeover_batch(
 		item->strict = ext_result.strict;
 		item->capabilities = ext_result.capabilities;
 		item->nr_capabilities = ext_result.nr_capabilities;
+		item->checkout_entry = ce;
 	}
 }
 
@@ -1160,7 +1195,7 @@ void textil_ext_collect_materialize_takeover_batch(
 /* --- Executor ----------------------------------------------------------- */
 
 enum textil_ext_executor_status textil_ext_execute_takeover_batch(
-	const struct textil_ext_takeover_batch *batch,
+	struct textil_ext_takeover_batch *batch,
 	struct strbuf *err)
 {
 	/* Preconditions (common, evaluated before #ifdef split) */
@@ -1228,7 +1263,7 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 
 	/* 5. Parse pkt-line response (preflight: no src_paths) */
 	if (parse_executor_response(answer.buf, answer.len,
-				    &status_str, &msg, NULL)) {
+				    &status_str, &msg, NULL, batch)) {
 		strbuf_addf(err,
 			_("textil-ext: invalid response from endpoint '%s'"),
 			endpoint);
