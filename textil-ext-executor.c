@@ -772,6 +772,7 @@ static int blob_content_is_lfs_pointer(const char *buf, size_t len)
 	const char *p = buf;
 	const char *end = buf + len;
 	int has_version = 0, has_oid = 0;
+	unsigned int extension_priorities = 0;
 
 	while (p < end) {
 		const char *line_end = memchr(p, '\n', end - p);
@@ -810,6 +811,33 @@ static int blob_content_is_lfs_pointer(const char *buf, size_t len)
 				if (!isdigit(size_val[i]))
 					return 0;
 			}
+		} else if (line_len >= strlen("ext-0-x sha256:") + 64 &&
+			   !memcmp(line, "ext-", 4)) {
+			const char *space = memchr(line, ' ', line_len);
+			const char *oid;
+			unsigned int priority;
+			size_t i;
+
+			if (!space || space - line < 7 ||
+			    line[4] < '0' || line[4] > '9' || line[5] != '-' ||
+			    !((line[6] >= 'a' && line[6] <= 'z') ||
+			      (line[6] >= 'A' && line[6] <= 'Z') ||
+			      (line[6] >= '0' && line[6] <= '9') ||
+			      line[6] == '_'))
+				return 0;
+			oid = space + 1;
+			if (trimmed_end - oid != strlen("sha256:") + 64 ||
+			    memcmp(oid, "sha256:", strlen("sha256:")))
+				return 0;
+			oid += strlen("sha256:");
+			for (i = 0; i < 64; i++)
+				if (!((oid[i] >= '0' && oid[i] <= '9') ||
+				      (oid[i] >= 'a' && oid[i] <= 'f')))
+					return 0;
+			priority = 1U << (line[4] - '0');
+			if (extension_priorities & priority)
+				return 0;
+			extension_priorities |= priority;
 		} else {
 			return 0;
 		}
