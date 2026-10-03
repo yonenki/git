@@ -474,7 +474,7 @@ static int check_updates(struct unpack_trees_options *o,
 
 		textil_ext_resolve_worktree_root(&main_wt);
 		textil_ext_collect_preflight_takeover_batch(
-			index, o->src_index, "checkout",
+			index, o, "checkout",
 			main_wt.buf, &pf_batch);
 
 		if (pf_batch.nr_items > 0)

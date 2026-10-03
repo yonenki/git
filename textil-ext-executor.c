@@ -8,6 +8,7 @@
 #include "strbuf.h"
 #include "string-list.h"
 #include "read-cache-ll.h"
+#include "unpack-trees.h"
 #include "repository.h"
 #include "convert.h"
 #include "alloc.h"
@@ -418,6 +419,7 @@ static int build_batch_request(
 {
 	int i, j;
 	const char *operation_id = getenv("TEXTIL_GIT_EXT_OPERATION_ID");
+	const char *projection_workspace = getenv("TEXTIL_GIT_EXT_PROJECTION_WORKSPACE");
 
 	/* Validate header values */
 	if (validate_request_value("operation", batch->operation, err))
@@ -427,6 +429,9 @@ static int build_batch_request(
 		return -1;
 	if (operation_id &&
 	    validate_request_value("operation_id", operation_id, err))
+		return -1;
+	if (projection_workspace &&
+	    validate_request_value("projection_workspace", projection_workspace, err))
 		return -1;
 
 	/* Header fields */
@@ -441,6 +446,8 @@ static int build_batch_request(
 		return -1;
 	if (operation_id)
 		packet_buf_write(out, "operation_id=%s\n", operation_id);
+	if (projection_workspace)
+		packet_buf_write(out, "projection_workspace=%s\n", projection_workspace);
 
 	/* Items (delim-separated) */
 	for (i = 0; i < batch->nr_items; i++) {
@@ -494,6 +501,11 @@ static int build_batch_request(
 			packet_buf_write(out, "blob_oid=%s\n", item->blob_oid);
 		if (item->old_blob_oid)
 			packet_buf_write(out, "old_blob_oid=%s\n", item->old_blob_oid);
+		if (batch->phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT) {
+			packet_buf_write(out, "checkout_two_tree=%s\n", item->two_tree_checkout ? "true" : "false");
+			packet_buf_write(out, "checkout_verified=%s\n", item->old_worktree_verified ? "true" : "false");
+			packet_buf_write(out, "checkout_overwrite=%s\n", item->overwrite_allowed ? "true" : "false");
+		}
 		packet_buf_write(out, "is_regular_file=%s\n",
 				 item->is_regular_file ? "true" : "false");
 		packet_buf_write(out, "strict=%s\n",
@@ -1177,20 +1189,39 @@ static void textil_ext_collect_takeover_batch(
 
 void textil_ext_collect_preflight_takeover_batch(
 	struct index_state *index,
-	struct index_state *source_index,
+	const struct unpack_trees_options *options,
 	const char *operation,
 	const char *repo_root,
 	struct textil_ext_takeover_batch *batch_out)
 {
 	int i;
+	struct index_state *source_index = options->src_index;
+	int two_tree = options->merge && options->fn == twoway_merge &&
+		options->internal.merge_size == 2;
 	textil_ext_collect_takeover_batch(index, operation, repo_root,
 					  TEXTIL_EXT_EXEC_PHASE_PREFLIGHT,
 					  batch_out);
 	for (i = 0; i < batch_out->nr_items; i++) {
 		struct textil_ext_takeover_item *item = &batch_out->items[i];
 		int pos = index_name_pos(source_index, item->path, strlen(item->path));
-		if (pos >= 0 && !ce_stage(source_index->cache[pos]))
-			item->old_blob_oid = xstrdup(oid_to_hex(&source_index->cache[pos]->oid));
+		item->two_tree_checkout = two_tree;
+		item->overwrite_allowed = options->reset != UNPACK_RESET_NONE;
+		if (pos >= 0 && !ce_stage(source_index->cache[pos])) {
+			const struct cache_entry *old = source_index->cache[pos];
+			item->old_blob_oid = xstrdup(oid_to_hex(&old->oid));
+			item->old_worktree_verified = two_tree && !item->overwrite_allowed &&
+				S_ISREG(old->ce_mode) && !(old->ce_flags & CE_CONFLICTED) &&
+				!(!options->skip_sparse_checkout && ce_skip_worktree(old) &&
+				  (old->ce_flags & CE_NEW_SKIP_WORKTREE));
+		} else if (pos < 0 && two_tree && !item->overwrite_allowed) {
+			struct stat st;
+			/* verify_absent may authorize overwriting an ignored file.
+			 * Only genuine absence grants lazy creation. */
+			if (lstat(item->path, &st) < 0 && errno == ENOENT)
+				item->old_worktree_verified = 1;
+			else
+				item->overwrite_allowed = 1;
+		}
 	}
 }
 

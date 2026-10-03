@@ -60,6 +60,9 @@ struct textil_ext_takeover_item {
 	const char * const *capabilities; /* required_capabilities (borrowed) */
 	int nr_capabilities;
 	int projected;              /* preflight disposition; suppress checkout payload */
+	int two_tree_checkout;
+	int old_worktree_verified;
+	int overwrite_allowed;
 	struct cache_entry *checkout_entry; /* borrowed checkout candidate, collection only */
 };
 
@@ -312,9 +315,10 @@ struct index_state; /* forward declaration */
  * On return, batch_out->items is heap-allocated (caller must free).
  * Always call textil_ext_takeover_batch_release() + free(items) after use.
  */
+struct unpack_trees_options;
 void textil_ext_collect_preflight_takeover_batch(
 	struct index_state *index,
-	struct index_state *source_index,
+	const struct unpack_trees_options *options,
 	const char *operation,
 	const char *repo_root,
 	struct textil_ext_takeover_batch *batch_out);
