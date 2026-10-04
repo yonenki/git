@@ -2213,7 +2213,7 @@ static int is_msys2_sh(const char *cmd)
 		if (!sh)
 			sh = path_lookup("sh", 0);
 
-		return !fspathcmp(cmd, sh);
+		return sh && !fspathcmp(cmd, sh);
 	}
 
 	return 0;

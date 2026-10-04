@@ -161,6 +161,15 @@ test_expect_success MINGW 'GIT_SHELL_PATH points to a suitable shell' '
 	esac
 '
 
+test_expect_success MINGW 'unavailable shell path is not a fatal error' '
+	mkdir no-shell-bin &&
+	test_env PATH="$PWD/no-shell-bin" test_expect_code 1 "$GIT_BINARY" \
+		var GIT_SHELL_PATH >actual &&
+	test_must_be_empty actual &&
+	test_env PATH="$PWD/no-shell-bin" "$GIT_BINARY" var -l >actual &&
+	! test_grep "^GIT_SHELL_PATH=" actual
+'
+
 test_expect_success 'GIT_ATTR_SYSTEM produces expected output' '
 	test_must_fail env GIT_ATTR_NOSYSTEM=1 git var GIT_ATTR_SYSTEM &&
 	(

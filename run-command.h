@@ -208,6 +208,8 @@ int exists_in_PATH(const char *command);
 
 /**
  * Return the path that is used to execute Unix shell command-lines.
+ * The returned path is allocated and must be freed by the caller. On Windows,
+ * return NULL when no shell is found in PATH.
  */
 char *git_shell_path(void);
 

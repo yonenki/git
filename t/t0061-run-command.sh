@@ -16,13 +16,11 @@ test_expect_success MINGW 'subprocess inherits only std handles' '
 	test-tool run-command inherited-handle
 '
 
-test_expect_success MINGW 'missing shell fails without running the command' '
+test_expect_success MINGW 'missing shell reports a spawn failure' '
 	mkdir no-shell-bin &&
-	PATH="$PWD/no-shell-bin" test_expect_code 128 "$GIT_BINARY" \
-		-c alias.needs-shell="!echo executed >shell-ran" needs-shell 2>err &&
-	test_path_is_missing shell-ran &&
-	test_grep sh err &&
-	test_grep PATH err
+	test_env PATH="$PWD/no-shell-bin" test_expect_code 128 "$GIT_BINARY" \
+		-c alias.needs-shell="!echo executed" needs-shell 2>err &&
+	test_grep "cannot spawn sh" err
 '
 
 test_expect_success 'start_command reports ENOENT (slash)' '

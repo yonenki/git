@@ -280,9 +280,8 @@ char *git_shell_path(void)
 	return xstrdup(SHELL_PATH);
 #else
 	char *p = locate_in_PATH("sh");
-	if (!p)
-		die(_("cannot find 'sh' in PATH"));
-	convert_slashes(p);
+	if (p)
+		convert_slashes(p);
 	return p;
 #endif
 }
@@ -293,7 +292,8 @@ static const char **prepare_shell_cmd(struct strvec *out, const char **argv)
 		BUG("shell command is empty");
 
 	if (strcspn(argv[0], "|&;<>()$`\\\"' \t\n*?[#~=%") != strlen(argv[0])) {
-		strvec_push_nodup(out, git_shell_path());
+		char *shell = git_shell_path();
+		strvec_push_nodup(out, shell ? shell : xstrdup("sh"));
 		strvec_push(out, "-c");
 
 		/*
