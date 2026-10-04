@@ -487,6 +487,17 @@ static int validate_src_path(const char *path, size_t path_len)
 	return 0;
 }
 
+/* string_list item util marks an explicitly controller-owned source. */
+static char cleanup_source_marker;
+
+static void release_materialize_source(struct string_list_item *item)
+{
+	if (item->util == &cleanup_source_marker) {
+		unlink(item->string);
+		item->util = NULL;
+	}
+}
+
 /*
  * Parse a pkt-line v1 executor response.
  *
@@ -499,6 +510,7 @@ static int validate_src_path(const char *path, size_t path_len)
  *   <pkt> status=ok
  *   <delim>
  *   <pkt> src_path=<abs_path>
+ *   <pkt> cleanup_source=0|1 (optional, defaults to 0)
  *   <delim>
  *   <pkt> src_path=<abs_path>
  *   ...
@@ -528,6 +540,7 @@ static int parse_executor_response(const char *buf, size_t len,
 	size_t pos = 0;
 	int has_status = 0, has_message = 0;
 	int in_src_path_section = 0;
+	int has_src_path = 0, has_cleanup_source = 0, cleanup_source = 0;
 
 	for (;;) {
 		const char *line;
@@ -542,8 +555,11 @@ static int parse_executor_response(const char *buf, size_t len,
 
 		if (st == PKTLINE_MEM_ERROR)
 			return -1;
-		if (st == PKTLINE_MEM_FLUSH)
+		if (st == PKTLINE_MEM_FLUSH) {
+			if (in_src_path_section && !has_src_path)
+				return -1;
 			break;
+		}
 		if (st == PKTLINE_MEM_DELIM) {
 			/*
 			 * Delim is only valid in materialize mode
@@ -553,6 +569,9 @@ static int parse_executor_response(const char *buf, size_t len,
 				return -1;
 			if (strcmp(status_out->buf, "ok"))
 				return -1; /* delim not allowed for non-ok */
+			if (in_src_path_section && !has_src_path)
+				return -1;
+			has_src_path = has_cleanup_source = cleanup_source = 0;
 			in_src_path_section = 1;
 			continue;
 		}
@@ -573,14 +592,27 @@ static int parse_executor_response(const char *buf, size_t len,
 		}
 
 		if (in_src_path_section) {
-			/* In src_path section: only src_path key is allowed */
+			/* Per-source ownership is explicit; absent means unowned. */
 			if (key_len == 8 && !memcmp(line, "src_path", 8)) {
 				struct strbuf path_buf = STRBUF_INIT;
+				if (has_src_path)
+					return -1;
 				if (validate_src_path(val, val_len))
 					return -1;
 				strbuf_add(&path_buf, val, val_len);
-				string_list_append(src_paths_out, path_buf.buf);
+				string_list_append(src_paths_out, path_buf.buf)->util =
+					cleanup_source ? &cleanup_source_marker : NULL;
+				has_src_path = 1;
 				strbuf_release(&path_buf);
+			} else if (key_len == 14 && !memcmp(line, "cleanup_source", 14)) {
+				if (has_cleanup_source || val_len != 1 ||
+				    (val[0] != '0' && val[0] != '1'))
+					return -1;
+				has_cleanup_source = 1;
+				cleanup_source = val[0] == '1';
+				if (has_src_path && cleanup_source)
+					src_paths_out->items[src_paths_out->nr - 1].util =
+						&cleanup_source_marker;
 			} else {
 				return -1; /* unknown key in src_path section */
 			}
@@ -1096,9 +1128,12 @@ void textil_ext_materialize_batch_result_init(
 void textil_ext_materialize_batch_result_release(
 	struct textil_ext_materialize_batch_result *result)
 {
+	struct string_list_item *item;
 	if (!result)
 		return;
 
+	for_each_string_list_item(item, &result->src_paths)
+		release_materialize_source(item);
 	string_list_clear(&result->src_paths, 0);
 }
 
@@ -1120,30 +1155,6 @@ enum textil_ext_executor_status textil_ext_resolve_materialize_batch(
 				      &result_out->src_paths, err);
 }
 
-enum textil_ext_executor_status textil_ext_execute_materialize_batch(
-	const struct textil_ext_takeover_batch *batch,
-	struct string_list *src_paths_out,
-	struct strbuf *err)
-{
-	struct textil_ext_materialize_batch_result result;
-	struct string_list_item *item;
-	enum textil_ext_executor_status status;
-
-	if (!src_paths_out)
-		BUG("execute_materialize_batch called with NULL src_paths_out");
-
-	textil_ext_materialize_batch_result_init(&result);
-	status = textil_ext_resolve_materialize_batch(batch, &result, err);
-	if (status != TEXTIL_EXT_EXECUTOR_OK)
-		goto done;
-
-	for_each_string_list_item(item, &result.src_paths)
-		string_list_append(src_paths_out, item->string);
-
-done:
-	textil_ext_materialize_batch_result_release(&result);
-	return status;
-}
 
 void textil_ext_resolve_worktree_root(struct strbuf *out)
 {
@@ -1193,11 +1204,13 @@ void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch)
 #include "strmap.h"
 
 /*
- * Global cache: "path\toid" → src_path (xstrdup'd).
+ * Global cache: "path\toid" → item in materialize_cache_sources.
  * Populated once before the sequential checkout loop, looked up per-file.
  */
 static struct strmap materialize_cache = STRMAP_INIT;
 static int materialize_cache_populated;
+static struct textil_ext_materialize_batch_result materialize_cache_sources;
+static int materialize_cache_cleanup_registered;
 
 static char *make_cache_key(const char *path, const char *oid_hex)
 {
@@ -1266,43 +1279,59 @@ int textil_ext_preresolve_materialize_cache(
 		char *key = make_cache_key(
 			preflight_batch->items[i].path,
 			preflight_batch->items[i].blob_oid);
-		strmap_put(&materialize_cache, key,
-			   xstrdup(result.src_paths.items[i].string));
+		strmap_put(&materialize_cache, key, &result.src_paths.items[i]);
 		free(key);
 	}
 	materialize_cache_populated = 1;
+	if (!materialize_cache_cleanup_registered) {
+		atexit(textil_ext_materialize_cache_clear);
+		materialize_cache_cleanup_registered = 1;
+	}
 
-	textil_ext_materialize_batch_result_release(&result);
+	/* The cache now owns the result's paths and cleanup flags. */
+	materialize_cache_sources = result;
 	strbuf_release(&main_wt);
 	textil_ext_takeover_batch_release(&mat_batch);
 	free(items);
 	return 0;
 }
 
-const char *textil_ext_materialize_cache_lookup(
-	const char *path, const char *blob_oid_hex)
+int textil_ext_materialize_cache_to_fd(
+	const char *path, const char *blob_oid_hex, int out_fd)
 {
 	char *key;
-	const char *value;
+	struct string_list_item *source;
+	int src_fd, ret = -1;
 
 	if (!materialize_cache_populated)
-		return NULL;
+		return 0;
 
 	key = make_cache_key(path, blob_oid_hex);
-	value = strmap_get(&materialize_cache, key);
+	source = strmap_get(&materialize_cache, key);
+	if (!source) {
+		free(key);
+		return 0;
+	}
+	strmap_remove(&materialize_cache, key, 0);
 	free(key);
-	return value;
+	src_fd = open(source->string, O_RDONLY);
+	if (src_fd < 0) {
+		error_errno("textil-ext: cannot open cached src_path '%s'",
+			    source->string);
+	} else {
+		if (copy_fd(src_fd, out_fd))
+			error("textil-ext: copy_fd failed for '%s'", path);
+		else
+			ret = 1;
+		close(src_fd);
+	}
+	release_materialize_source(source);
+	return ret;
 }
 
 void textil_ext_materialize_cache_clear(void)
 {
-	struct hashmap_iter iter;
-	struct strmap_entry *entry;
-
-	hashmap_for_each_entry(&materialize_cache.map, &iter, entry,
-			       ent) {
-		free(entry->value);
-	}
+	textil_ext_materialize_batch_result_release(&materialize_cache_sources);
 	strmap_clear(&materialize_cache, 0);
 	materialize_cache_populated = 0;
 }

@@ -646,6 +646,61 @@ test_expect_success 'materialize E2E: path checkout fallback includes repo_root'
 	grep "\"items\":1" "$trace_log" &&
 	grep "\"repo_root_present\":true" "$trace_log"
 '
+test_expect_success 'materialize owned sources: repeated cached and single checkout removes temporary files' '
+	mkdir owned-sources &&
+	test_when_finished stop_executor_server &&
+	TMPDIR="$TRASH_DIRECTORY/owned-sources" restart_server materialize-checkout-owned &&
+	(
+		cd executor-ipc-repo &&
+		for round in 1 2 3
+		do
+			git checkout -f main &&
+			env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
+				TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+				git checkout with-lfs &&
+			grep "materialized-by-textil" a.bin &&
+			grep "materialized-by-textil" b.bin &&
+			rm a.bin &&
+			env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
+				TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+				git checkout -- a.bin || return 1
+		done
+	) &&
+	find owned-sources -type f >remaining &&
+	test_must_be_empty remaining
+'
+
+test_expect_success 'materialize failed copy releases unconsumed cached owned sources' '
+	mkdir failed-owned-sources &&
+	test_when_finished stop_executor_server &&
+	TMPDIR="$TRASH_DIRECTORY/failed-owned-sources" restart_server materialize-checkout-open-failure &&
+	(
+		cd executor-ipc-repo &&
+		git checkout -f main &&
+		test_must_fail env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git checkout with-lfs
+	) &&
+	find failed-owned-sources -type f >remaining &&
+	test_must_be_empty remaining
+'
+
+test_expect_success 'materialize unowned sources are never removed' '
+	mkdir unowned-sources &&
+	test_when_finished stop_executor_server &&
+	TMPDIR="$TRASH_DIRECTORY/unowned-sources" restart_server materialize-checkout &&
+	(
+		cd executor-ipc-repo &&
+		git checkout -f main &&
+		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git checkout with-lfs
+	) &&
+	find unowned-sources -type f >remaining &&
+	test_line_count = 2 remaining
+'
+
 
 # === Checkin convert phase tests ===
 

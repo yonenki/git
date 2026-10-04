@@ -66,6 +66,8 @@ enum reply_mode {
 	REPLY_MATERIALIZE_SRC_PATH_WINDOWS_VERBATIM,
 	REPLY_MATERIALIZE_SRC_PATH_WINDOWS_UNC,
 	REPLY_MATERIALIZE_CHECKOUT,
+	REPLY_MATERIALIZE_CHECKOUT_OWNED,
+	REPLY_MATERIALIZE_CHECKOUT_OPEN_FAILURE,
 	REPLY_MATERIALIZE_COUNT_MISMATCH,
 	REPLY_VALIDATE_REQUEST_MATERIALIZE,
 	REPLY_CHECKIN_CONVERT_CHECKIN,
@@ -166,6 +168,10 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_MATERIALIZE_SRC_PATH_WINDOWS_UNC;
 	if (!strcmp(s, "materialize-checkout"))
 		return REPLY_MATERIALIZE_CHECKOUT;
+	if (!strcmp(s, "materialize-checkout-owned"))
+		return REPLY_MATERIALIZE_CHECKOUT_OWNED;
+	if (!strcmp(s, "materialize-checkout-open-failure"))
+		return REPLY_MATERIALIZE_CHECKOUT_OPEN_FAILURE;
 	if (!strcmp(s, "batch-checkout"))
 		return REPLY_BATCH_CHECKOUT;
 	if (!strcmp(s, "materialize-count-mismatch"))
@@ -780,7 +786,9 @@ static int app_cb(void *application_data UNUSED,
 		strbuf_release(&reply);
 		return ret;
 
-	case REPLY_MATERIALIZE_CHECKOUT: {
+	case REPLY_MATERIALIZE_CHECKOUT:
+	case REPLY_MATERIALIZE_CHECKOUT_OWNED:
+	case REPLY_MATERIALIZE_CHECKOUT_OPEN_FAILURE: {
 		/*
 		 * Parse request to extract item paths, create temp files
 		 * with predictable content, return src_paths.
@@ -861,9 +869,13 @@ static int app_cb(void *application_data UNUSED,
 				write_in_full(tmp_fd, content, strlen(content));
 				close(tmp_fd);
 			}
+			if (server_args.mode == REPLY_MATERIALIZE_CHECKOUT_OPEN_FAILURE && !i)
+				unlink(tmp_path.buf);
 			packet_buf_delim(&reply);
 			packet_buf_write(&reply, "src_path=%s\n",
 					 tmp_path.buf);
+			if (server_args.mode != REPLY_MATERIALIZE_CHECKOUT)
+				packet_buf_write(&reply, "cleanup_source=1\n");
 			strbuf_release(&tmp_path);
 			strbuf_release(&item_paths[i]);
 		}
@@ -1478,7 +1490,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 	}
 
 	/*
-	 * send-materialize: invoke textil_ext_execute_materialize_batch()
+	 * send-materialize: invoke textil_ext_resolve_materialize_batch()
 	 * with a fake 1-item batch.
 	 * Uses TEXTIL_GIT_EXT_ENDPOINT from env (must be set).
 	 * Prints executor status, src_paths, and any error message to stdout.
@@ -1486,13 +1498,14 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 	if (!strcmp(subcmd, "send-materialize")) {
 		struct textil_ext_takeover_batch batch;
 		struct textil_ext_takeover_item item;
-		struct string_list src_paths = STRING_LIST_INIT_DUP;
+		struct textil_ext_materialize_batch_result result;
 		struct strbuf err_buf = STRBUF_INIT;
 		enum textil_ext_executor_status st;
 		int i;
 
 		memset(&batch, 0, sizeof(batch));
 		memset(&item, 0, sizeof(item));
+		textil_ext_materialize_batch_result_init(&result);
 
 		item.path = xstrdup("test/a.bin");
 		item.rule_id = "lfs-takeover";
@@ -1509,8 +1522,8 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		batch.items = &item;
 		batch.nr_items = 1;
 
-		st = textil_ext_execute_materialize_batch(&batch, &src_paths,
-							  &err_buf);
+		st = textil_ext_resolve_materialize_batch(&batch, &result,
+							 &err_buf);
 
 		switch (st) {
 		case TEXTIL_EXT_EXECUTOR_OK:
@@ -1526,15 +1539,15 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 			printf("status=error\n");
 			break;
 		}
-		for (i = 0; i < src_paths.nr; i++)
-			printf("src_path=%s\n", src_paths.items[i].string);
+		for (i = 0; i < result.src_paths.nr; i++)
+			printf("src_path=%s\n", result.src_paths.items[i].string);
 		if (err_buf.len)
 			printf("message=%s\n", err_buf.buf);
 
 		free(item.path);
 		free(item.attr_filter);
 		free(item.blob_oid);
-		string_list_clear(&src_paths, 0);
+		textil_ext_materialize_batch_result_release(&result);
 		strbuf_release(&err_buf);
 		return (st != TEXTIL_EXT_EXECUTOR_OK) ? 1 : 0;
 	}
@@ -1691,7 +1704,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 	}
 
 	/*
-	 * send-materialize-wrong-phase: call textil_ext_execute_materialize_batch()
+	 * send-materialize-wrong-phase: call textil_ext_resolve_materialize_batch()
 	 * with phase=PREFLIGHT.  This is a programming error and must
 	 * trigger BUG() / exit(99).  Used to verify the materialize-only
 	 * API contract (symmetric with send-preflight-wrong-phase).
@@ -1699,11 +1712,12 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 	if (!strcmp(subcmd, "send-materialize-wrong-phase")) {
 		struct textil_ext_takeover_batch batch;
 		struct textil_ext_takeover_item item;
-		struct string_list src_paths = STRING_LIST_INIT_DUP;
+		struct textil_ext_materialize_batch_result result;
 		struct strbuf err_buf = STRBUF_INIT;
 
 		memset(&batch, 0, sizeof(batch));
 		memset(&item, 0, sizeof(item));
+		textil_ext_materialize_batch_result_init(&result);
 
 		item.path = xstrdup("test/a.bin");
 		item.rule_id = "lfs-takeover";
@@ -1722,7 +1736,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		batch.nr_items = 1;
 
 		/* This must BUG() and abort — should never return */
-		textil_ext_execute_materialize_batch(&batch, &src_paths, &err_buf);
+		textil_ext_resolve_materialize_batch(&batch, &result, &err_buf);
 
 		/* If we reach here, the BUG guard is broken */
 		die("BUG guard did not fire for non-materialize phase");

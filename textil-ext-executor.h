@@ -95,7 +95,7 @@ enum textil_ext_executor_status {
  *   - batch->phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT (BUG otherwise)
  *   - batch->nr_items > 0
  *
- * For materialize, use textil_ext_execute_materialize_batch() instead.
+ * For materialize, use textil_ext_resolve_materialize_batch() instead.
  */
 enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 	const struct textil_ext_takeover_batch *batch,
@@ -115,6 +115,7 @@ struct strbuf; /* forward declaration */
  * Lifetime:
  *   - initialize with textil_ext_materialize_batch_result_init()
  *   - release with textil_ext_materialize_batch_result_release()
+ * Release unlinks only sources explicitly transferred by cleanup_source=1.
  */
 struct textil_ext_materialize_batch_result {
 	struct string_list src_paths;
@@ -141,17 +142,6 @@ void textil_ext_materialize_batch_result_release(
 enum textil_ext_executor_status textil_ext_resolve_materialize_batch(
 	const struct textil_ext_takeover_batch *batch,
 	struct textil_ext_materialize_batch_result *result_out,
-	struct strbuf *err);
-
-/*
- * Compatibility adapter: forwards to the batch-first controller resolution
- * API and copies the ordered src_paths into the caller-owned string_list.
- *
- * This helper is not the conceptual center of the design.
- */
-enum textil_ext_executor_status textil_ext_execute_materialize_batch(
-	const struct textil_ext_takeover_batch *batch,
-	struct string_list *src_paths_out,
 	struct strbuf *err);
 
 /*
@@ -192,7 +182,7 @@ int textil_ext_materialize_one_to_fd(
 /*
  * Execute a checkin_convert takeover batch and return src_paths.
  *
- * Like textil_ext_execute_materialize_batch(), but for the checkin_convert
+ * Like textil_ext_resolve_materialize_batch(), but for the checkin_convert
  * phase.  The backend reads the input file (item->input_path), writes the
  * converted output to a temp file, and returns the src_path.
  *
@@ -290,12 +280,12 @@ int textil_ext_preresolve_materialize_cache(
 	struct strbuf *err);
 
 /*
- * Look up a pre-resolved src_path for the given (path, blob_oid) pair.
- *
- * Returns the src_path string (owned by the cache) or NULL if not found.
+ * Consume a pre-resolved source, copy it to out_fd and release its ownership.
+ * Returns 1 when copied, 0 on cache miss, -1 on failure. Controller-owned
+ * sources are unlinked after closing the source fd, on success or failure.
  */
-const char *textil_ext_materialize_cache_lookup(
-	const char *path, const char *blob_oid_hex);
+int textil_ext_materialize_cache_to_fd(
+	const char *path, const char *blob_oid_hex, int out_fd);
 
 /*
  * Release all resources held by the global materialize cache.
