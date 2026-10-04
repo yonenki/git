@@ -276,6 +276,8 @@ static const char *command_for_phase(enum textil_ext_executor_phase phase)
  * Capture native extension configuration once per Git invocation. The
  * repository-controlled .lfsconfig contributes only safe priorities, below
  * every effective Git config source (including worktree and command scope).
+ * Preserve source order and duplicate keys: invalid priority values do not
+ * erase an earlier valid priority when the controller folds the snapshot.
  * Cache the encoded header, not a config subprocess or per-file config read.
  */
 static struct strbuf extension_config_header = STRBUF_INIT;
@@ -295,8 +297,7 @@ static int collect_extension_config(const char *key, const char *value,
 	setting = strrchr(name, '.');
 	if (!setting || setting == name || !setting[1])
 		return 0;
-	item = string_list_insert(entries, key);
-	free(item->util);
+	item = string_list_append(entries, key);
 	item->util = xstrdup(value);
 	return 0;
 }
@@ -315,7 +316,8 @@ static void collect_lfsconfig_priorities(struct string_list *entries)
 	const struct config_options opts = { .error_action = CONFIG_ERROR_SILENT };
 	struct strbuf contents = STRBUF_INIT;
 	struct object_id oid;
-	char *file = repo_worktree_path(the_repository, ".lfsconfig");
+	char *file = repo_get_work_tree(the_repository)
+		? repo_worktree_path(the_repository, ".lfsconfig") : NULL;
 	char *blob = NULL;
 	const char *name = ".lfsconfig";
 	enum config_origin_type origin = CONFIG_ORIGIN_FILE;
