@@ -576,7 +576,7 @@ test_expect_success 'setup: policy for lfs materialize takeover' '
 	  "rules": [
 	    {
 	      "id": "lfs-takeover",
-	      "phases": ["materialize"],
+	      "phases": ["preflight", "materialize"],
 	      "selector": {
 	        "attr_filter_equals": "lfs",
 	        "regular_file_only": true
@@ -677,10 +677,11 @@ test_expect_success 'materialize failed copy releases unconsumed cached owned so
 	(
 		cd executor-ipc-repo &&
 		git checkout -f main &&
-		test_must_fail env \
+		env \
 			TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
 			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			git checkout with-lfs
+			git checkout with-lfs 2>err &&
+		grep "cannot open cached src_path" err
 	) &&
 	find failed-owned-sources -type f >remaining &&
 	test_must_be_empty remaining

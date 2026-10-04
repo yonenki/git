@@ -829,8 +829,19 @@ static int app_cb(void *application_data UNUSED,
 			}
 			if (st != PKTLINE_MEM_DATA)
 				continue;
-			if (in_header)
+			if (in_header) {
+				if (!parse_kv(line, line_len, &key, &key_len,
+					      &val, &val_len) &&
+				    kv_matches(key, key_len, "phase") &&
+				    val_equals(val, val_len, "preflight")) {
+					build_ok_reply(&reply);
+					ret = reply_cb(reply_data, reply.buf, reply.len);
+					strbuf_release(&reply);
+					strbuf_release(&cur_path);
+					return ret;
+				}
 				continue;
+			}
 			if (!parse_kv(line, line_len, &key, &key_len,
 				      &val, &val_len) &&
 			    kv_matches(key, key_len, "path"))
