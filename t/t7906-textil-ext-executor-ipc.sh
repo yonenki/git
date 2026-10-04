@@ -785,4 +785,182 @@ test_expect_success 'checkin_convert E2E: git add writes LFS pointer via executo
 	)
 '
 
+# Extension-config fields are hex-framed so command text cannot inject a
+# request header or lose embedded whitespace. The snapshot is process-owned.
+extension_config_line () {
+	key_hex=$(printf "%s" "$1" | od -An -tx1 | tr -d " \n") &&
+	value_hex=$(printf "%s" "$2" | od -An -tx1 | tr -d " \n") &&
+	printf "extension_config=%s:%s\n" "$key_hex" "$value_hex"
+}
+
+capture_extension_config () {
+	trace_log="$TRASH_DIRECTORY/extension-config.trace" &&
+	rm -f "$trace_log" &&
+	restart_server_with_trace materialize-config "$trace_log"
+}
+
+test_expect_success 'extension snapshot setup: safe lower file and effective repository config' '
+	git init snapshot-repo &&
+	git -C snapshot-repo config lfs.extension.snapshot.clean "local clean %f" &&
+	git -C snapshot-repo config lfs.extension.snapshot.priority 6 &&
+	cat >snapshot-repo/.lfsconfig <<-\EOF &&
+	[lfs "extension.snapshot"]
+		priority = 5
+		clean = untrusted-clean-must-not-run
+	EOF
+	test_when_finished stop_executor_server &&
+	capture_extension_config &&
+	(
+		cd snapshot-repo &&
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			test-tool textil-ext-executor-server send-materialize
+	) &&
+	extension_config_line lfs.extension.snapshot.clean "local clean %f" >expect &&
+	extension_config_line lfs.extension.snapshot.priority 6 >>expect &&
+	test_cmp expect "$trace_log"
+'
+
+test_expect_success 'extension snapshot transports Git -c and preserves command whitespace' '
+	capture_extension_config &&
+	git -C snapshot-repo config alias.snapshot "!test-tool textil-ext-executor-server send-materialize" &&
+	command_text="node \"script with spaces\" %f
+	second-line=日本語" &&
+	(
+		cd snapshot-repo &&
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git -c lfs.extension.snapshot.clean="$command_text" \
+			    -c lfs.extension.snapshot.priority=7 snapshot
+	) &&
+	extension_config_line lfs.extension.snapshot.clean "$command_text" >expect &&
+	extension_config_line lfs.extension.snapshot.priority 7 >>expect &&
+	test_cmp expect "$trace_log"
+'
+
+test_expect_success 'extension snapshot includes environment and worktree configuration precedence' '
+	git -C snapshot-repo config extensions.worktreeConfig true &&
+	git -C snapshot-repo config --worktree lfs.extension.snapshot.priority 8 &&
+	capture_extension_config &&
+	(
+		cd snapshot-repo &&
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			test-tool textil-ext-executor-server send-checkin-convert
+	) &&
+	extension_config_line lfs.extension.snapshot.clean "local clean %f" >expect &&
+	extension_config_line lfs.extension.snapshot.priority 8 >>expect &&
+	test_cmp expect "$trace_log" &&
+	capture_extension_config &&
+	(
+		cd snapshot-repo &&
+		GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=lfs.extension.snapshot.priority \
+			GIT_CONFIG_VALUE_0=9 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			test-tool textil-ext-executor-server send-materialize
+	) &&
+	extension_config_line lfs.extension.snapshot.clean "local clean %f" >expect &&
+	extension_config_line lfs.extension.snapshot.priority 9 >>expect &&
+	test_cmp expect "$trace_log"
+'
+
+test_expect_success 'extension snapshot captures config only once per invocation' '
+	capture_extension_config &&
+	(
+		cd snapshot-repo &&
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			test-tool textil-ext-executor-server send-materialize-twice
+	) &&
+	extension_config_line lfs.extension.snapshot.clean "local clean %f" >one &&
+	extension_config_line lfs.extension.snapshot.priority 8 >>one &&
+	cat one one >expect &&
+	test_cmp expect "$trace_log"
+'
+
+test_expect_success 'extension snapshot uses worktree then index then HEAD safe priorities' '
+	git -C snapshot-repo config --unset lfs.extension.snapshot.priority &&
+	git -C snapshot-repo config --worktree --unset lfs.extension.snapshot.priority &&
+	git -C snapshot-repo add .lfsconfig &&
+	git -C snapshot-repo commit -m "safe priority" &&
+	capture_extension_config &&
+	(
+		cd snapshot-repo &&
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			test-tool textil-ext-executor-server send-materialize
+	) &&
+	extension_config_line lfs.extension.snapshot.clean "local clean %f" >expect &&
+	extension_config_line lfs.extension.snapshot.priority 5 >>expect &&
+	test_cmp expect "$trace_log" &&
+	git -C snapshot-repo config --file .lfsconfig lfs.extension.snapshot.priority 11 &&
+	git -C snapshot-repo add .lfsconfig &&
+	rm snapshot-repo/.lfsconfig &&
+	capture_extension_config &&
+	(
+		cd snapshot-repo &&
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			test-tool textil-ext-executor-server send-materialize
+	) &&
+	extension_config_line lfs.extension.snapshot.clean "local clean %f" >expect &&
+	extension_config_line lfs.extension.snapshot.priority 11 >>expect &&
+	test_cmp expect "$trace_log" &&
+	git -C snapshot-repo rm --cached .lfsconfig &&
+	capture_extension_config &&
+	(
+		cd snapshot-repo &&
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			test-tool textil-ext-executor-server send-materialize
+	) &&
+	extension_config_line lfs.extension.snapshot.clean "local clean %f" >expect &&
+	extension_config_line lfs.extension.snapshot.priority 5 >>expect &&
+	test_cmp expect "$trace_log"
+'
+
+test_expect_success 'extension snapshot malformed lower file warns and discards partial priorities' '
+	printf "[lfs \"extension.snapshot\"]\npriority=12\n[broken\n" >snapshot-repo/.lfsconfig &&
+	capture_extension_config &&
+	(
+		cd snapshot-repo &&
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			test-tool textil-ext-executor-server send-materialize 2>err &&
+		grep "ignoring malformed or non-UTF-8 .lfsconfig" err
+	) &&
+	extension_config_line lfs.extension.snapshot.clean "local clean %f" >expect &&
+	test_cmp expect "$trace_log"
+'
+
+test_expect_success 'extension snapshot non-UTF8 lower file warns without failing native requests' '
+	printf "[lfs \"extension.snapshot\"]\npriority=12\n#\377\n" >snapshot-repo/.lfsconfig &&
+	capture_extension_config &&
+	(
+		cd snapshot-repo &&
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			test-tool textil-ext-executor-server send-materialize 2>err &&
+		grep "ignoring malformed or non-UTF-8 .lfsconfig" err
+	) &&
+	extension_config_line lfs.extension.snapshot.clean "local clean %f" >expect &&
+	test_cmp expect "$trace_log"
+'
+
+test_expect_success 'extension snapshot skips valueless keys but preserves explicit empty overrides' '
+	rm snapshot-repo/.lfsconfig &&
+	cat >>snapshot-repo/.git/config <<-\EOF &&
+	[lfs "extension.snapshot"]
+		clean
+	EOF
+	capture_extension_config &&
+	(
+		cd snapshot-repo &&
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			test-tool textil-ext-executor-server send-materialize
+	) &&
+	extension_config_line lfs.extension.snapshot.clean "local clean %f" >expect &&
+	extension_config_line lfs.extension.snapshot.priority 5 >>expect &&
+	test_cmp expect "$trace_log" &&
+	capture_extension_config &&
+	(
+		cd snapshot-repo &&
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git -c lfs.extension.snapshot.clean= snapshot
+	) &&
+	extension_config_line lfs.extension.snapshot.clean "" >expect &&
+	extension_config_line lfs.extension.snapshot.priority 5 >>expect &&
+	test_cmp expect "$trace_log"
+'
+
 test_done

@@ -26,6 +26,7 @@
 #include "write-or-die.h"
 #include "repository.h"
 #include "setup.h"
+#include "config.h"
 
 #ifndef SUPPORTS_SIMPLE_IPC
 int cmd__textil_ext_executor_server(int argc, const char **argv)
@@ -58,6 +59,7 @@ enum reply_mode {
 	REPLY_OVERSIZED,
 	REPLY_DUPLICATE_KEY,
 	REPLY_MATERIALIZE_OK,
+	REPLY_MATERIALIZE_CONFIG,
 	REPLY_MATERIALIZE_REJECTED,
 	REPLY_MATERIALIZE_SRC_PATH_RELATIVE,
 	REPLY_MATERIALIZE_SRC_PATH_WITH_STATUS_ERROR,
@@ -152,6 +154,8 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_DUPLICATE_KEY;
 	if (!strcmp(s, "materialize-ok"))
 		return REPLY_MATERIALIZE_OK;
+	if (!strcmp(s, "materialize-config"))
+		return REPLY_MATERIALIZE_CONFIG;
 	if (!strcmp(s, "materialize-rejected"))
 		return REPLY_MATERIALIZE_REJECTED;
 	if (!strcmp(s, "materialize-src-path-relative"))
@@ -707,6 +711,26 @@ static int app_cb(void *application_data UNUSED,
 		strbuf_release(&reply);
 		return ret;
 
+	case REPLY_MATERIALIZE_CONFIG: {
+		size_t pos = 0;
+		FILE *fp = fopen(server_args.trace_log_path, "a");
+		if (!fp)
+			die_errno("cannot open extension-config trace");
+		for (;;) {
+			const char *line;
+			size_t line_len;
+			enum pktline_mem_status st = pktline_read_mem(
+				request, request_len, &pos, &line, &line_len);
+			if (st != PKTLINE_MEM_DATA)
+				break;
+			if (line_len >= 17 && !memcmp(line, "extension_config=", 17)) {
+				fwrite(line, 1, line_len, fp);
+				fputc('\n', fp);
+			}
+		}
+		fclose(fp);
+	}
+		/* fallthrough */
 	case REPLY_MATERIALIZE_OK:
 		/* materialize ok with 1 src_path (matches 1-item batch) */
 		packet_buf_write(&reply, "status=ok\n");
@@ -1506,13 +1530,15 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 	 * Uses TEXTIL_GIT_EXT_ENDPOINT from env (must be set).
 	 * Prints executor status, src_paths, and any error message to stdout.
 	 */
-	if (!strcmp(subcmd, "send-materialize")) {
+	if (!strcmp(subcmd, "send-materialize") ||
+	    !strcmp(subcmd, "send-materialize-twice")) {
 		struct textil_ext_takeover_batch batch;
 		struct textil_ext_takeover_item item;
 		struct textil_ext_materialize_batch_result result;
 		struct strbuf err_buf = STRBUF_INIT;
 		enum textil_ext_executor_status st;
 		int i;
+		setup_git_directory(the_repository);
 
 		memset(&batch, 0, sizeof(batch));
 		memset(&item, 0, sizeof(item));
@@ -1535,6 +1561,14 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 
 		st = textil_ext_resolve_materialize_batch(&batch, &result,
 							 &err_buf);
+		if (st == TEXTIL_EXT_EXECUTOR_OK &&
+		    !strcmp(subcmd, "send-materialize-twice")) {
+			textil_ext_materialize_batch_result_release(&result);
+			textil_ext_materialize_batch_result_init(&result);
+			git_config_push_parameter("lfs.extension.snapshot.priority=99");
+			repo_config_clear(the_repository);
+			st = textil_ext_resolve_materialize_batch(&batch, &result, &err_buf);
+		}
 
 		switch (st) {
 		case TEXTIL_EXT_EXECUTOR_OK:
@@ -1614,6 +1648,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		enum textil_ext_executor_status st;
 		struct strbuf tmp_input = STRBUF_INIT;
 		int tmp_fd, i;
+		setup_git_directory(the_repository);
 
 		memset(&batch, 0, sizeof(batch));
 		memset(&item, 0, sizeof(item));

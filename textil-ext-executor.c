@@ -17,6 +17,10 @@
 #include "odb.h"
 #include "trace.h"
 #include "trace2.h"
+#include "config.h"
+#include "object-name.h"
+#include "path.h"
+#include "utf8.h"
 
 #ifdef SUPPORTS_SIMPLE_IPC
 #include "simple-ipc.h"
@@ -230,17 +234,20 @@ static int validate_request_value(const char *key, const char *value,
 }
 
 /*
- * Build a pkt-line v1 preflight_batch request.
+ * Build a phase-specific pkt-line v1 takeover request.
  *
- * All string values are validated for control characters before emission.
+ * Paths and metadata are validated before emission. Extension configuration
+ * uses hex framing, preserving arbitrary UTF-8 command text without injection.
  * Returns 0 on success, -1 on validation error (message appended to err).
  *
  * Format:
  *   <pkt> version=1
- *   <pkt> command=preflight_batch
+ *   <pkt> command=preflight_batch|materialize_batch|checkin_convert_batch
  *   <pkt> phase=<phase>
  *   <pkt> operation=<operation>
  *   <pkt> repo_root=<path>          (optional, omitted when NULL)
+ *   <pkt> extension_config=<hex-key>:<hex-value>
+ *                                  (repeated snapshot entries, native phases only)
  *   <delim>                         (start first item)
  *   <pkt> path=<path>
  *   <pkt> rule_id=<id>
@@ -265,6 +272,143 @@ static const char *command_for_phase(enum textil_ext_executor_phase phase)
 	BUG("unknown executor phase for command: %d", (int)phase);
 }
 
+/*
+ * Capture native extension configuration once per Git invocation. The
+ * repository-controlled .lfsconfig contributes only safe priorities, below
+ * every effective Git config source (including worktree and command scope).
+ * Cache the encoded header, not a config subprocess or per-file config read.
+ */
+static struct strbuf extension_config_header = STRBUF_INIT;
+static struct strbuf extension_config_error = STRBUF_INIT;
+static int extension_config_captured;
+
+static int collect_extension_config(const char *key, const char *value,
+				    const struct config_context *ctx UNUSED,
+				    void *data)
+{
+	struct string_list *entries = data;
+	struct string_list_item *item;
+	const char *name, *setting;
+
+	if (!value || !skip_prefix(key, "lfs.extension.", &name))
+		return 0;
+	setting = strrchr(name, '.');
+	if (!setting || setting == name || !setting[1])
+		return 0;
+	item = string_list_insert(entries, key);
+	free(item->util);
+	item->util = xstrdup(value);
+	return 0;
+}
+
+static int collect_safe_extension_priority(const char *key, const char *value,
+					  const struct config_context *ctx,
+					  void *data)
+{
+	if (ends_with(key, ".priority"))
+		return collect_extension_config(key, value, ctx, data);
+	return 0;
+}
+
+static void collect_lfsconfig_priorities(struct string_list *entries)
+{
+	const struct config_options opts = { .error_action = CONFIG_ERROR_SILENT };
+	struct strbuf contents = STRBUF_INIT;
+	struct object_id oid;
+	char *file = repo_worktree_path(the_repository, ".lfsconfig");
+	char *blob = NULL;
+	const char *name = ".lfsconfig";
+	enum config_origin_type origin = CONFIG_ORIGIN_FILE;
+	int ret = 0;
+
+	if (!the_repository->gitdir)
+		goto done;
+	if (file && strbuf_read_file(&contents, file, 0) >= 0) {
+		name = file;
+	} else if (file && errno != ENOENT) {
+		ret = -1;
+		goto done;
+	} else if (!repo_get_oid(the_repository, ":.lfsconfig", &oid) ||
+		   !repo_get_oid(the_repository, "HEAD:.lfsconfig", &oid)) {
+		enum object_type type;
+		size_t size;
+		blob = odb_read_object(the_repository->objects, &oid, &type, &size);
+		if (!blob || type != OBJ_BLOB) {
+			ret = -1;
+			goto done;
+		}
+		strbuf_attach(&contents, blob, size, size + 1);
+		blob = NULL;
+		origin = CONFIG_ORIGIN_BLOB;
+	} else {
+		goto done;
+	}
+
+	if (memchr(contents.buf, '\0', contents.len) || !is_utf8(contents.buf))
+		ret = -1;
+	else
+		ret = git_config_from_mem(collect_safe_extension_priority, origin,
+					 name, contents.buf, contents.len, entries,
+					 CONFIG_SCOPE_LOCAL, &opts);
+done:
+	if (ret < 0) {
+		warning(_("textil-ext: ignoring malformed or non-UTF-8 .lfsconfig"));
+		string_list_clear(entries, 1);
+		string_list_init_dup(entries);
+	}
+	free(blob);
+	free(file);
+	strbuf_release(&contents);
+}
+
+static void add_extension_config_hex(struct strbuf *out, const char *value)
+{
+	static const char hex[] = "0123456789abcdef";
+	const unsigned char *p;
+	for (p = (const unsigned char *)value; *p; p++) {
+		strbuf_addch(out, hex[*p >> 4]);
+		strbuf_addch(out, hex[*p & 15]);
+	}
+}
+
+static int append_extension_config_snapshot(struct strbuf *out,
+					    struct strbuf *err)
+{
+	if (!extension_config_captured) {
+		struct string_list entries = STRING_LIST_INIT_DUP;
+		struct string_list_item *item;
+		struct strbuf line = STRBUF_INIT;
+
+		collect_lfsconfig_priorities(&entries);
+		repo_config(the_repository, collect_extension_config, &entries);
+		for_each_string_list_item(item, &entries) {
+			const char *value = item->util;
+			size_t bytes = strlen(item->string) + strlen(value);
+			if (bytes > (LARGE_PACKET_DATA_MAX - 19) / 2) {
+				strbuf_addstr(&extension_config_error,
+					_("textil-ext: extension configuration exceeds pkt-line limit"));
+				break;
+			}
+			strbuf_reset(&line);
+			strbuf_addstr(&line, "extension_config=");
+			add_extension_config_hex(&line, item->string);
+			strbuf_addch(&line, ':');
+			add_extension_config_hex(&line, value);
+			strbuf_addch(&line, '\n');
+			packet_buf_write(&extension_config_header, "%s", line.buf);
+		}
+		strbuf_release(&line);
+		string_list_clear(&entries, 1);
+		extension_config_captured = 1;
+	}
+	if (extension_config_error.len) {
+		strbuf_addbuf(err, &extension_config_error);
+		return -1;
+	}
+	strbuf_addbuf(out, &extension_config_header);
+	return 0;
+}
+
 static int build_batch_request(
 	const struct textil_ext_takeover_batch *batch,
 	struct strbuf *out,
@@ -286,6 +430,9 @@ static int build_batch_request(
 	packet_buf_write(out, "operation=%s\n", batch->operation);
 	if (batch->repo_root)
 		packet_buf_write(out, "repo_root=%s\n", batch->repo_root);
+	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_PREFLIGHT &&
+	    append_extension_config_snapshot(out, err))
+		return -1;
 
 	/* Items (delim-separated) */
 	for (i = 0; i < batch->nr_items; i++) {
