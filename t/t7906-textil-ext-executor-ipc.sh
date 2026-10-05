@@ -578,6 +578,37 @@ test_expect_success 'setup: policy for lfs materialize takeover' '
 	EOF
 '
 
+test_expect_success 'new-path admission: switch overwrites an ignored target with committed content' '
+	restart_server admitted-checkout &&
+	git init ignored-target-repo &&
+	(
+		cd ignored-target-repo &&
+		git config filter.lfs.process "" &&
+		git config filter.lfs.clean cat &&
+		git config filter.lfs.smudge cat &&
+		git config filter.lfs.required false &&
+		echo "*.bin filter=lfs -text" >.gitattributes &&
+		echo "target.bin" >.gitignore &&
+		git add .gitattributes .gitignore &&
+		git commit -m base &&
+		git branch -M main &&
+		git switch -c target &&
+		write_pointer d30530669c8334ddc14204eacfcdd9e73ac8eccdc8ca6ff1cc8b3060fa8b29c3 29 >target.bin &&
+		git add -f target.bin &&
+		git commit -m target &&
+		git switch main &&
+		echo "ignored worktree content" >target.bin &&
+		printf "materialized-by-textil-batch\n" >expect &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-ipc-mat-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git switch target &&
+		test_cmp expect target.bin
+	)
+'
+
+
 test_expect_success 'materialize E2E: checkout writes src_path content to file' '
 	restart_server materialize-checkout &&
 	(

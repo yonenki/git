@@ -2549,6 +2549,7 @@ static int verify_absent_1(const struct cache_entry *ce,
 {
 	int len;
 	struct stat st;
+	((struct cache_entry *)ce)->textil_worktree_absent = 0;
 
 	if (o->index_only || !o->update)
 		return 0;
@@ -2565,6 +2566,7 @@ static int verify_absent_1(const struct cache_entry *ce,
 
 	len = check_leading_path(ce->name, ce_namelen(ce), 0);
 	if (!len) {
+		((struct cache_entry *)ce)->textil_worktree_absent = 1;
 		return 0;
 	} else if (len > 0) {
 		char *path;
@@ -2588,6 +2590,7 @@ static int verify_absent_1(const struct cache_entry *ce,
 	} else if (lstat(ce->name, &st)) {
 		if (errno != ENOENT)
 			return error_errno("cannot stat '%s'", ce->name);
+		((struct cache_entry *)ce)->textil_worktree_absent = 1;
 		return 0;
 	} else {
 		if (submodule_from_ce(ce))

@@ -1214,7 +1214,7 @@ void textil_ext_collect_preflight_takeover_batch(
 				!(!options->skip_sparse_checkout && ce_skip_worktree(old) &&
 				  (old->ce_flags & CE_NEW_SKIP_WORKTREE));
 		} else if (pos < 0 && two_tree && !item->overwrite_allowed) {
-			item->old_worktree_verified = 1;
+			item->old_worktree_verified = item->checkout_entry->textil_worktree_absent;
 		}
 	}
 }

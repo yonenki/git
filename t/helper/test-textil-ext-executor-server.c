@@ -74,6 +74,7 @@ enum reply_mode {
 	REPLY_CHECKIN_CONVERT_CHECKIN,
 	REPLY_VALIDATE_REQUEST_CHECKIN_CONVERT,
 	REPLY_BATCH_CHECKOUT,
+	REPLY_ADMITTED_CHECKOUT, /* single-path lazy-admission regression */
 };
 
 static struct {
@@ -175,6 +176,8 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_MATERIALIZE_CHECKOUT_OPEN_FAILURE;
 	if (!strcmp(s, "batch-checkout"))
 		return REPLY_BATCH_CHECKOUT;
+	if (!strcmp(s, "admitted-checkout"))
+		return REPLY_ADMITTED_CHECKOUT;
 	if (!strcmp(s, "materialize-count-mismatch"))
 		return REPLY_MATERIALIZE_COUNT_MISMATCH;
 	if (!strcmp(s, "validate-request-materialize"))
@@ -1118,6 +1121,7 @@ static int app_cb(void *application_data UNUSED,
 		return ret;
 	}
 
+	case REPLY_ADMITTED_CHECKOUT:
 	case REPLY_BATCH_CHECKOUT: {
 		/*
 		 * Dual-phase handler for batch-first checkout proof.
@@ -1130,6 +1134,7 @@ static int app_cb(void *application_data UNUSED,
 		int in_header = 1;
 		int is_materialize = 0;
 		int has_repo_root = 0;
+		int checkout_verified = 0;
 		int nr_items = 0;
 		struct strbuf *item_paths = NULL;
 		int alloc_items = 0;
@@ -1176,9 +1181,13 @@ static int app_cb(void *application_data UNUSED,
 				continue;
 			}
 			if (!parse_kv(line, line_len, &key, &key_len,
-				      &val, &val_len) &&
-			    kv_matches(key, key_len, "path"))
-				strbuf_add(&cur_path, val, val_len);
+				      &val, &val_len)) {
+				if (kv_matches(key, key_len, "path"))
+					strbuf_add(&cur_path, val, val_len);
+				else if (kv_matches(key, key_len, "checkout_verified") &&
+					 val_len == 4 && !memcmp(val, "true", 4))
+					checkout_verified = 1;
+			}
 		}
 		if (!in_header && cur_path.len) {
 			ALLOC_GROW(item_paths, nr_items + 1, alloc_items);
@@ -1212,7 +1221,9 @@ static int app_cb(void *application_data UNUSED,
 			packet_buf_write(&reply, "status=ok\n");
 			for (i = 0; i < nr_items; i++) {
 				packet_buf_delim(&reply);
-				packet_buf_write(&reply, "disposition=materialize\n");
+				packet_buf_write(&reply, "disposition=%s\n",
+					server_args.mode == REPLY_ADMITTED_CHECKOUT && checkout_verified
+						? "projected" : "materialize");
 			}
 			packet_buf_flush(&reply);
 			for (i = 0; i < nr_items; i++)
