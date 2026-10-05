@@ -62,7 +62,6 @@ struct textil_ext_takeover_item {
 	int projected;              /* preflight disposition; suppress checkout payload */
 	int two_tree_checkout;
 	int old_worktree_verified;
-	int old_worktree_absent;
 	int overwrite_allowed;
 	struct cache_entry *checkout_entry; /* borrowed checkout candidate, collection only */
 };

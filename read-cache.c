@@ -101,7 +101,6 @@ static inline struct cache_entry *mem_pool__ce_alloc(struct mem_pool *mem_pool, 
 	struct cache_entry *ce;
 	ce = mem_pool_alloc(mem_pool, cache_entry_size(len));
 	ce->mem_pool_allocated = 1;
-	ce->textil_worktree_absent = 0;
 	return ce;
 }
 

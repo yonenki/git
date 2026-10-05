@@ -2293,9 +2293,6 @@ static int verify_uptodate_1(const struct cache_entry *ce,
 			     enum unpack_trees_error_types error_type)
 {
 	struct stat st;
-	/* Logical cache identity stays const; this is transient admission metadata. */
-	((struct cache_entry *)ce)->textil_worktree_absent = 0;
-
 	if (o->index_only)
 		return 0;
 
@@ -2333,10 +2330,8 @@ static int verify_uptodate_1(const struct cache_entry *ce,
 
 		errno = 0;
 	}
-	if (errno == ENOENT) {
-		((struct cache_entry *)ce)->textil_worktree_absent = 1;
+	if (errno == ENOENT)
 		return 0;
-	}
 	return add_rejected_path(o, error_type, ce->name);
 }
 
@@ -2554,7 +2549,6 @@ static int verify_absent_1(const struct cache_entry *ce,
 {
 	int len;
 	struct stat st;
-	((struct cache_entry *)ce)->textil_worktree_absent = 0;
 
 	if (o->index_only || !o->update)
 		return 0;
@@ -2571,7 +2565,6 @@ static int verify_absent_1(const struct cache_entry *ce,
 
 	len = check_leading_path(ce->name, ce_namelen(ce), 0);
 	if (!len) {
-		((struct cache_entry *)ce)->textil_worktree_absent = 1;
 		return 0;
 	} else if (len > 0) {
 		char *path;
@@ -2595,7 +2588,6 @@ static int verify_absent_1(const struct cache_entry *ce,
 	} else if (lstat(ce->name, &st)) {
 		if (errno != ENOENT)
 			return error_errno("cannot stat '%s'", ce->name);
-		((struct cache_entry *)ce)->textil_worktree_absent = 1;
 		return 0;
 	} else {
 		if (submodule_from_ce(ce))
