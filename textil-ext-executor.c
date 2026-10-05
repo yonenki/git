@@ -733,7 +733,8 @@ static int parse_executor_response(const char *buf, size_t len,
 		if (st == PKTLINE_MEM_ERROR)
 			return -1;
 		if (st == PKTLINE_MEM_FLUSH) {
-			if (in_src_path_section && !has_src_path)
+			if (in_src_path_section &&
+			    !(preflight_batch ? section_has_value : has_src_path))
 				return -1;
 			break;
 		}
@@ -741,12 +742,11 @@ static int parse_executor_response(const char *buf, size_t len,
 			/* Item sections require a successful batch reply. */
 			if ((!src_paths_out && !preflight_batch) || !has_status)
 				return -1;
-			if (in_src_path_section && !section_has_value)
+			if (in_src_path_section &&
+			    !(preflight_batch ? section_has_value : has_src_path))
 				return -1;
 			if (strcmp(status_out->buf, "ok"))
 				return -1; /* delim not allowed for non-ok */
-			if (in_src_path_section && !has_src_path)
-				return -1;
 			has_src_path = has_cleanup_source = cleanup_source = 0;
 			section_has_value = 0;
 			in_src_path_section = 1;
@@ -828,7 +828,7 @@ static int parse_executor_response(const char *buf, size_t len,
 		}
 	}
 
-	if (in_src_path_section && !section_has_value)
+	if (preflight_batch && in_src_path_section && !section_has_value)
 		return -1;
 	if (preflight_batch && !strcmp(status_out->buf, "ok") &&
 	    (disposition_nr != preflight_batch->nr_items || has_message))
