@@ -860,7 +860,7 @@ static int app_cb(void *application_data UNUSED,
 					      &val, &val_len) &&
 				    kv_matches(key, key_len, "phase") &&
 				    val_equals(val, val_len, "preflight")) {
-					build_ok_reply(&reply);
+					build_ok_reply(&reply, request, request_len);
 					ret = reply_cb(reply_data, reply.buf, reply.len);
 					strbuf_release(&reply);
 					strbuf_release(&cur_path);
