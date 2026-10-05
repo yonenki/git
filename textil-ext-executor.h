@@ -63,7 +63,6 @@ struct textil_ext_takeover_item {
 	int two_tree_checkout;
 	int old_worktree_verified;
 	int overwrite_allowed;
-	struct cache_entry *checkout_entry; /* borrowed checkout candidate, collection only */
 };
 
 /* --- Takeover batch (executor input) ------------------------------------ */
