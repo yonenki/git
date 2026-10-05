@@ -121,7 +121,6 @@ struct strbuf; /* forward declaration */
  * Lifetime:
  *   - initialize with textil_ext_materialize_batch_result_init()
  *   - release with textil_ext_materialize_batch_result_release()
- * Release unlinks only sources explicitly transferred by cleanup_source=1.
  */
 struct textil_ext_materialize_batch_result {
 	struct string_list src_paths;
@@ -285,13 +284,9 @@ int textil_ext_preresolve_materialize_cache(
 	const struct textil_ext_takeover_batch *preflight_batch,
 	struct strbuf *err);
 
-/*
- * Consume a pre-resolved source, copy it to out_fd and release its ownership.
- * Returns 1 when copied, 0 on cache miss, -1 on failure. Controller-owned
- * sources are unlinked after closing the source fd, on success or failure.
- */
-int textil_ext_materialize_cache_to_fd(
-	const char *path, const char *blob_oid_hex, int out_fd);
+/* Look up a canonical source. The returned path is owned by the cache. */
+const char *textil_ext_materialize_cache_lookup(
+	const char *path, const char *blob_oid_hex);
 
 /*
  * Release all resources held by the global materialize cache.

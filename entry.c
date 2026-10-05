@@ -35,10 +35,19 @@ static int textil_ext_materialize_to_fd(const char *ce_name,
 					int out_fd,
 					struct strbuf *err)
 {
-	int cached = textil_ext_materialize_cache_to_fd(
-		ce_name, oid_to_hex(ce_oid), out_fd);
-	if (cached)
-		return cached < 0 ? -1 : 0;
+	const char *source = textil_ext_materialize_cache_lookup(
+		ce_name, oid_to_hex(ce_oid));
+	if (source) {
+		int src_fd = open(source, O_RDONLY);
+		int ret;
+		if (src_fd < 0)
+			return error_errno("textil-ext: cannot open cached src_path '%s'", source);
+		ret = copy_fd(src_fd, out_fd);
+		close(src_fd);
+		if (ret)
+			return error("textil-ext: copy_fd failed for '%s'", ce_name);
+		return 0;
+	}
 
 	/* cache miss: 単発の checkout（wave 外）向け single-item fallback */
 	{

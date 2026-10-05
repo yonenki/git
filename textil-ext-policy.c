@@ -1,3 +1,5 @@
+#define USE_THE_REPOSITORY_VARIABLE
+
 #include "git-compat-util.h"
 #include "abspath.h"
 #include "textil-ext-policy.h"
@@ -5,6 +7,10 @@
 #include "strbuf.h"
 #include "trace.h"
 #include "gettext.h"
+#include "config.h"
+#include "repository.h"
+#include "path.h"
+#include "dir.h"
 
 #define ENV_POLICY_JSON    "TEXTIL_GIT_EXT_POLICY_JSON"
 #define ENV_POLICY_B64     "TEXTIL_GIT_EXT_POLICY_B64"
@@ -686,12 +692,64 @@ void textil_ext_policy_evaluate(
  * Convenience wrappers for hook points
  * ====================================================================== */
 
+static int lfs_extensions_checked;
+static int has_lfs_extensions;
+
+static int detect_lfs_extensions(const char *key, const char *value UNUSED,
+				 const struct config_context *ctx UNUSED,
+				 void *data)
+{
+	if (starts_with(key, "lfs.extension."))
+		*(int *)data = 1;
+	return 0;
+}
+
+static int detect_safe_lfs_priority(const char *key, const char *value UNUSED,
+				    const struct config_context *ctx UNUSED,
+				    void *data)
+{
+	const char *name, *property;
+	if (!skip_prefix(key, "lfs.extension.", &name))
+		return 0;
+	property = strrchr(name, '.');
+	if (property && property != name && !strcmp(property + 1, "priority"))
+		*(int *)data = 1;
+	return 0;
+}
+
+static int worktree_has_lfs_extension_priorities(void)
+{
+	const struct config_options opts = { .error_action = CONFIG_ERROR_SILENT };
+	char *file;
+	int found = 0;
+
+	if (!repo_get_work_tree(the_repository))
+		return 0;
+	file = repo_worktree_path(the_repository, ".lfsconfig");
+	if (file_exists(file) &&
+	    git_config_from_file_with_options(detect_safe_lfs_priority, file,
+					     &found, CONFIG_SCOPE_LOCAL, &opts) < 0) {
+		warning(_("textil-ext: ignoring malformed .lfsconfig '%s'"), file);
+		found = 0;
+	}
+	free(file);
+	return found;
+}
+
 static void evaluate_or_default(enum textil_ext_phase phase,
 				const char *attr_filter,
 				int is_regular_file,
 				struct textil_ext_eval_result *result)
 {
-	if (!policy_active) {
+	if (policy_active && !lfs_extensions_checked) {
+		repo_config(the_repository, detect_lfs_extensions, &has_lfs_extensions);
+		if (!has_lfs_extensions)
+			has_lfs_extensions = worktree_has_lfs_extension_priorities();
+		lfs_extensions_checked = 1;
+	}
+	/* Extension repositories use the invoking Git's filter process for every
+	 * LFS conversion, including checkout preflight and single-file calls. */
+	if (!policy_active || has_lfs_extensions) {
 		memset(result, 0, sizeof(*result));
 		result->action = TEXTIL_ACTION_OBSERVE;
 		result->fallback = TEXTIL_FALLBACK_SKIP;

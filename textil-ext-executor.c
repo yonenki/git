@@ -18,10 +18,6 @@
 #include "odb.h"
 #include "trace.h"
 #include "trace2.h"
-#include "config.h"
-#include "object-name.h"
-#include "path.h"
-#include "utf8.h"
 
 #ifdef SUPPORTS_SIMPLE_IPC
 #include "simple-ipc.h"
@@ -237,8 +233,7 @@ static int validate_request_value(const char *key, const char *value,
 /*
  * Build a phase-specific pkt-line v1 takeover request.
  *
- * Paths and metadata are validated before emission. Extension configuration
- * uses hex framing, preserving arbitrary UTF-8 command text without injection.
+ * Paths and metadata are validated before emission.
  * Returns 0 on success, -1 on validation error (message appended to err).
  *
  * Format:
@@ -247,8 +242,6 @@ static int validate_request_value(const char *key, const char *value,
  *   <pkt> phase=<phase>
  *   <pkt> operation=<operation>
  *   <pkt> repo_root=<path>          (optional, omitted when NULL)
- *   <pkt> extension_config=<hex-key>:<hex-value>
- *                                  (repeated snapshot entries, native phases only)
  *   <delim>                         (start first item)
  *   <pkt> path=<path>
  *   <pkt> rule_id=<id>
@@ -271,145 +264,6 @@ static const char *command_for_phase(enum textil_ext_executor_phase phase)
 		return "checkin_convert_batch";
 	}
 	BUG("unknown executor phase for command: %d", (int)phase);
-}
-
-/*
- * Capture native extension configuration once per Git invocation. The
- * repository-controlled .lfsconfig contributes only safe priorities, below
- * every effective Git config source (including worktree and command scope).
- * Preserve source order and duplicate keys: invalid priority values do not
- * erase an earlier valid priority when the controller folds the snapshot.
- * Cache the encoded header, not a config subprocess or per-file config read.
- */
-static struct strbuf extension_config_header = STRBUF_INIT;
-static struct strbuf extension_config_error = STRBUF_INIT;
-static int extension_config_captured;
-
-static int collect_extension_config(const char *key, const char *value,
-				    const struct config_context *ctx UNUSED,
-				    void *data)
-{
-	struct string_list *entries = data;
-	struct string_list_item *item;
-	const char *name, *setting;
-
-	if (!value || !skip_prefix(key, "lfs.extension.", &name))
-		return 0;
-	setting = strrchr(name, '.');
-	if (!setting || setting == name || !setting[1])
-		return 0;
-	item = string_list_append(entries, key);
-	item->util = xstrdup(value);
-	return 0;
-}
-
-static int collect_safe_extension_priority(const char *key, const char *value,
-					  const struct config_context *ctx,
-					  void *data)
-{
-	if (ends_with(key, ".priority"))
-		return collect_extension_config(key, value, ctx, data);
-	return 0;
-}
-
-static void collect_lfsconfig_priorities(struct string_list *entries)
-{
-	const struct config_options opts = { .error_action = CONFIG_ERROR_SILENT };
-	struct strbuf contents = STRBUF_INIT;
-	struct object_id oid;
-	char *file = repo_get_work_tree(the_repository)
-		? repo_worktree_path(the_repository, ".lfsconfig") : NULL;
-	char *blob = NULL;
-	const char *name = ".lfsconfig";
-	enum config_origin_type origin = CONFIG_ORIGIN_FILE;
-	int ret = 0;
-
-	if (!the_repository->gitdir)
-		goto done;
-	if (file && strbuf_read_file(&contents, file, 0) >= 0) {
-		name = file;
-	} else if (file && errno != ENOENT) {
-		ret = -1;
-		goto done;
-	} else if (!repo_get_oid(the_repository, ":.lfsconfig", &oid) ||
-		   !repo_get_oid(the_repository, "HEAD:.lfsconfig", &oid)) {
-		enum object_type type;
-		size_t size;
-		blob = odb_read_object(the_repository->objects, &oid, &type, &size);
-		if (!blob || type != OBJ_BLOB) {
-			ret = -1;
-			goto done;
-		}
-		strbuf_attach(&contents, blob, size, size + 1);
-		blob = NULL;
-		origin = CONFIG_ORIGIN_BLOB;
-	} else {
-		goto done;
-	}
-
-	if (memchr(contents.buf, '\0', contents.len) || !is_utf8(contents.buf))
-		ret = -1;
-	else
-		ret = git_config_from_mem(collect_safe_extension_priority, origin,
-					 name, contents.buf, contents.len, entries,
-					 CONFIG_SCOPE_LOCAL, &opts);
-done:
-	if (ret < 0) {
-		warning(_("textil-ext: ignoring malformed or non-UTF-8 .lfsconfig"));
-		string_list_clear(entries, 1);
-		string_list_init_dup(entries);
-	}
-	free(blob);
-	free(file);
-	strbuf_release(&contents);
-}
-
-static void add_extension_config_hex(struct strbuf *out, const char *value)
-{
-	static const char hex[] = "0123456789abcdef";
-	const unsigned char *p;
-	for (p = (const unsigned char *)value; *p; p++) {
-		strbuf_addch(out, hex[*p >> 4]);
-		strbuf_addch(out, hex[*p & 15]);
-	}
-}
-
-static int append_extension_config_snapshot(struct strbuf *out,
-					    struct strbuf *err)
-{
-	if (!extension_config_captured) {
-		struct string_list entries = STRING_LIST_INIT_DUP;
-		struct string_list_item *item;
-		struct strbuf line = STRBUF_INIT;
-
-		collect_lfsconfig_priorities(&entries);
-		repo_config(the_repository, collect_extension_config, &entries);
-		for_each_string_list_item(item, &entries) {
-			const char *value = item->util;
-			size_t bytes = strlen(item->string) + strlen(value);
-			if (bytes > (LARGE_PACKET_DATA_MAX - 19) / 2) {
-				strbuf_addstr(&extension_config_error,
-					_("textil-ext: extension configuration exceeds pkt-line limit"));
-				break;
-			}
-			strbuf_reset(&line);
-			strbuf_addstr(&line, "extension_config=");
-			add_extension_config_hex(&line, item->string);
-			strbuf_addch(&line, ':');
-			add_extension_config_hex(&line, value);
-			strbuf_addch(&line, '\n');
-			packet_buf_write(&extension_config_header, "%s", line.buf);
-		}
-		strbuf_release(&line);
-		string_list_clear(&entries, 1);
-		extension_config_captured = 1;
-	}
-	if (extension_config_error.len) {
-		strbuf_addbuf(err, &extension_config_error);
-		return -1;
-	}
-	strbuf_addbuf(out, &extension_config_header);
-	return 0;
 }
 
 static int build_batch_request(
@@ -441,9 +295,6 @@ static int build_batch_request(
 	packet_buf_write(out, "operation=%s\n", batch->operation);
 	if (batch->repo_root)
 		packet_buf_write(out, "repo_root=%s\n", batch->repo_root);
-	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_PREFLIGHT &&
-	    append_extension_config_snapshot(out, err))
-		return -1;
 	if (operation_id)
 		packet_buf_write(out, "operation_id=%s\n", operation_id);
 	if (projection_workspace)
@@ -659,17 +510,6 @@ static int validate_src_path(const char *path, size_t path_len)
 	return 0;
 }
 
-/* string_list item util marks an explicitly controller-owned source. */
-static char cleanup_source_marker;
-
-static void release_materialize_source(struct string_list_item *item)
-{
-	if (item->util == &cleanup_source_marker) {
-		unlink(item->string);
-		item->util = NULL;
-	}
-}
-
 /*
  * Parse a pkt-line v1 executor response.
  *
@@ -684,7 +524,6 @@ static void release_materialize_source(struct string_list_item *item)
  *   <pkt> status=ok
  *   <delim>
  *   <pkt> src_path=<abs_path>
- *   <pkt> cleanup_source=0|1 (optional, defaults to 0)
  *   <delim>
  *   <pkt> src_path=<abs_path>
  *   ...
@@ -714,7 +553,7 @@ static int parse_executor_response(const char *buf, size_t len,
 	size_t pos = 0;
 	int has_status = 0, has_message = 0;
 	int in_src_path_section = 0;
-	int has_src_path = 0, has_cleanup_source = 0, cleanup_source = 0;
+	int has_src_path = 0;
 	int disposition_nr = 0;
 	int section_has_value = 0;
 
@@ -746,7 +585,7 @@ static int parse_executor_response(const char *buf, size_t len,
 				return -1;
 			if (strcmp(status_out->buf, "ok"))
 				return -1; /* delim not allowed for non-ok */
-			has_src_path = has_cleanup_source = cleanup_source = 0;
+			has_src_path = 0;
 			section_has_value = 0;
 			in_src_path_section = 1;
 			continue;
@@ -786,7 +625,6 @@ static int parse_executor_response(const char *buf, size_t len,
 				preflight_batch->items[disposition_nr++].projected = projected;
 				continue;
 			}
-			/* Per-source ownership is explicit; absent means unowned. */
 			if (key_len == 8 && !memcmp(line, "src_path", 8)) {
 				struct strbuf path_buf = STRBUF_INIT;
 				if (has_src_path)
@@ -794,19 +632,9 @@ static int parse_executor_response(const char *buf, size_t len,
 				if (validate_src_path(val, val_len))
 					return -1;
 				strbuf_add(&path_buf, val, val_len);
-				string_list_append(src_paths_out, path_buf.buf)->util =
-					cleanup_source ? &cleanup_source_marker : NULL;
+				string_list_append(src_paths_out, path_buf.buf);
 				has_src_path = 1;
 				strbuf_release(&path_buf);
-			} else if (key_len == 14 && !memcmp(line, "cleanup_source", 14)) {
-				if (has_cleanup_source || val_len != 1 ||
-				    (val[0] != '0' && val[0] != '1'))
-					return -1;
-				has_cleanup_source = 1;
-				cleanup_source = val[0] == '1';
-				if (has_src_path && cleanup_source)
-					src_paths_out->items[src_paths_out->nr - 1].util =
-						&cleanup_source_marker;
 			} else {
 				return -1; /* unknown key in src_path section */
 			}
@@ -1004,7 +832,6 @@ static int blob_content_is_lfs_pointer(const char *buf, size_t len)
 	const char *p = buf;
 	const char *end = buf + len;
 	int has_version = 0, has_oid = 0;
-	unsigned int extension_priorities = 0;
 
 	while (p < end) {
 		const char *line_end = memchr(p, '\n', end - p);
@@ -1043,33 +870,6 @@ static int blob_content_is_lfs_pointer(const char *buf, size_t len)
 				if (!isdigit(size_val[i]))
 					return 0;
 			}
-		} else if (line_len >= strlen("ext-0-x sha256:") + 64 &&
-			   !memcmp(line, "ext-", 4)) {
-			const char *space = memchr(line, ' ', line_len);
-			const char *oid;
-			unsigned int priority;
-			size_t i;
-
-			if (!space || space - line < 7 ||
-			    line[4] < '0' || line[4] > '9' || line[5] != '-' ||
-			    !((line[6] >= 'a' && line[6] <= 'z') ||
-			      (line[6] >= 'A' && line[6] <= 'Z') ||
-			      (line[6] >= '0' && line[6] <= '9') ||
-			      line[6] == '_'))
-				return 0;
-			oid = space + 1;
-			if (trimmed_end - oid != strlen("sha256:") + 64 ||
-			    memcmp(oid, "sha256:", strlen("sha256:")))
-				return 0;
-			oid += strlen("sha256:");
-			for (i = 0; i < 64; i++)
-				if (!((oid[i] >= '0' && oid[i] <= '9') ||
-				      (oid[i] >= 'a' && oid[i] <= 'f')))
-					return 0;
-			priority = 1U << (line[4] - '0');
-			if (extension_priorities & priority)
-				return 0;
-			extension_priorities |= priority;
 		} else {
 			return 0;
 		}
@@ -1350,12 +1150,9 @@ void textil_ext_materialize_batch_result_init(
 void textil_ext_materialize_batch_result_release(
 	struct textil_ext_materialize_batch_result *result)
 {
-	struct string_list_item *item;
 	if (!result)
 		return;
 
-	for_each_string_list_item(item, &result->src_paths)
-		release_materialize_source(item);
 	string_list_clear(&result->src_paths, 0);
 }
 
@@ -1427,13 +1224,11 @@ void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch)
 #include "strmap.h"
 
 /*
- * Global cache: "path\toid" → item in materialize_cache_sources.
+ * Global cache: "path\toid" → canonical src_path.
  * Populated once before the sequential checkout loop, looked up per-file.
  */
 static struct strmap materialize_cache = STRMAP_INIT;
 static int materialize_cache_populated;
-static struct textil_ext_materialize_batch_result materialize_cache_sources;
-static int materialize_cache_cleanup_registered;
 
 static char *make_cache_key(const char *path, const char *oid_hex)
 {
@@ -1502,59 +1297,40 @@ int textil_ext_preresolve_materialize_cache(
 		char *key = make_cache_key(
 			preflight_batch->items[i].path,
 			preflight_batch->items[i].blob_oid);
-		strmap_put(&materialize_cache, key, &result.src_paths.items[i]);
+		strmap_put(&materialize_cache, key, result.src_paths.items[i].string);
+		result.src_paths.items[i].string = NULL;
 		free(key);
 	}
 	materialize_cache_populated = 1;
-	if (!materialize_cache_cleanup_registered) {
-		atexit(textil_ext_materialize_cache_clear);
-		materialize_cache_cleanup_registered = 1;
-	}
 
-	/* The cache now owns the result's paths and cleanup flags. */
-	materialize_cache_sources = result;
+	textil_ext_materialize_batch_result_release(&result);
 	strbuf_release(&main_wt);
 	textil_ext_takeover_batch_release(&mat_batch);
 	free(items);
 	return 0;
 }
 
-int textil_ext_materialize_cache_to_fd(
-	const char *path, const char *blob_oid_hex, int out_fd)
+const char *textil_ext_materialize_cache_lookup(
+	const char *path, const char *blob_oid_hex)
 {
 	char *key;
-	struct string_list_item *source;
-	int src_fd, ret = -1;
+	const char *source;
 
 	if (!materialize_cache_populated)
-		return 0;
-
+		return NULL;
 	key = make_cache_key(path, blob_oid_hex);
 	source = strmap_get(&materialize_cache, key);
-	if (!source) {
-		free(key);
-		return 0;
-	}
-	strmap_remove(&materialize_cache, key, 0);
 	free(key);
-	src_fd = open(source->string, O_RDONLY);
-	if (src_fd < 0) {
-		error_errno("textil-ext: cannot open cached src_path '%s'",
-			    source->string);
-	} else {
-		if (copy_fd(src_fd, out_fd))
-			error("textil-ext: copy_fd failed for '%s'", path);
-		else
-			ret = 1;
-		close(src_fd);
-	}
-	release_materialize_source(source);
-	return ret;
+	return source;
 }
 
 void textil_ext_materialize_cache_clear(void)
 {
-	textil_ext_materialize_batch_result_release(&materialize_cache_sources);
+	struct hashmap_iter iter;
+	struct strmap_entry *entry;
+
+	hashmap_for_each_entry(&materialize_cache.map, &iter, entry, ent)
+		free(entry->value);
 	strmap_clear(&materialize_cache, 0);
 	materialize_cache_populated = 0;
 }

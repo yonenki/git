@@ -664,63 +664,6 @@ test_expect_success 'materialize E2E: path checkout fallback includes repo_root'
 	grep "\"items\":1" "$trace_log" &&
 	grep "\"repo_root_present\":true" "$trace_log"
 '
-test_expect_success 'materialize owned sources: repeated cached and single checkout removes temporary files' '
-	mkdir owned-sources &&
-	test_when_finished stop_executor_server &&
-	TMPDIR="$TRASH_DIRECTORY/owned-sources" restart_server materialize-checkout-owned &&
-	(
-		cd executor-ipc-repo &&
-		for round in 1 2 3
-		do
-			git checkout -f main &&
-			env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
-				TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-				git checkout with-lfs &&
-			grep "materialized-by-textil" a.bin &&
-			grep "materialized-by-textil" b.bin &&
-			rm a.bin &&
-			env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
-				TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-				git checkout -- a.bin || return 1
-		done
-	) &&
-	find owned-sources -type f >remaining &&
-	test_must_be_empty remaining
-'
-
-test_expect_success 'materialize failed copy releases unconsumed cached owned sources' '
-	mkdir failed-owned-sources &&
-	test_when_finished stop_executor_server &&
-	TMPDIR="$TRASH_DIRECTORY/failed-owned-sources" restart_server materialize-checkout-open-failure &&
-	(
-		cd executor-ipc-repo &&
-		git checkout -f main &&
-		env \
-			TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
-			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			git checkout with-lfs 2>err &&
-		grep "cannot open cached src_path" err
-	) &&
-	find failed-owned-sources -type f >remaining &&
-	test_must_be_empty remaining
-'
-
-test_expect_success 'materialize unowned sources are never removed' '
-	mkdir unowned-sources &&
-	test_when_finished stop_executor_server &&
-	TMPDIR="$TRASH_DIRECTORY/unowned-sources" restart_server materialize-checkout &&
-	(
-		cd executor-ipc-repo &&
-		git checkout -f main &&
-		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
-			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			git checkout with-lfs
-	) &&
-	find unowned-sources -type f >remaining &&
-	test_line_count = 2 remaining
-'
-
-
 # === Checkin convert phase tests ===
 
 test_expect_success 'setup: policy for lfs checkin_convert takeover' '
@@ -803,255 +746,140 @@ test_expect_success 'checkin_convert E2E: git add writes LFS pointer via executo
 	)
 '
 
-# Extension-config fields are hex-framed so command text cannot inject a
-# request header or lose embedded whitespace. The snapshot is process-owned.
-extension_config_line () {
-	key_hex=$(printf "%s" "$1" | od -An -tx1 | tr -d " \n") &&
-	value_hex=$(printf "%s" "$2" | od -An -tx1 | tr -d " \n") &&
-	printf "extension_config=%s:%s\n" "$key_hex" "$value_hex"
-}
-
-capture_extension_config () {
-	trace_log="$TRASH_DIRECTORY/extension-config.trace" &&
-	rm -f "$trace_log" &&
-	restart_server_with_trace materialize-config "$trace_log"
-}
-
-test_expect_success 'extension snapshot setup: safe lower file and effective repository config' '
-	git init snapshot-repo &&
-	git -C snapshot-repo config lfs.extension.snapshot.clean "local clean %f" &&
-	git -C snapshot-repo config lfs.extension.snapshot.priority 6 &&
-	cat >snapshot-repo/.lfsconfig <<-\EOF &&
-	[lfs "extension.snapshot"]
-		priority = 5
-		clean = untrusted-clean-must-not-run
-	EOF
-	test_when_finished stop_executor_server &&
-	capture_extension_config &&
+test_expect_success 'extension repositories use filter-process for add, path checkout and checkout waves' '
+	git init extension-fallback-repo &&
 	(
-		cd snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			test-tool textil-ext-executor-server send-materialize
-	) &&
-	extension_config_line lfs.extension.snapshot.priority 5 >expect &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >>expect &&
-	extension_config_line lfs.extension.snapshot.priority 6 >>expect &&
-	test_cmp expect "$trace_log"
+		cd extension-fallback-repo &&
+		git config filter.lfs.process "test-tool rot13-filter --log=filter.log clean smudge" &&
+		git config filter.lfs.required true &&
+		git config lfs.extension.example.clean "ignored-by-native-Git" &&
+		echo "*.bin filter=lfs -text" >.gitattributes &&
+		git add .gitattributes &&
+		git commit -m base &&
+		git branch -M main &&
+		git checkout -b with-content &&
+		echo "native extension fallback" >asset.bin &&
+		cp asset.bin original &&
+		tr "[A-Za-z]" "[N-ZA-Mn-za-m]" <original >encoded &&
+		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-cc-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH-unreachable" \
+			git add asset.bin &&
+		git show :asset.bin >actual &&
+		test_cmp encoded actual &&
+		git commit -m content &&
+		rm asset.bin &&
+		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH-unreachable" \
+			git checkout -- asset.bin &&
+		test_cmp original asset.bin &&
+		git checkout main &&
+		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH-unreachable" \
+			git checkout with-content &&
+		test_cmp original asset.bin
+	)
 '
 
-test_expect_success 'extension snapshot transports Git -c and preserves command whitespace' '
-	capture_extension_config &&
-	git -C snapshot-repo config alias.snapshot "!test-tool textil-ext-executor-server send-materialize" &&
-	command_text="node \"script with spaces\" %f
-	second-line=日本語" &&
+test_expect_success 'any extension config key declines native checkin, including valueless keys and -c' '
 	(
-		cd snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			git -c lfs.extension.snapshot.clean="$command_text" \
-			    -c lfs.extension.snapshot.priority=7 snapshot
-	) &&
-	extension_config_line lfs.extension.snapshot.priority 5 >expect &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >>expect &&
-	extension_config_line lfs.extension.snapshot.priority 6 >>expect &&
-	extension_config_line lfs.extension.snapshot.clean "$command_text" >>expect &&
-	extension_config_line lfs.extension.snapshot.priority 7 >>expect &&
-	test_cmp expect "$trace_log"
+		cd extension-fallback-repo &&
+		git config --remove-section lfs.extension.example &&
+		echo "command scope extension" >command.bin &&
+		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-cc-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH-unreachable" \
+			git -c lfs.extension.command.priority= add command.bin &&
+		tr "[A-Za-z]" "[N-ZA-Mn-za-m]" <command.bin >encoded &&
+		git show :command.bin >actual &&
+		test_cmp encoded actual &&
+		cat >>.git/config <<-\EOF &&
+		[lfs "extension.bare"]
+			priority
+		EOF
+		echo "bare extension key" >bare.bin &&
+		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-cc-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH-unreachable" \
+			git add bare.bin &&
+		tr "[A-Za-z]" "[N-ZA-Mn-za-m]" <bare.bin >encoded &&
+		git show :bare.bin >actual &&
+		test_cmp encoded actual
+	)
 '
 
-test_expect_success 'extension snapshot includes environment and worktree configuration precedence' '
-	git -C snapshot-repo config extensions.worktreeConfig true &&
-	git -C snapshot-repo config --worktree lfs.extension.snapshot.priority 8 &&
-	capture_extension_config &&
+test_expect_success 'extension pointers are not admitted to native materialize without extension config' '
 	(
-		cd snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			test-tool textil-ext-executor-server send-checkin-convert
-	) &&
-	extension_config_line lfs.extension.snapshot.priority 5 >expect &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >>expect &&
-	extension_config_line lfs.extension.snapshot.priority 6 >>expect &&
-	extension_config_line lfs.extension.snapshot.priority 8 >>expect &&
-	test_cmp expect "$trace_log" &&
-	capture_extension_config &&
-	(
-		cd snapshot-repo &&
-		GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=lfs.extension.snapshot.priority \
-			GIT_CONFIG_VALUE_0=9 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			test-tool textil-ext-executor-server send-materialize
-	) &&
-	extension_config_line lfs.extension.snapshot.priority 5 >expect &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >>expect &&
-	extension_config_line lfs.extension.snapshot.priority 6 >>expect &&
-	extension_config_line lfs.extension.snapshot.priority 8 >>expect &&
-	extension_config_line lfs.extension.snapshot.priority 9 >>expect &&
-	test_cmp expect "$trace_log"
+		cd extension-fallback-repo &&
+		git config --remove-section lfs.extension.bare &&
+		{
+			echo "version https://git-lfs.github.com/spec/v1" &&
+			echo "ext-0-example sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" &&
+			echo "oid sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" &&
+			echo "size 4"
+		} >extension.bin &&
+		git -c filter.lfs.process= -c filter.lfs.required=false add extension.bin &&
+		tr "[A-Za-z]" "[N-ZA-Mn-za-m]" <extension.bin >expected &&
+		rm extension.bin &&
+		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH-unreachable" \
+			git checkout -- extension.bin &&
+		test_cmp expected extension.bin
+	)
 '
 
-test_expect_success 'extension snapshot captures config only once per invocation' '
-	capture_extension_config &&
+test_expect_success 'priority-only worktree .lfsconfig declines native add and checkout without Git extension keys' '
 	(
-		cd snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			test-tool textil-ext-executor-server send-materialize-twice
-	) &&
-	extension_config_line lfs.extension.snapshot.priority 5 >one &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >>one &&
-	extension_config_line lfs.extension.snapshot.priority 6 >>one &&
-	extension_config_line lfs.extension.snapshot.priority 8 >>one &&
-	cat one one >expect &&
-	test_cmp expect "$trace_log"
+		cd extension-fallback-repo &&
+		test_must_fail git config --get-regexp "^lfs\\.extension\\." &&
+		cat >.lfsconfig <<-\EOF &&
+		[lfs "extension.priority-only"]
+			priority = 10
+		EOF
+		echo "priority only lower source" >priority.bin &&
+		cp priority.bin original &&
+		tr "[A-Za-z]" "[N-ZA-Mn-za-m]" <original >encoded &&
+		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-cc-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH-unreachable" \
+			git add priority.bin &&
+		git show :priority.bin >actual &&
+		test_cmp encoded actual &&
+		rm priority.bin &&
+		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-mat-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH-unreachable" \
+			git checkout -- priority.bin &&
+		test_cmp original priority.bin
+	)
 '
 
-test_expect_success 'extension snapshot uses worktree then index then HEAD safe priorities' '
-	git -C snapshot-repo config --unset lfs.extension.snapshot.priority &&
-	git -C snapshot-repo config --worktree --unset lfs.extension.snapshot.priority &&
-	git -C snapshot-repo add .lfsconfig &&
-	git -C snapshot-repo commit -m "safe priority" &&
-	capture_extension_config &&
+test_expect_success 'malformed .lfsconfig warns and drops partial safe priorities before native takeover' '
+	restart_server checkin-convert-checkin &&
 	(
-		cd snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			test-tool textil-ext-executor-server send-materialize
-	) &&
-	extension_config_line lfs.extension.snapshot.priority 5 >expect &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >>expect &&
-	test_cmp expect "$trace_log" &&
-	git -C snapshot-repo config --file .lfsconfig lfs.extension.snapshot.priority 11 &&
-	git -C snapshot-repo add .lfsconfig &&
-	rm snapshot-repo/.lfsconfig &&
-	capture_extension_config &&
-	(
-		cd snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			test-tool textil-ext-executor-server send-materialize
-	) &&
-	extension_config_line lfs.extension.snapshot.priority 11 >expect &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >>expect &&
-	test_cmp expect "$trace_log" &&
-	git -C snapshot-repo rm --cached .lfsconfig &&
-	capture_extension_config &&
-	(
-		cd snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			test-tool textil-ext-executor-server send-materialize
-	) &&
-	extension_config_line lfs.extension.snapshot.priority 5 >expect &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >>expect &&
-	test_cmp expect "$trace_log"
+		cd extension-fallback-repo &&
+		printf "[lfs \"extension.partial\"]\npriority=10\n[broken\n" >.lfsconfig &&
+		echo "malformed lower source" >malformed.bin &&
+		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-cc-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git add malformed.bin 2>err &&
+		grep "ignoring malformed .lfsconfig" err &&
+		git show :malformed.bin >actual &&
+		grep "version https://git-lfs.github.com/spec/v1" actual
+	)
 '
 
-test_expect_success 'extension snapshot malformed lower file warns and discards partial priorities' '
-	printf "[lfs \"extension.snapshot\"]\npriority=12\n[broken\n" >snapshot-repo/.lfsconfig &&
-	capture_extension_config &&
+test_expect_success 'unsafe .lfsconfig extension commands alone do not disable native takeover' '
+	restart_server checkin-convert-checkin &&
 	(
-		cd snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			test-tool textil-ext-executor-server send-materialize 2>err &&
-		grep "ignoring malformed or non-UTF-8 .lfsconfig" err
-	) &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >expect &&
-	test_cmp expect "$trace_log"
-'
-
-test_expect_success 'extension snapshot non-UTF8 lower file warns without failing native requests' '
-	printf "[lfs \"extension.snapshot\"]\npriority=12\n#\377\n" >snapshot-repo/.lfsconfig &&
-	capture_extension_config &&
-	(
-		cd snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			test-tool textil-ext-executor-server send-materialize 2>err &&
-		grep "ignoring malformed or non-UTF-8 .lfsconfig" err
-	) &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >expect &&
-	test_cmp expect "$trace_log"
-'
-
-test_expect_success 'extension snapshot skips valueless keys but preserves explicit empty overrides' '
-	rm snapshot-repo/.lfsconfig &&
-	cat >>snapshot-repo/.git/config <<-\EOF &&
-	[lfs "extension.snapshot"]
-		clean
-	EOF
-	capture_extension_config &&
-	(
-		cd snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			test-tool textil-ext-executor-server send-materialize
-	) &&
-	extension_config_line lfs.extension.snapshot.priority 5 >expect &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >>expect &&
-	test_cmp expect "$trace_log" &&
-	capture_extension_config &&
-	(
-		cd snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			git -c lfs.extension.snapshot.clean= snapshot
-	) &&
-	extension_config_line lfs.extension.snapshot.priority 5 >expect &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >>expect &&
-	extension_config_line lfs.extension.snapshot.clean "" >>expect &&
-	test_cmp expect "$trace_log"
-'
-
-test_expect_success 'extension snapshot preserves same-source valid then invalid priority entries' '
-	git init duplicate-snapshot-repo &&
-	git -C duplicate-snapshot-repo config lfs.extension.snapshot.clean "local clean %f" &&
-	git -C duplicate-snapshot-repo config --add lfs.extension.snapshot.priority 10 &&
-	git -C duplicate-snapshot-repo config --add lfs.extension.snapshot.priority invalid &&
-	git -C duplicate-snapshot-repo config --add lfs.extension.snapshot.priority -1 &&
-	capture_extension_config &&
-	(
-		cd duplicate-snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			test-tool textil-ext-executor-server send-materialize
-	) &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >expect &&
-	extension_config_line lfs.extension.snapshot.priority 10 >>expect &&
-	extension_config_line lfs.extension.snapshot.priority invalid >>expect &&
-	extension_config_line lfs.extension.snapshot.priority -1 >>expect &&
-	test_cmp expect "$trace_log"
-'
-
-test_expect_success 'extension snapshot preserves lower .lfsconfig priority before invalid Git and -c entries' '
-	git -C duplicate-snapshot-repo config --unset-all lfs.extension.snapshot.priority &&
-	cat >duplicate-snapshot-repo/.lfsconfig <<-\EOF &&
-	[lfs "extension.snapshot"]
-		priority = 10
-		priority = invalid
-		priority = -1
-	EOF
-	git -C duplicate-snapshot-repo config --add lfs.extension.snapshot.priority invalid-git &&
-	git -C duplicate-snapshot-repo config --add lfs.extension.snapshot.priority -1 &&
-	git -C duplicate-snapshot-repo config alias.snapshot "!test-tool textil-ext-executor-server send-materialize" &&
-	capture_extension_config &&
-	(
-		cd duplicate-snapshot-repo &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			git -c lfs.extension.snapshot.priority=invalid-command \
-			    -c lfs.extension.snapshot.priority=-1 snapshot
-	) &&
-	extension_config_line lfs.extension.snapshot.priority 10 >expect &&
-	extension_config_line lfs.extension.snapshot.priority invalid >>expect &&
-	extension_config_line lfs.extension.snapshot.priority -1 >>expect &&
-	extension_config_line lfs.extension.snapshot.clean "local clean %f" >>expect &&
-	extension_config_line lfs.extension.snapshot.priority invalid-git >>expect &&
-	extension_config_line lfs.extension.snapshot.priority -1 >>expect &&
-	extension_config_line lfs.extension.snapshot.priority invalid-command >>expect &&
-	extension_config_line lfs.extension.snapshot.priority -1 >>expect &&
-	test_cmp expect "$trace_log"
-'
-
-test_expect_success 'extension snapshot reads HEAD safe priorities in a bare repository without a worktree' '
-	git clone --bare snapshot-repo snapshot-bare.git &&
-	capture_extension_config &&
-	(
-		cd snapshot-bare.git &&
-		test_must_fail git rev-parse --show-toplevel &&
-		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
-			test-tool textil-ext-executor-server send-materialize
-	) &&
-	extension_config_line lfs.extension.snapshot.priority 5 >expect &&
-	test_cmp expect "$trace_log"
+		cd extension-fallback-repo &&
+		cat >.lfsconfig <<-\EOF &&
+		[lfs "extension.untrusted"]
+			clean = never-trusted
+			smudge = never-trusted
+		EOF
+		echo "unsafe lower commands" >unsafe.bin &&
+		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-cc-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git add unsafe.bin &&
+		git show :unsafe.bin >actual &&
+		grep "version https://git-lfs.github.com/spec/v1" actual
+	)
 '
 
 test_done
