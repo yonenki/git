@@ -1183,6 +1183,7 @@ static void textil_ext_collect_takeover_batch(
 		item->strict = ext_result.strict;
 		item->capabilities = ext_result.capabilities;
 		item->nr_capabilities = ext_result.nr_capabilities;
+		item->checkout_entry = ce;
 	}
 }
 
