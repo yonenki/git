@@ -74,6 +74,12 @@ struct textil_ext_takeover_batch {
 	const char *repo_root;       /* worktree root; NULL for bare repos */
 	struct textil_ext_takeover_item *items; /* array of candidates */
 	int nr_items;                /* must be > 0 when calling executor */
+	/*
+	 * checkin_convert only: the controller seals objects without making
+	 * them durable; their OIDs are fenced before the ODB transaction
+	 * commits, i.e. before Git can reference the returned pointers.
+	 */
+	int deferred_durability;
 };
 
 /* --- Executor status ---------------------------------------------------- */
@@ -199,7 +205,16 @@ int textil_ext_materialize_one_to_fd(
 enum textil_ext_executor_status textil_ext_execute_checkin_convert_batch(
 	const struct textil_ext_takeover_batch *batch,
 	struct string_list *src_paths_out,
+	struct string_list *fence_oids_out,
 	struct strbuf *err);
+
+/*
+ * Make every object sealed by deferred checkin conversions durable.
+ * Called before an ODB transaction commits, so before Git publishes the
+ * returned pointers through the index or any tree. No-op when nothing
+ * is pending. Returns 0 on success, -1 with err filled on failure.
+ */
+int textil_ext_flush_deferred_durability(struct strbuf *err);
 
 /*
  * High-level helper: checkin_convert a single file to a strbuf.

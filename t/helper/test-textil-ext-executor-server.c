@@ -71,6 +71,8 @@ enum reply_mode {
 	REPLY_VALIDATE_REQUEST_CHECKIN_CONVERT,
 	REPLY_BATCH_CHECKOUT,
 	REPLY_ADMITTED_CHECKOUT, /* single-path lazy-admission regression */
+	REPLY_CHECKIN_DEFERRED, /* fence_oid for deferred checkins, logged fences */
+	REPLY_CHECKIN_DEFERRED_FENCE_ERROR,
 };
 
 static struct {
@@ -176,6 +178,10 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_CHECKIN_CONVERT_CHECKIN;
 	if (!strcmp(s, "validate-request-checkin-convert"))
 		return REPLY_VALIDATE_REQUEST_CHECKIN_CONVERT;
+	if (!strcmp(s, "checkin-deferred"))
+		return REPLY_CHECKIN_DEFERRED;
+	if (!strcmp(s, "checkin-deferred-fence-error"))
+		return REPLY_CHECKIN_DEFERRED_FENCE_ERROR;
 	die("unknown reply-mode: '%s'", s);
 }
 
@@ -558,6 +564,98 @@ static void build_error_reply(struct strbuf *out, const char *message)
 	packet_buf_flush(out);
 }
 
+/*
+ * Deferred-durability controller double. A checkin reply carries one
+ * pointer src_path per item and, when the request is deferred, a
+ * fence_oid derived from the item path. Every request is appended to the
+ * trace log as "<command> deferred=<0|1> items=<n>".
+ */
+static int reply_checkin_deferred(const char *request, size_t request_len,
+				  struct strbuf *reply, int fence_fails)
+{
+	size_t pos = 0;
+	int in_header = 1, deferred = 0, fence = 0, nr_items = 0;
+	struct string_list paths = STRING_LIST_INIT_DUP;
+	size_t i;
+
+	for (;;) {
+		const char *line, *key, *val;
+		size_t line_len, key_len, val_len;
+		enum pktline_mem_status st = pktline_read_mem(request, request_len,
+							      &pos, &line, &line_len);
+		if (st == PKTLINE_MEM_FLUSH || st == PKTLINE_MEM_ERROR)
+			break;
+		if (st == PKTLINE_MEM_DELIM) {
+			in_header = 0;
+			nr_items++;
+			continue;
+		}
+		if (parse_kv(line, line_len, &key, &key_len, &val, &val_len))
+			continue;
+		if (in_header) {
+			if (kv_matches(key, key_len, "durability") &&
+			    val_equals(val, val_len, "deferred"))
+				deferred = 1;
+			else if (kv_matches(key, key_len, "command") &&
+				 val_equals(val, val_len, "durability_fence"))
+				fence = 1;
+		} else if (kv_matches(key, key_len, "path")) {
+			string_list_append_nodup(&paths, xmemdupz(val, val_len));
+		}
+	}
+
+	if (server_args.trace_log_path) {
+		FILE *fp = fopen(server_args.trace_log_path, "a");
+		if (fp) {
+			fprintf(fp, "%s deferred=%d items=%d\n",
+				fence ? "fence" : "checkin", deferred, nr_items);
+			fclose(fp);
+		}
+	}
+
+	if (fence) {
+		if (fence_fails)
+			build_error_reply(reply, "mock fence failure");
+		else {
+			packet_buf_write(reply, "status=ok\n");
+			packet_buf_flush(reply);
+		}
+		string_list_clear(&paths, 0);
+		return 0;
+	}
+
+	packet_buf_write(reply, "status=ok\n");
+	for (i = 0; i < paths.nr; i++) {
+		struct strbuf tmp_path = STRBUF_INIT;
+		uint32_t h = 2166136261u;
+		const char *p;
+		int tmp_fd;
+
+		for (p = paths.items[i].string; *p; p++)
+			h = (h ^ (unsigned char)*p) * 16777619u;
+		strbuf_addf(&tmp_path, "%s/checkin-deferred-XXXXXX",
+			    getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+		tmp_fd = mkstemp(tmp_path.buf);
+		if (tmp_fd >= 0) {
+			struct strbuf pointer = STRBUF_INIT;
+			strbuf_addf(&pointer,
+				    "version https://git-lfs.github.com/spec/v1\n"
+				    "oid sha256:%064x\nsize 42\n", h);
+			write_in_full(tmp_fd, pointer.buf, pointer.len);
+			close(tmp_fd);
+			strbuf_release(&pointer);
+		}
+		packet_buf_delim(reply);
+		packet_buf_write(reply, "src_path=%s\n", tmp_path.buf);
+		if (deferred)
+			packet_buf_write(reply, "fence_oid=%064x\n", h);
+		strbuf_release(&tmp_path);
+	}
+	packet_buf_flush(reply);
+	string_list_clear(&paths, 0);
+	return 0;
+}
+
 static int app_cb(void *application_data UNUSED,
 		  const char *request, size_t request_len,
 		  ipc_server_reply_cb *reply_cb,
@@ -570,6 +668,14 @@ static int app_cb(void *application_data UNUSED,
 		return SIMPLE_IPC_QUIT;
 
 	switch (server_args.mode) {
+	case REPLY_CHECKIN_DEFERRED:
+	case REPLY_CHECKIN_DEFERRED_FENCE_ERROR:
+		reply_checkin_deferred(request, request_len, &reply,
+				       server_args.mode == REPLY_CHECKIN_DEFERRED_FENCE_ERROR);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
 	case REPLY_OK:
 		build_ok_reply(&reply, request, request_len);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
@@ -1651,7 +1757,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		batch.nr_items = 1;
 
 		st = textil_ext_execute_checkin_convert_batch(&batch, &src_paths,
-							      &err_buf);
+							      NULL, &err_buf);
 
 		switch (st) {
 		case TEXTIL_EXT_EXECUTOR_OK:
@@ -1714,7 +1820,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		batch.nr_items = 1;
 
 		/* This must BUG() and abort — should never return */
-		textil_ext_execute_checkin_convert_batch(&batch, &src_paths, &err_buf);
+		textil_ext_execute_checkin_convert_batch(&batch, &src_paths, NULL, &err_buf);
 
 		/* If we reach here, the BUG guard is broken */
 		die("BUG guard did not fire for non-checkin_convert phase");
