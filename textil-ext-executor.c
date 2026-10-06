@@ -18,6 +18,8 @@
 #include "odb.h"
 #include "trace.h"
 #include "trace2.h"
+#include "strmap.h"
+#include "parse.h"
 
 #ifdef SUPPORTS_SIMPLE_IPC
 #include "simple-ipc.h"
@@ -299,6 +301,9 @@ static int build_batch_request(
 		packet_buf_write(out, "operation_id=%s\n", operation_id);
 	if (projection_workspace)
 		packet_buf_write(out, "projection_workspace=%s\n", projection_workspace);
+	if (batch->phase == TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT &&
+	    batch->deferred_durability)
+		packet_buf_write(out, "durability=deferred\n");
 
 	/* Items (delim-separated) */
 	for (i = 0; i < batch->nr_items; i++) {
@@ -548,12 +553,14 @@ static int parse_executor_response(const char *buf, size_t len,
 				   struct strbuf *status_out,
 				   struct strbuf *msg_out,
 				   struct string_list *src_paths_out,
+				   struct string_list *fence_oids_out,
 				   struct textil_ext_takeover_batch *preflight_batch)
 {
 	size_t pos = 0;
 	int has_status = 0, has_message = 0;
 	int in_src_path_section = 0;
 	int has_src_path = 0;
+	int has_fence_oid = 0;
 	int disposition_nr = 0;
 	int section_has_value = 0;
 
@@ -586,6 +593,7 @@ static int parse_executor_response(const char *buf, size_t len,
 			if (strcmp(status_out->buf, "ok"))
 				return -1; /* delim not allowed for non-ok */
 			has_src_path = 0;
+			has_fence_oid = 0;
 			section_has_value = 0;
 			in_src_path_section = 1;
 			continue;
@@ -635,6 +643,19 @@ static int parse_executor_response(const char *buf, size_t len,
 				string_list_append(src_paths_out, path_buf.buf);
 				has_src_path = 1;
 				strbuf_release(&path_buf);
+			} else if (fence_oids_out && key_len == 9 &&
+				   !memcmp(line, "fence_oid", 9)) {
+				struct strbuf oid_buf = STRBUF_INIT;
+				/* A sealed object's SHA-256 LFS OID, at most one per item. */
+				if (has_fence_oid || val_len != 64)
+					return -1;
+				for (k = 0; k < val_len; k++)
+					if (!isxdigit((unsigned char)val[k]))
+						return -1;
+				strbuf_add(&oid_buf, val, val_len);
+				string_list_append(fence_oids_out, oid_buf.buf);
+				has_fence_oid = 1;
+				strbuf_release(&oid_buf);
 			} else {
 				return -1; /* unknown key in src_path section */
 			}
@@ -700,6 +721,7 @@ static enum textil_ext_executor_status execute_src_path_batch(
 	const struct textil_ext_takeover_batch *batch,
 	const char *count_mismatch_label,
 	struct string_list *src_paths_out,
+	struct string_list *fence_oids_out,
 	struct strbuf *err)
 {
 #ifndef SUPPORTS_SIMPLE_IPC
@@ -754,7 +776,7 @@ static enum textil_ext_executor_status execute_src_path_batch(
 
 	if (parse_executor_response(answer.buf, answer.len,
 				    &status_str, &msg,
-				    src_paths_out, NULL)) {
+				    src_paths_out, fence_oids_out, NULL)) {
 		strbuf_addf(err,
 			_("textil-ext: invalid response from endpoint '%s'"),
 			endpoint);
@@ -1101,7 +1123,7 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 
 	/* 5. Parse pkt-line response (preflight: no src_paths) */
 	if (parse_executor_response(answer.buf, answer.len,
-				    &status_str, &msg, NULL, batch)) {
+				    &status_str, &msg, NULL, NULL, batch)) {
 		strbuf_addf(err,
 			_("textil-ext: invalid response from endpoint '%s'"),
 			endpoint);
@@ -1171,7 +1193,7 @@ enum textil_ext_executor_status textil_ext_resolve_materialize_batch(
 		BUG("resolve_materialize_batch called with NULL err");
 
 	return execute_src_path_batch(batch, "materialize",
-				      &result_out->src_paths, err);
+				      &result_out->src_paths, NULL, err);
 }
 
 
@@ -1405,6 +1427,7 @@ cleanup:
 enum textil_ext_executor_status textil_ext_execute_checkin_convert_batch(
 	const struct textil_ext_takeover_batch *batch,
 	struct string_list *src_paths_out,
+	struct string_list *fence_oids_out,
 	struct strbuf *err)
 {
 	/* Preconditions (common, evaluated before #ifdef split) */
@@ -1418,7 +1441,207 @@ enum textil_ext_executor_status textil_ext_execute_checkin_convert_batch(
 		BUG("execute_checkin_convert_batch called with NULL err");
 
 	return execute_src_path_batch(batch, "checkin_convert",
-				      src_paths_out, err);
+				      src_paths_out, fence_oids_out, err);
+}
+
+/* --- Deferred checkin durability ---------------------------------------- */
+
+/*
+ * OIDs sealed by deferred conversions in this process. A fence request
+ * carries about 77 bytes per OID and the controller accepts at most
+ * 8 MiB, so the set is fenced early once it reaches this size; every
+ * fence still precedes the transaction commit and so the index write.
+ */
+#define TEXTIL_EXT_FENCE_MAX_OIDS 65536
+
+static struct strset pending_fence_oids = STRSET_INIT;
+
+static int build_fence_request(struct strbuf *out, struct strbuf *err)
+{
+	const char *operation_id = getenv("TEXTIL_GIT_EXT_OPERATION_ID");
+	const char *projection_workspace = getenv("TEXTIL_GIT_EXT_PROJECTION_WORKSPACE");
+	struct strbuf repo_root = STRBUF_INIT;
+	struct hashmap_iter iter;
+	struct strmap_entry *entry;
+	int ret = -1;
+
+	textil_ext_resolve_worktree_root(&repo_root);
+	if (validate_request_value("repo_root", repo_root.buf, err) ||
+	    (operation_id &&
+	     validate_request_value("operation_id", operation_id, err)) ||
+	    (projection_workspace &&
+	     validate_request_value("projection_workspace", projection_workspace, err)))
+		goto done;
+
+	packet_buf_write(out, "version=1\n");
+	packet_buf_write(out, "command=durability_fence\n");
+	packet_buf_write(out, "phase=checkin_convert\n");
+	packet_buf_write(out, "operation=checkin\n");
+	packet_buf_write(out, "repo_root=%s\n", repo_root.buf);
+	if (operation_id)
+		packet_buf_write(out, "operation_id=%s\n", operation_id);
+	if (projection_workspace)
+		packet_buf_write(out, "projection_workspace=%s\n", projection_workspace);
+	strset_for_each_entry(&pending_fence_oids, &iter, entry) {
+		packet_buf_delim(out);
+		packet_buf_write(out, "oid=%s\n", entry->key);
+	}
+	packet_buf_flush(out);
+	ret = 0;
+done:
+	strbuf_release(&repo_root);
+	return ret;
+}
+
+int textil_ext_flush_deferred_durability(struct strbuf *err)
+{
+#ifndef SUPPORTS_SIMPLE_IPC
+	if (!strset_get_size(&pending_fence_oids))
+		return 0;
+	strbuf_addstr(err,
+		_("textil-ext: simple-ipc not available on this platform"));
+	return -1;
+#else
+	struct textil_ext_takeover_batch trace_batch = {
+		.phase = TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT,
+		.operation = "durability_fence",
+	};
+	struct ipc_client_connect_options options
+		= IPC_CLIENT_CONNECT_OPTIONS_INIT;
+	struct strbuf request = STRBUF_INIT;
+	struct strbuf answer = STRBUF_INIT;
+	struct strbuf status_str = STRBUF_INIT;
+	struct strbuf msg = STRBUF_INIT;
+	enum textil_ext_executor_status status = TEXTIL_EXT_EXECUTOR_ERROR;
+	uint64_t trace_start_ns;
+	const char *endpoint;
+
+	if (!strset_get_size(&pending_fence_oids))
+		return 0;
+	trace_start_ns = (uint64_t)getnanotime();
+	trace_batch.nr_items = strset_get_size(&pending_fence_oids);
+
+	endpoint = endpoint_from_env(err);
+	if (!endpoint || build_fence_request(&request, err))
+		goto done;
+	options.wait_if_busy = 1;
+	options.wait_if_not_found = 0;
+	if (send_controller_request(&trace_batch, endpoint, &options,
+				    &request, &answer)) {
+		strbuf_addf(err,
+			_("textil-ext: failed to connect to endpoint '%s'"),
+			endpoint);
+		goto done;
+	}
+	if (answer.len > TEXTIL_EXT_MAX_REPLY_SIZE ||
+	    parse_executor_response(answer.buf, answer.len, &status_str,
+				    &msg, NULL, NULL, NULL)) {
+		strbuf_addf(err,
+			_("textil-ext: invalid response from endpoint '%s'"),
+			endpoint);
+		goto done;
+	}
+	if (strcmp(status_str.buf, "ok")) {
+		strbuf_addf(err,
+			_("textil-ext: durability fence failed: %s"),
+			msg.len ? msg.buf : "(no message)");
+		goto done;
+	}
+	status = TEXTIL_EXT_EXECUTOR_OK;
+	strset_clear(&pending_fence_oids);
+	strset_init(&pending_fence_oids);
+
+done:
+	trace_batch_roundtrip(&trace_batch, endpoint, status, err->buf,
+			      trace_start_ns);
+	strbuf_release(&request);
+	strbuf_release(&answer);
+	strbuf_release(&status_str);
+	strbuf_release(&msg);
+	return status == TEXTIL_EXT_EXECUTOR_OK ? 0 : -1;
+#endif /* SUPPORTS_SIMPLE_IPC */
+}
+
+/*
+ * Inside an open ODB transaction nothing can reference a converted
+ * pointer before the transaction commits, so the durability fence moves
+ * to that commit. Outside a transaction every conversion fences itself.
+ */
+static int checkin_durability_deferred(void)
+{
+	return the_repository->objects && the_repository->objects->transaction;
+}
+
+static int queue_deferred_fence(const struct string_list *fence_oids,
+				struct strbuf *err)
+{
+	size_t i;
+
+	for (i = 0; i < fence_oids->nr; i++)
+		strset_add(&pending_fence_oids, fence_oids->items[i].string);
+	if (strset_get_size(&pending_fence_oids) <
+	    git_env_ulong("GIT_TEST_TEXTIL_EXT_FENCE_MAX_OIDS",
+			  TEXTIL_EXT_FENCE_MAX_OIDS))
+		return 0;
+	return textil_ext_flush_deferred_durability(err);
+}
+
+/* Convert one item, queue its sealed OID if deferred, read the pointer. */
+static int run_single_checkin(struct textil_ext_takeover_batch *batch,
+			      struct textil_ext_takeover_item *item,
+			      const char *repo_root, const char *path,
+			      struct strbuf *dst, struct strbuf *err)
+{
+	struct string_list src_paths = STRING_LIST_INIT_DUP;
+	struct string_list fence_oids = STRING_LIST_INIT_DUP;
+	enum textil_ext_executor_status st;
+	int src_fd, ret = -1;
+
+	batch->phase = TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT;
+	batch->operation = "checkin";
+	batch->repo_root = repo_root;
+	batch->items = item;
+	batch->nr_items = 1;
+	batch->deferred_durability = checkin_durability_deferred();
+
+	st = textil_ext_execute_checkin_convert_batch(batch, &src_paths,
+						      &fence_oids, err);
+	if (st != TEXTIL_EXT_EXECUTOR_OK) {
+		error("textil-ext: checkin_convert failed for '%s': %s",
+		      path, err->buf);
+		goto done;
+	}
+	if (fence_oids.nr && !batch->deferred_durability) {
+		strbuf_addstr(err, _("textil-ext: fence_oid in an immediate checkin reply"));
+		error("textil-ext: checkin_convert failed for '%s': %s",
+		      path, err->buf);
+		goto done;
+	}
+	if (queue_deferred_fence(&fence_oids, err)) {
+		error("textil-ext: checkin_convert failed for '%s': %s",
+		      path, err->buf);
+		goto done;
+	}
+
+	/* Read the returned src_path content into dst */
+	src_fd = open(src_paths.items[0].string, O_RDONLY);
+	if (src_fd < 0) {
+		error_errno("textil-ext: cannot open src_path '%s'",
+			    src_paths.items[0].string);
+		goto done;
+	}
+	strbuf_reset(dst);
+	if (strbuf_read(dst, src_fd, 0) < 0) {
+		close(src_fd);
+		error_errno("textil-ext: read src_path failed for '%s'", path);
+		goto done;
+	}
+	close(src_fd);
+	ret = 0;
+done:
+	string_list_clear(&src_paths, 0);
+	string_list_clear(&fence_oids, 0);
+	return ret;
 }
 
 /* --- Checkin convert one-to-buf helper ---------------------------------- */
@@ -1434,10 +1657,8 @@ int textil_ext_checkin_convert_one_to_buf(
 {
 	struct textil_ext_takeover_batch batch;
 	struct textil_ext_takeover_item item;
-	struct string_list src_paths = STRING_LIST_INIT_DUP;
-	enum textil_ext_executor_status st;
 	struct strbuf tmp_path = STRBUF_INIT;
-	int tmp_fd, src_fd, ret = -1;
+	int tmp_fd, ret = -1;
 
 	memset(&batch, 0, sizeof(batch));
 	memset(&item, 0, sizeof(item));
@@ -1475,42 +1696,12 @@ int textil_ext_checkin_convert_one_to_buf(
 	item.capabilities = eval_result->capabilities;
 	item.nr_capabilities = eval_result->nr_capabilities;
 
-	batch.phase = TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT;
-	batch.operation = "checkin";
-	batch.repo_root = repo_root;
-	batch.items = &item;
-	batch.nr_items = 1;
+	ret = run_single_checkin(&batch, &item, repo_root, path, dst, err);
 
-	st = textil_ext_execute_checkin_convert_batch(&batch, &src_paths, err);
-	if (st != TEXTIL_EXT_EXECUTOR_OK) {
-		error("textil-ext: checkin_convert failed for '%s': %s",
-		      path, err->buf);
-		goto cleanup;
-	}
-
-	/* Read the returned src_path content into dst */
-	src_fd = open(src_paths.items[0].string, O_RDONLY);
-	if (src_fd < 0) {
-		error_errno("textil-ext: cannot open src_path '%s'",
-			    src_paths.items[0].string);
-		goto cleanup;
-	}
-
-	strbuf_reset(dst);
-	if (strbuf_read(dst, src_fd, 0) < 0) {
-		close(src_fd);
-		error_errno("textil-ext: read src_path failed for '%s'", path);
-		goto cleanup;
-	}
-	close(src_fd);
-	ret = 0;
-
-cleanup:
 	/* Remove temp input file */
 	if (item.input_path)
 		unlink(item.input_path);
 	textil_ext_takeover_batch_release(&batch);
-	string_list_clear(&src_paths, 0);
 	return ret;
 }
 
@@ -1528,10 +1719,8 @@ int textil_ext_checkin_convert_fd_to_buf(
 {
 	struct textil_ext_takeover_batch batch;
 	struct textil_ext_takeover_item item;
-	struct string_list src_paths = STRING_LIST_INIT_DUP;
-	enum textil_ext_executor_status st;
 	struct strbuf tmp_path = STRBUF_INIT;
-	int tmp_fd = -1, src_fd, ret = -1;
+	int tmp_fd = -1, ret = -1;
 	int remove_input_path = 0;
 
 	memset(&batch, 0, sizeof(batch));
@@ -1575,40 +1764,10 @@ int textil_ext_checkin_convert_fd_to_buf(
 	item.capabilities = eval_result->capabilities;
 	item.nr_capabilities = eval_result->nr_capabilities;
 
-	batch.phase = TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT;
-	batch.operation = "checkin";
-	batch.repo_root = repo_root;
-	batch.items = &item;
-	batch.nr_items = 1;
+	ret = run_single_checkin(&batch, &item, repo_root, path, dst, err);
 
-	st = textil_ext_execute_checkin_convert_batch(&batch, &src_paths, err);
-	if (st != TEXTIL_EXT_EXECUTOR_OK) {
-		error("textil-ext: checkin_convert failed for '%s': %s",
-		      path, err->buf);
-		goto cleanup;
-	}
-
-	/* Read the returned src_path content into dst */
-	src_fd = open(src_paths.items[0].string, O_RDONLY);
-	if (src_fd < 0) {
-		error_errno("textil-ext: cannot open src_path '%s'",
-			    src_paths.items[0].string);
-		goto cleanup;
-	}
-
-	strbuf_reset(dst);
-	if (strbuf_read(dst, src_fd, 0) < 0) {
-		close(src_fd);
-		error_errno("textil-ext: read src_path failed for '%s'", path);
-		goto cleanup;
-	}
-	close(src_fd);
-	ret = 0;
-
-cleanup:
 	if (remove_input_path && item.input_path)
 		unlink(item.input_path);
 	textil_ext_takeover_batch_release(&batch);
-	string_list_clear(&src_paths, 0);
 	return ret;
 }
