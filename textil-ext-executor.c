@@ -785,7 +785,7 @@ static enum textil_ext_executor_status execute_src_path_batch(
 	}
 
 	if (!strcmp(status_str.buf, "ok")) {
-		if (src_paths_out->nr != batch->nr_items) {
+		if (src_paths_out->nr != (size_t)batch->nr_items) {
 			strbuf_addf(err,
 				_("textil-ext: %s src_path count mismatch: got %lu, expected %d"),
 				count_mismatch_label,
@@ -988,7 +988,7 @@ static void textil_ext_collect_takeover_batch(
 	enum textil_ext_executor_phase phase,
 	struct textil_ext_takeover_batch *batch_out)
 {
-	int i;
+	unsigned int i;
 	int alloc = 0;
 
 	memset(batch_out, 0, sizeof(*batch_out));
@@ -1095,19 +1095,10 @@ void textil_ext_collect_materialize_takeover_batch(
 
 /* --- Executor ----------------------------------------------------------- */
 
-enum textil_ext_executor_status textil_ext_execute_takeover_batch(
+static enum textil_ext_executor_status execute_takeover_batch_ipc(
 	struct textil_ext_takeover_batch *batch,
 	struct strbuf *err)
 {
-	/* Preconditions (common, evaluated before #ifdef split) */
-	if (!batch || !batch->items || batch->nr_items <= 0)
-		BUG("execute_takeover_batch called with invalid batch");
-	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_PREFLIGHT)
-		BUG("execute_takeover_batch called with non-preflight phase (phase=%d)",
-		    batch->phase);
-	if (!err)
-		BUG("execute_takeover_batch called with NULL err");
-
 #ifndef SUPPORTS_SIMPLE_IPC
 	strbuf_addstr(err,
 		_("textil-ext: simple-ipc not available on this platform"));
@@ -1198,6 +1189,22 @@ done:
 	strbuf_release(&msg);
 	return status;
 #endif /* SUPPORTS_SIMPLE_IPC */
+}
+
+enum textil_ext_executor_status textil_ext_execute_takeover_batch(
+	struct textil_ext_takeover_batch *batch,
+	struct strbuf *err)
+{
+	/* Preconditions (common, evaluated before #ifdef split) */
+	if (!batch || !batch->items || batch->nr_items <= 0)
+		BUG("execute_takeover_batch called with invalid batch");
+	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_PREFLIGHT)
+		BUG("execute_takeover_batch called with non-preflight phase (phase=%d)",
+		    batch->phase);
+	if (!err)
+		BUG("execute_takeover_batch called with NULL err");
+
+	return execute_takeover_batch_ipc(batch, err);
 }
 
 void textil_ext_materialize_batch_result_init(
@@ -1351,7 +1358,7 @@ int textil_ext_preresolve_materialize_cache(
 		return -1;
 	}
 
-	if (result.src_paths.nr != preflight_batch->nr_items)
+	if (result.src_paths.nr != (size_t)preflight_batch->nr_items)
 		BUG("preresolve: batch returned %lu src_paths for %d items",
 		    (unsigned long)result.src_paths.nr, preflight_batch->nr_items);
 
