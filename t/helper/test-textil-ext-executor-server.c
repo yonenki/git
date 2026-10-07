@@ -69,6 +69,8 @@ enum reply_mode {
 	REPLY_VALIDATE_REQUEST_MATERIALIZE,
 	REPLY_CHECKIN_CONVERT_CHECKIN,
 	REPLY_VALIDATE_REQUEST_CHECKIN_CONVERT,
+	REPLY_CHECKIN_CONVERT_BAD_POINTER,
+	REPLY_CHECKIN_CONVERT_NON_HEX_POINTER,
 	REPLY_BATCH_CHECKOUT,
 	REPLY_ADMITTED_CHECKOUT, /* single-path lazy-admission regression */
 	REPLY_CHECKIN_DEFERRED, /* fence_oid for deferred checkins, logged fences */
@@ -176,6 +178,10 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_VALIDATE_REQUEST_MATERIALIZE;
 	if (!strcmp(s, "checkin-convert-checkin"))
 		return REPLY_CHECKIN_CONVERT_CHECKIN;
+	if (!strcmp(s, "checkin-convert-bad-pointer"))
+		return REPLY_CHECKIN_CONVERT_BAD_POINTER;
+	if (!strcmp(s, "checkin-convert-non-hex-pointer"))
+		return REPLY_CHECKIN_CONVERT_NON_HEX_POINTER;
 	if (!strcmp(s, "validate-request-checkin-convert"))
 		return REPLY_VALIDATE_REQUEST_CHECKIN_CONVERT;
 	if (!strcmp(s, "checkin-deferred"))
@@ -570,6 +576,28 @@ static void build_error_reply(struct strbuf *out, const char *message)
  * fence_oid derived from the item path. Every request is appended to the
  * trace log as "<command> deferred=<0|1> items=<n>".
  */
+static const char checkin_pointer[] =
+	"version https://git-lfs.github.com/spec/v1\n"
+	"oid sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+	"size 42\n";
+
+static void packet_buf_write_hex_pointer(struct strbuf *reply, const char *text)
+{
+	static const char hex[] = "0123456789abcdef";
+	struct strbuf line = STRBUF_INIT;
+	const unsigned char *p;
+
+	strbuf_grow(&line, 9 + 2 * strlen(text));
+	strbuf_addstr(&line, "pointer=");
+	for (p = (const unsigned char *)text; *p; p++) {
+		strbuf_addch(&line, hex[*p >> 4]);
+		strbuf_addch(&line, hex[*p & 15]);
+	}
+	strbuf_addch(&line, '\n');
+	packet_buf_write(reply, "%s", line.buf);
+	strbuf_release(&line);
+}
+
 static int reply_checkin_deferred(const char *request, size_t request_len,
 				  struct strbuf *reply, int fence_fails)
 {
@@ -626,30 +654,20 @@ static int reply_checkin_deferred(const char *request, size_t request_len,
 
 	packet_buf_write(reply, "status=ok\n");
 	for (i = 0; i < paths.nr; i++) {
-		struct strbuf tmp_path = STRBUF_INIT;
+		struct strbuf pointer = STRBUF_INIT;
 		uint32_t h = 2166136261u;
 		const char *p;
-		int tmp_fd;
 
 		for (p = paths.items[i].string; *p; p++)
 			h = (h ^ (unsigned char)*p) * 16777619u;
-		strbuf_addf(&tmp_path, "%s/checkin-deferred-XXXXXX",
-			    getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
-		tmp_fd = mkstemp(tmp_path.buf);
-		if (tmp_fd >= 0) {
-			struct strbuf pointer = STRBUF_INIT;
-			strbuf_addf(&pointer,
-				    "version https://git-lfs.github.com/spec/v1\n"
-				    "oid sha256:%064x\nsize 42\n", h);
-			write_in_full(tmp_fd, pointer.buf, pointer.len);
-			close(tmp_fd);
-			strbuf_release(&pointer);
-		}
+		strbuf_addf(&pointer,
+			    "version https://git-lfs.github.com/spec/v1\n"
+			    "oid sha256:%064x\nsize 42\n", h);
 		packet_buf_delim(reply);
-		packet_buf_write(reply, "src_path=%s\n", tmp_path.buf);
+		packet_buf_write_hex_pointer(reply, pointer.buf);
 		if (deferred)
 			packet_buf_write(reply, "fence_oid=%064x\n", h);
-		strbuf_release(&tmp_path);
+		strbuf_release(&pointer);
 	}
 	packet_buf_flush(reply);
 	string_list_clear(&paths, 0);
@@ -1067,9 +1085,7 @@ static int app_cb(void *application_data UNUSED,
 
 	case REPLY_CHECKIN_CONVERT_CHECKIN: {
 		/*
-		 * Parse request to extract item paths, create temp files
-		 * with predictable LFS pointer content, return src_paths.
-		 * Mirror of REPLY_MATERIALIZE_CHECKOUT for checkin_convert.
+		 * Parse item paths and return predictable LFS pointer bytes inline.
 		 */
 		size_t pos = 0;
 		int in_header = 1;
@@ -1131,32 +1147,11 @@ static int app_cb(void *application_data UNUSED,
 			return ret;
 		}
 
-		/* Build reply: status=ok + src_paths with LFS pointer content */
+		/* Build reply: status=ok + inline hex pointers. */
 		packet_buf_write(&reply, "status=ok\n");
 		for (i = 0; i < nr_items; i++) {
-			struct strbuf tmp_path = STRBUF_INIT;
-			int tmp_fd;
-
-			strbuf_addf(&tmp_path, "%s/checkin-convert-XXXXXX",
-				    getenv("TMPDIR") ? getenv("TMPDIR")
-						     : "/tmp");
-			tmp_fd = mkstemp(tmp_path.buf);
-			if (tmp_fd >= 0) {
-				/*
-				 * Write a predictable LFS pointer.
-				 * Use a fixed OID to make test assertions simple.
-				 */
-				const char *content =
-					"version https://git-lfs.github.com/spec/v1\n"
-					"oid sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
-					"size 42\n";
-				write_in_full(tmp_fd, content, strlen(content));
-				close(tmp_fd);
-			}
 			packet_buf_delim(&reply);
-			packet_buf_write(&reply, "src_path=%s\n",
-					 tmp_path.buf);
-			strbuf_release(&tmp_path);
+			packet_buf_write_hex_pointer(&reply, checkin_pointer);
 			strbuf_release(&item_paths[i]);
 		}
 		packet_buf_flush(&reply);
@@ -1167,10 +1162,22 @@ static int app_cb(void *application_data UNUSED,
 		return ret;
 	}
 
+	case REPLY_CHECKIN_CONVERT_BAD_POINTER:
+	case REPLY_CHECKIN_CONVERT_NON_HEX_POINTER:
+		packet_buf_write(&reply, "status=ok\n");
+		packet_buf_delim(&reply);
+		packet_buf_write(&reply, "pointer=%s\n",
+				 server_args.mode == REPLY_CHECKIN_CONVERT_BAD_POINTER ?
+				 "abc" : "gg");
+		packet_buf_flush(&reply);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
 	case REPLY_VALIDATE_REQUEST_CHECKIN_CONVERT: {
 		/*
 		 * Validate request structure (including command-phase pairing),
-		 * then reply with proper checkin_convert format (ok + 1 src_path).
+		 * then reply with proper checkin_convert format (ok + 1 pointer).
 		 */
 		struct strbuf reason = STRBUF_INIT;
 
@@ -1178,8 +1185,7 @@ static int app_cb(void *application_data UNUSED,
 					   &reason)) {
 			packet_buf_write(&reply, "status=ok\n");
 			packet_buf_delim(&reply);
-			packet_buf_write(&reply,
-					 "src_path=/tmp/validate-cc-ok\n");
+			packet_buf_write_hex_pointer(&reply, checkin_pointer);
 			packet_buf_flush(&reply);
 			ret = reply_cb(reply_data, reply.buf, reply.len);
 		} else {
@@ -1716,12 +1722,12 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 	 * send-checkin-convert: invoke textil_ext_execute_checkin_convert_batch()
 	 * with a fake 1-item batch.
 	 * Uses TEXTIL_GIT_EXT_ENDPOINT from env (must be set).
-	 * Prints executor status, src_paths, and any error message to stdout.
+	 * Prints executor status, pointers, and any error message to stdout.
 	 */
 	if (!strcmp(subcmd, "send-checkin-convert")) {
 		struct textil_ext_takeover_batch batch;
 		struct textil_ext_takeover_item item;
-		struct string_list src_paths = STRING_LIST_INIT_DUP;
+		struct string_list pointers = STRING_LIST_INIT_DUP;
 		struct strbuf err_buf = STRBUF_INIT;
 		enum textil_ext_executor_status st;
 		struct strbuf tmp_input = STRBUF_INIT;
@@ -1756,7 +1762,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		batch.items = &item;
 		batch.nr_items = 1;
 
-		st = textil_ext_execute_checkin_convert_batch(&batch, &src_paths,
+		st = textil_ext_execute_checkin_convert_batch(&batch, &pointers,
 							      NULL, &err_buf);
 
 		switch (st) {
@@ -1773,8 +1779,8 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 			printf("status=error\n");
 			break;
 		}
-		for (i = 0; i < src_paths.nr; i++)
-			printf("src_path=%s\n", src_paths.items[i].string);
+		for (i = 0; i < pointers.nr; i++)
+			printf("pointer=%s\n", pointers.items[i].string);
 		if (err_buf.len)
 			printf("message=%s\n", err_buf.buf);
 
@@ -1783,7 +1789,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		free(item.path);
 		free(item.attr_filter);
 		free(item.input_path);
-		string_list_clear(&src_paths, 0);
+		string_list_clear(&pointers, 0);
 		strbuf_release(&err_buf);
 		return (st != TEXTIL_EXT_EXECUTOR_OK) ? 1 : 0;
 	}
@@ -1796,7 +1802,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 	if (!strcmp(subcmd, "send-checkin-convert-wrong-phase")) {
 		struct textil_ext_takeover_batch batch;
 		struct textil_ext_takeover_item item;
-		struct string_list src_paths = STRING_LIST_INIT_DUP;
+		struct string_list pointers = STRING_LIST_INIT_DUP;
 		struct strbuf err_buf = STRBUF_INIT;
 
 		memset(&batch, 0, sizeof(batch));
@@ -1820,7 +1826,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		batch.nr_items = 1;
 
 		/* This must BUG() and abort — should never return */
-		textil_ext_execute_checkin_convert_batch(&batch, &src_paths, NULL, &err_buf);
+		textil_ext_execute_checkin_convert_batch(&batch, &pointers, NULL, &err_buf);
 
 		/* If we reach here, the BUG guard is broken */
 		die("BUG guard did not fire for non-checkin_convert phase");

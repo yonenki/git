@@ -191,20 +191,19 @@ int textil_ext_materialize_one_to_fd(
 	struct strbuf *err);
 
 /*
- * Execute a checkin_convert takeover batch and return src_paths.
+ * Execute a checkin_convert takeover batch and return validated hex pointers.
  *
- * Like textil_ext_resolve_materialize_batch(), but for the checkin_convert
- * phase.  The backend reads the input file (item->input_path), writes the
- * converted output to a temp file, and returns the src_path.
+ * The backend reads the input file (item->input_path) and returns exact
+ * pointer bytes inline; no backend output file is created.
  *
  * Preconditions:
  *   - batch->phase == TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT
  *   - batch->nr_items > 0
- *   - src_paths_out is initialized
+ *   - pointers_out is initialized
  */
 enum textil_ext_executor_status textil_ext_execute_checkin_convert_batch(
 	const struct textil_ext_takeover_batch *batch,
-	struct string_list *src_paths_out,
+	struct string_list *pointers_out,
 	struct string_list *fence_oids_out,
 	struct strbuf *err);
 
@@ -220,8 +219,8 @@ int textil_ext_flush_deferred_durability(struct strbuf *err);
  * High-level helper: checkin_convert a single file to a strbuf.
  *
  * Writes the working tree file to a temp file, builds a 1-item
- * checkin_convert batch, calls the executor, reads the returned
- * src_path content into dst.
+ * checkin_convert batch, calls the executor, and decodes the returned
+ * inline pointer into dst.
  *
  * Returns 0 on success, -1 on any failure (error() already emitted).
  */
@@ -239,8 +238,8 @@ int textil_ext_checkin_convert_one_to_buf(
  *
  * When input_path names the file backing fd, passes that absolute path
  * directly to the backend. Otherwise streams fd to a temp file. Builds a
- * 1-item checkin_convert batch, calls the executor, and reads the returned
- * src_path content into dst.
+ * 1-item checkin_convert batch, calls the executor, and decodes the returned
+ * inline pointer into dst.
  *
  * Returns 0 on success, -1 on any failure (error() already emitted).
  */

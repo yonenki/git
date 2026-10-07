@@ -28,6 +28,8 @@
 #include "read-cache.h"
 #include "setup.h"
 #include "sparse-index.h"
+#include "convert.h"
+#include "textil-ext-policy.h"
 #include "split-index.h"
 #include "symlinks.h"
 #include "fsmonitor.h"
@@ -51,6 +53,7 @@ static int mark_skip_worktree_only;
 static int mark_fsmonitor_only;
 static int ignore_skip_worktree_entries;
 static int textil_materialized;
+static int textil_materialized_if_unchanged;
 #ifndef USE_NSEC
 static time_t textil_materialized_latest_mtime;
 #endif
@@ -261,12 +264,21 @@ static int mark_ce_flags(const char *path, int flag, int mark)
 	return -1;
 }
 
+static void record_textil_materialized_stat(struct cache_entry *ce, struct stat *st)
+{
+	fill_stat_cache_info(the_repository->index, ce, st);
+#ifndef USE_NSEC
+	if (textil_materialized_latest_mtime < st->st_mtime)
+		textil_materialized_latest_mtime = st->st_mtime;
+#endif
+	/* Callers decide whether skip-worktree may be cleared. */
+	ce->ce_flags |= CE_UPDATE_IN_BASE;
+	mark_fsmonitor_invalid(the_repository->index, ce);
+	the_repository->index->cache_changed |= CE_ENTRY_CHANGED;
+}
+
 /*
- * Record the worktree stat produced by Textil's clone materializer without
- * converting or reading the file contents again.  The caller owns the list
- * of paths it has just materialized; this command only completes the same
- * index bookkeeping that checkout normally performs after a successful
- * write.
+ * Clone/projected finalize owns the unconditional list of materialized paths.
  */
 static int mark_textil_materialized(const char *path, struct stat *st)
 {
@@ -275,18 +287,110 @@ static int mark_textil_materialized(const char *path, struct stat *st)
 
 	if (pos < 0)
 		return error("%s: not a stage-0 index entry", path);
-
 	ce = the_repository->index->cache[pos];
-	fill_stat_cache_info(the_repository->index, ce, st);
-#ifndef USE_NSEC
-	if (textil_materialized_latest_mtime < st->st_mtime)
-		textil_materialized_latest_mtime = st->st_mtime;
-#endif
 	ce->ce_flags &= ~CE_SKIP_WORKTREE;
-	ce->ce_flags |= CE_UPDATE_IN_BASE;
-	mark_fsmonitor_invalid(the_repository->index, ce);
-	the_repository->index->cache_changed |= CE_ENTRY_CHANGED;
+	record_textil_materialized_stat(ce, st);
 	return 0;
+}
+
+static uintmax_t materialized_number(const char **cursor, char separator)
+{
+	char *end;
+	uintmax_t value;
+
+	if (**cursor < '0' || **cursor > '9')
+		die("malformed Textil materialized stat record");
+	errno = 0;
+	value = strtoumax(*cursor, &end, 10);
+	if (errno || *end != separator)
+		die("malformed Textil materialized stat record");
+	*cursor = end + 1;
+	return value;
+}
+
+static void read_textil_materialized_stats(void)
+{
+	struct strbuf buf = STRBUF_INIT;
+
+	setup_work_tree(the_repository);
+	while (!strbuf_getwholeline(&buf, stdin, '\0')) {
+		struct object_id oid;
+		struct stat st;
+		struct cache_entry *ce;
+		struct conv_attrs ca;
+		struct textil_ext_eval_result policy;
+		const char *p, *path, *reason = NULL;
+		uintmax_t size, mtime, mtime_nsec, ctime, ctime_nsec;
+		uintmax_t dev, ino, uid, gid;
+		int pos;
+
+		if (!buf.len || buf.buf[buf.len - 1] != '\0')
+			die("unterminated Textil materialized stat record");
+		strbuf_setlen(&buf, buf.len - 1);
+		if (parse_oid_hex(buf.buf, &oid, &p) || *p++ != ' ')
+			die("malformed Textil materialized stat record");
+		size = materialized_number(&p, ' ');
+		mtime = materialized_number(&p, ' ');
+		mtime_nsec = materialized_number(&p, ' ');
+		ctime = materialized_number(&p, ' ');
+		ctime_nsec = materialized_number(&p, ' ');
+		dev = materialized_number(&p, ' ');
+		ino = materialized_number(&p, ' ');
+		uid = materialized_number(&p, ' ');
+		gid = materialized_number(&p, '\t');
+		path = p;
+		if (!*path || mtime_nsec >= 1000000000 || ctime_nsec >= 1000000000)
+			die("malformed Textil materialized stat record");
+		if (!verify_path(path, 0))
+			die("invalid Textil materialized path: %s", path);
+		pos = index_name_pos(the_repository->index, path, strlen(path));
+		if (pos < 0)
+			reason = "not a stage-0 index entry";
+		else {
+			ce = the_repository->index->cache[pos];
+			if (!S_ISREG(ce->ce_mode))
+				reason = "not a regular index entry";
+			else if (!oideq(&ce->oid, &oid))
+				reason = "index blob changed";
+			else if (ce->ce_flags & (CE_SKIP_WORKTREE | CE_VALID))
+				reason = "index entry excluded";
+			else if (has_symlink_leading_path(path, strlen(path)))
+				reason = "symlinked leading path";
+			else if (lstat(path, &st) || !S_ISREG(st.st_mode))
+				reason = "not a regular worktree file";
+			else if ((uintmax_t)st.st_size != size ||
+				 (uintmax_t)st.st_mtime != mtime ||
+				 (uintmax_t)st.st_ctime != ctime ||
+				 (unsigned int)st.st_dev != (unsigned int)dev ||
+				 (unsigned int)st.st_ino != (unsigned int)ino ||
+				 (unsigned int)st.st_uid != (unsigned int)uid ||
+				 (unsigned int)st.st_gid != (unsigned int)gid
+#ifdef USE_NSEC
+				 || ST_MTIME_NSEC(st) != mtime_nsec ||
+				 ST_CTIME_NSEC(st) != ctime_nsec
+#endif
+				)
+				reason = "worktree stat changed";
+			else {
+				convert_attrs(the_repository->index, &ca, path);
+				textil_ext_evaluate_for_checkin(conv_attrs_filter_name(&ca), 1, &policy);
+				if (!policy.matched || policy.action != TEXTIL_ACTION_TAKEOVER ||
+				    !conv_attrs_filter_name(&ca) ||
+				    strcmp(conv_attrs_filter_name(&ca), "lfs"))
+					reason = "not an LFS checkin takeover";
+				else {
+					unsigned int valid = ce->ce_flags & CE_VALID;
+
+					record_textil_materialized_stat(ce, &st);
+					/* core.ignoreStat must not undo --no-assume-unchanged. */
+					ce->ce_flags = (ce->ce_flags & ~CE_VALID) | valid;
+				}
+			}
+		}
+		if (reason)
+			report("textil-materialized skip %s: %s", reason, path);
+	}
+	strbuf_release(&buf);
 }
 
 static int remove_one_path(const char *path)
@@ -896,6 +1000,19 @@ static enum parse_opt_result stdin_cacheinfo_callback(
 	return 0;
 }
 
+static enum parse_opt_result materialized_stats_callback(
+	struct parse_opt_ctx_t *ctx, const struct option *opt,
+	const char *arg, int unset)
+{
+	BUG_ON_OPT_NEG(unset);
+	BUG_ON_OPT_ARG(arg);
+	if (ctx->argc != 1 || !*(int *)opt->value)
+		return error("option '%s' requires -z and must be the last argument", opt->long_name);
+	textil_materialized_if_unchanged = 1;
+	read_textil_materialized_stats();
+	return 0;
+}
+
 static enum parse_opt_result stdin_callback(
 	struct parse_opt_ctx_t *ctx, const struct option *opt,
 	const char *arg, int unset)
@@ -1052,6 +1169,14 @@ int cmd_update_index(int argc,
 			 N_("do not touch index-only entries")),
 		OPT_BOOL(0, "textil-materialized", &textil_materialized,
 			 N_("record stat information for Textil-materialized files")),
+		{
+			.type = OPTION_LOWLEVEL_CALLBACK,
+			.long_name = "textil-materialized-if-unchanged",
+			.value = &nul_term_line,
+			.help = N_("record owned-handle stat if the LFS index blob and worktree are unchanged"),
+			.flags = PARSE_OPT_NONEG | PARSE_OPT_NOARG,
+			.ll_callback = materialized_stats_callback,
+		},
 		OPT_SET_INT(0, "info-only", &info_only,
 			N_("add to index only; do not add content to object database"), 1),
 		OPT_SET_INT(0, "force-remove", &force_remove,
@@ -1355,7 +1480,7 @@ int cmd_update_index(int argc,
 		 * status.  Wait only when this materialized batch actually needs the
 		 * timestamp boundary; the work remains independent of file size.
 		 */
-		if (textil_materialized &&
+		if ((textil_materialized || textil_materialized_if_unchanged) &&
 		    time(NULL) <= textil_materialized_latest_mtime)
 			sleep(1);
 #endif

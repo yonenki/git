@@ -515,6 +515,17 @@ static int validate_src_path(const char *path, size_t path_len)
 	return 0;
 }
 
+static int validate_pointer_hex(const char *value, size_t len)
+{
+	size_t i;
+	if (len % 2)
+		return -1;
+	for (i = 0; i < len; i++)
+		if (!isxdigit((unsigned char)value[i]))
+			return -1;
+	return 0;
+}
+
 /*
  * Parse a pkt-line v1 executor response.
  *
@@ -525,7 +536,7 @@ static int validate_src_path(const char *path, size_t path_len)
  *   ...
  *   <flush>
  *
- * Materialize format (when src_paths_out is non-NULL):
+ * Materialize format (item_key = "src_path"):
  *   <pkt> status=ok
  *   <delim>
  *   <pkt> src_path=<abs_path>
@@ -534,13 +545,21 @@ static int validate_src_path(const char *path, size_t path_len)
  *   ...
  *   <flush>
  *
+ * Checkin format (item_key = "pointer"; bytes are inline hex):
+ *   <pkt> status=ok
+ *   <delim>
+ *   <pkt> pointer=<hex>
+ *   <pkt> fence_oid=<sha256> (optional)
+ *   ...
+ *   <flush>
+ *
  *   OR (status != ok):
  *   <pkt> status=rejected|error
  *   <pkt> message=<text>
  *   <flush>
  *
- * A successful preflight fills batch item dispositions; materialize fills
- * src_paths_out. Each item section contains exactly one value. Failed replies
+ * A successful preflight fills batch item dispositions; other batches fill
+ * item_values_out. Each item section contains exactly one value. Failed replies
  * have only status + required message, with no item sections.
  *
  * Key order within a section is independent.  Unknown keys, duplicate
@@ -552,14 +571,15 @@ static int validate_src_path(const char *path, size_t path_len)
 static int parse_executor_response(const char *buf, size_t len,
 				   struct strbuf *status_out,
 				   struct strbuf *msg_out,
-				   struct string_list *src_paths_out,
+				   struct string_list *item_values_out,
+				   const char *item_key,
 				   struct string_list *fence_oids_out,
 				   struct textil_ext_takeover_batch *preflight_batch)
 {
 	size_t pos = 0;
 	int has_status = 0, has_message = 0;
-	int in_src_path_section = 0;
-	int has_src_path = 0;
+	int in_item_section = 0;
+	int has_item_value = 0;
 	int has_fence_oid = 0;
 	int disposition_nr = 0;
 	int section_has_value = 0;
@@ -578,24 +598,24 @@ static int parse_executor_response(const char *buf, size_t len,
 		if (st == PKTLINE_MEM_ERROR)
 			return -1;
 		if (st == PKTLINE_MEM_FLUSH) {
-			if (in_src_path_section &&
-			    !(preflight_batch ? section_has_value : has_src_path))
+			if (in_item_section &&
+			    !(preflight_batch ? section_has_value : has_item_value))
 				return -1;
 			break;
 		}
 		if (st == PKTLINE_MEM_DELIM) {
 			/* Item sections require a successful batch reply. */
-			if ((!src_paths_out && !preflight_batch) || !has_status)
+			if ((!item_values_out && !preflight_batch) || !has_status)
 				return -1;
-			if (in_src_path_section &&
-			    !(preflight_batch ? section_has_value : has_src_path))
+			if (in_item_section &&
+			    !(preflight_batch ? section_has_value : has_item_value))
 				return -1;
 			if (strcmp(status_out->buf, "ok"))
 				return -1; /* delim not allowed for non-ok */
-			has_src_path = 0;
+			has_item_value = 0;
 			has_fence_oid = 0;
 			section_has_value = 0;
-			in_src_path_section = 1;
+			in_item_section = 1;
 			continue;
 		}
 
@@ -614,7 +634,7 @@ static int parse_executor_response(const char *buf, size_t len,
 				return -1;
 		}
 
-		if (in_src_path_section) {
+		if (in_item_section) {
 			if (preflight_batch) {
 				int projected;
 				if (section_has_value)
@@ -633,16 +653,19 @@ static int parse_executor_response(const char *buf, size_t len,
 				preflight_batch->items[disposition_nr++].projected = projected;
 				continue;
 			}
-			if (key_len == 8 && !memcmp(line, "src_path", 8)) {
-				struct strbuf path_buf = STRBUF_INIT;
-				if (has_src_path)
+			if (key_len == strlen(item_key) &&
+			    !memcmp(line, item_key, key_len)) {
+				struct strbuf value_buf = STRBUF_INIT;
+				if (has_item_value)
 					return -1;
-				if (validate_src_path(val, val_len))
+				if (!strcmp(item_key, "src_path") ?
+				    validate_src_path(val, val_len) :
+				    validate_pointer_hex(val, val_len))
 					return -1;
-				strbuf_add(&path_buf, val, val_len);
-				string_list_append(src_paths_out, path_buf.buf);
-				has_src_path = 1;
-				strbuf_release(&path_buf);
+				strbuf_add(&value_buf, val, val_len);
+				string_list_append(item_values_out, value_buf.buf);
+				has_item_value = 1;
+				strbuf_release(&value_buf);
 			} else if (fence_oids_out && key_len == 9 &&
 				   !memcmp(line, "fence_oid", 9)) {
 				struct strbuf oid_buf = STRBUF_INIT;
@@ -657,7 +680,7 @@ static int parse_executor_response(const char *buf, size_t len,
 				has_fence_oid = 1;
 				strbuf_release(&oid_buf);
 			} else {
-				return -1; /* unknown key in src_path section */
+				return -1; /* unknown key in item section */
 			}
 		} else if (key_len == 6 && !memcmp(line, "status", 6)) {
 			if (has_status)
@@ -676,7 +699,7 @@ static int parse_executor_response(const char *buf, size_t len,
 		}
 	}
 
-	if (preflight_batch && in_src_path_section && !section_has_value)
+	if (preflight_batch && in_item_section && !section_has_value)
 		return -1;
 	if (preflight_batch && !strcmp(status_out->buf, "ok") &&
 	    (disposition_nr != preflight_batch->nr_items || has_message))
@@ -700,27 +723,28 @@ static int parse_executor_response(const char *buf, size_t len,
 	if (strcmp(status_out->buf, "ok") && !has_message)
 		return -1;
 
-	/* src_path is forbidden when status != ok */
-	if (src_paths_out && src_paths_out->nr > 0 &&
+	/* Item values are forbidden when status != ok. */
+	if (item_values_out && item_values_out->nr > 0 &&
 	    strcmp(status_out->buf, "ok"))
 		return -1;
 
-	/* materialize ok requires at least one src_path */
-	if (src_paths_out && !strcmp(status_out->buf, "ok") &&
-	    src_paths_out->nr == 0)
+	/* A successful value batch requires at least one item. */
+	if (item_values_out && !strcmp(status_out->buf, "ok") &&
+	    item_values_out->nr == 0)
 		return -1;
 
-	/* materialize ok forbids message (only delim+src_path allowed) */
-	if (src_paths_out && !strcmp(status_out->buf, "ok") && has_message)
+	/* A successful value batch forbids message. */
+	if (item_values_out && !strcmp(status_out->buf, "ok") && has_message)
 		return -1;
 
 	return 0;
 }
 
-static enum textil_ext_executor_status execute_src_path_batch(
+static enum textil_ext_executor_status execute_item_value_batch(
 	const struct textil_ext_takeover_batch *batch,
 	const char *count_mismatch_label,
-	struct string_list *src_paths_out,
+	struct string_list *item_values_out,
+	const char *item_key,
 	struct string_list *fence_oids_out,
 	struct strbuf *err)
 {
@@ -776,7 +800,7 @@ static enum textil_ext_executor_status execute_src_path_batch(
 
 	if (parse_executor_response(answer.buf, answer.len,
 				    &status_str, &msg,
-				    src_paths_out, fence_oids_out, NULL)) {
+				    item_values_out, item_key, fence_oids_out, NULL)) {
 		strbuf_addf(err,
 			_("textil-ext: invalid response from endpoint '%s'"),
 			endpoint);
@@ -785,11 +809,11 @@ static enum textil_ext_executor_status execute_src_path_batch(
 	}
 
 	if (!strcmp(status_str.buf, "ok")) {
-		if (src_paths_out->nr != batch->nr_items) {
+		if (item_values_out->nr != batch->nr_items) {
 			strbuf_addf(err,
-				_("textil-ext: %s src_path count mismatch: got %lu, expected %d"),
-				count_mismatch_label,
-				(unsigned long)src_paths_out->nr,
+				_("textil-ext: %s %s count mismatch: got %lu, expected %d"),
+				count_mismatch_label, item_key,
+				(unsigned long)item_values_out->nr,
 				batch->nr_items);
 			status = TEXTIL_EXT_EXECUTOR_ERROR;
 			goto done;
@@ -1123,7 +1147,7 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 
 	/* 5. Parse pkt-line response (preflight: no src_paths) */
 	if (parse_executor_response(answer.buf, answer.len,
-				    &status_str, &msg, NULL, NULL, batch)) {
+				    &status_str, &msg, NULL, NULL, NULL, batch)) {
 		strbuf_addf(err,
 			_("textil-ext: invalid response from endpoint '%s'"),
 			endpoint);
@@ -1192,8 +1216,8 @@ enum textil_ext_executor_status textil_ext_resolve_materialize_batch(
 	if (!err)
 		BUG("resolve_materialize_batch called with NULL err");
 
-	return execute_src_path_batch(batch, "materialize",
-				      &result_out->src_paths, NULL, err);
+	return execute_item_value_batch(batch, "materialize",
+				      &result_out->src_paths, "src_path", NULL, err);
 }
 
 
@@ -1426,7 +1450,7 @@ cleanup:
 
 enum textil_ext_executor_status textil_ext_execute_checkin_convert_batch(
 	const struct textil_ext_takeover_batch *batch,
-	struct string_list *src_paths_out,
+	struct string_list *pointers_out,
 	struct string_list *fence_oids_out,
 	struct strbuf *err)
 {
@@ -1435,13 +1459,13 @@ enum textil_ext_executor_status textil_ext_execute_checkin_convert_batch(
 		BUG("execute_checkin_convert_batch called with invalid batch");
 	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT)
 		BUG("execute_checkin_convert_batch called with non-checkin_convert phase");
-	if (!src_paths_out)
-		BUG("execute_checkin_convert_batch called with NULL src_paths_out");
+	if (!pointers_out)
+		BUG("execute_checkin_convert_batch called with NULL pointers_out");
 	if (!err)
 		BUG("execute_checkin_convert_batch called with NULL err");
 
-	return execute_src_path_batch(batch, "checkin_convert",
-				      src_paths_out, fence_oids_out, err);
+	return execute_item_value_batch(batch, "checkin_convert",
+				      pointers_out, "pointer", fence_oids_out, err);
 }
 
 /* --- Deferred checkin durability ---------------------------------------- */
@@ -1535,7 +1559,7 @@ int textil_ext_flush_deferred_durability(struct strbuf *err)
 	}
 	if (answer.len > TEXTIL_EXT_MAX_REPLY_SIZE ||
 	    parse_executor_response(answer.buf, answer.len, &status_str,
-				    &msg, NULL, NULL, NULL)) {
+				    &msg, NULL, NULL, NULL, NULL)) {
 		strbuf_addf(err,
 			_("textil-ext: invalid response from endpoint '%s'"),
 			endpoint);
@@ -1592,10 +1616,12 @@ static int run_single_checkin(struct textil_ext_takeover_batch *batch,
 			      const char *repo_root, const char *path,
 			      struct strbuf *dst, struct strbuf *err)
 {
-	struct string_list src_paths = STRING_LIST_INIT_DUP;
+	struct string_list pointers = STRING_LIST_INIT_DUP;
 	struct string_list fence_oids = STRING_LIST_INIT_DUP;
 	enum textil_ext_executor_status st;
-	int src_fd, ret = -1;
+	const char *hex;
+	size_t len;
+	int ret = -1;
 
 	batch->phase = TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT;
 	batch->operation = "checkin";
@@ -1604,7 +1630,7 @@ static int run_single_checkin(struct textil_ext_takeover_batch *batch,
 	batch->nr_items = 1;
 	batch->deferred_durability = checkin_durability_deferred();
 
-	st = textil_ext_execute_checkin_convert_batch(batch, &src_paths,
+	st = textil_ext_execute_checkin_convert_batch(batch, &pointers,
 						      &fence_oids, err);
 	if (st != TEXTIL_EXT_EXECUTOR_OK) {
 		error("textil-ext: checkin_convert failed for '%s': %s",
@@ -1623,23 +1649,16 @@ static int run_single_checkin(struct textil_ext_takeover_batch *batch,
 		goto done;
 	}
 
-	/* Read the returned src_path content into dst */
-	src_fd = open(src_paths.items[0].string, O_RDONLY);
-	if (src_fd < 0) {
-		error_errno("textil-ext: cannot open src_path '%s'",
-			    src_paths.items[0].string);
-		goto done;
-	}
+	/* The parser validated the inline hex pointer, including empty input. */
+	hex = pointers.items[0].string;
+	len = strlen(hex) / 2;
 	strbuf_reset(dst);
-	if (strbuf_read(dst, src_fd, 0) < 0) {
-		close(src_fd);
-		error_errno("textil-ext: read src_path failed for '%s'", path);
-		goto done;
-	}
-	close(src_fd);
+	strbuf_grow(dst, len);
+	hex_to_bytes((unsigned char *)dst->buf, hex, len);
+	strbuf_setlen(dst, len);
 	ret = 0;
 done:
-	string_list_clear(&src_paths, 0);
+	string_list_clear(&pointers, 0);
 	string_list_clear(&fence_oids, 0);
 	return ret;
 }

@@ -688,12 +688,25 @@ test_expect_success 'setup: policy for lfs checkin_convert takeover' '
 	EOF
 '
 
-test_expect_success 'checkin_convert-ok: executor parses delim-separated src_paths' '
+test_expect_success 'checkin_convert-ok: executor parses inline hex pointers' '
 	restart_server checkin-convert-checkin &&
 	TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
 	test-tool textil-ext-executor-server send-checkin-convert \
 		--name="$IPC_PATH" >out &&
-	grep "^status=ok$" out
+	grep "^status=ok$" out &&
+	grep "^pointer=76657273696f6e20" out
+'
+
+test_expect_success 'checkin_convert-bad-pointer: odd/non-hex pointer is invalid response' '
+	for mode in checkin-convert-bad-pointer checkin-convert-non-hex-pointer
+	do
+		restart_server "$mode" &&
+		test_must_fail env TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			test-tool textil-ext-executor-server send-checkin-convert \
+				--name="$IPC_PATH" >out &&
+		grep "^status=error$" out &&
+		grep "invalid response" out || return 1
+	done
 '
 
 test_expect_success 'checkin_convert-rejected: executor reports rejected status' '
