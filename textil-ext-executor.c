@@ -823,6 +823,8 @@ done:
 /* --- Preflight collection ----------------------------------------------- */
 
 #define TEXTIL_EXT_MAX_POINTER_BLOB_SIZE 8192
+/* Keep in sync with textil-source-pointer's MAX_SOURCE_POINTER_BYTES. */
+#define TEXTIL_EXT_MAX_SOURCE_POINTER_BLOB_SIZE 1024
 
 static const char lfs_pointer_version_line[] =
 	"version https://git-lfs.github.com/spec/v1";
@@ -902,8 +904,9 @@ static int blob_content_is_lfs_pointer(const char *buf, size_t len)
 	return has_version && has_oid;
 }
 
-int textil_ext_blob_oid_is_lfs_pointer(
+static int blob_oid_is_pointer(
 	const struct object_id *oid,
+	const char *source_prefix,
 	int *is_pointer,
 	struct strbuf *err)
 {
@@ -929,15 +932,53 @@ int textil_ext_blob_oid_is_lfs_pointer(
 		return -1;
 	}
 
-	if (size > TEXTIL_EXT_MAX_POINTER_BLOB_SIZE) {
+	if (size > (source_prefix ? TEXTIL_EXT_MAX_SOURCE_POINTER_BLOB_SIZE :
+				   TEXTIL_EXT_MAX_POINTER_BLOB_SIZE)) {
 		free(blob);
 		*is_pointer = 0;
 		return 0;
 	}
 
-	*is_pointer = blob_content_is_lfs_pointer(blob, size);
+	*is_pointer = source_prefix ?
+		starts_with(blob, source_prefix) :
+		blob_content_is_lfs_pointer(blob, size);
 	free(blob);
 	return 0;
+}
+
+int textil_ext_blob_oid_is_lfs_pointer(
+	const struct object_id *oid,
+	int *is_pointer,
+	struct strbuf *err)
+{
+	return blob_oid_is_pointer(oid, NULL, is_pointer, err);
+}
+
+static int blob_oid_is_takeover_candidate(
+	const struct object_id *oid,
+	const char *filter_name,
+	enum textil_ext_executor_phase phase,
+	int *is_pointer,
+	struct strbuf *err)
+{
+	const char *source_prefix;
+
+	*is_pointer = 0;
+	if (!filter_name)
+		return 0;
+	if (!strcmp(filter_name, "lfs"))
+		return textil_ext_blob_oid_is_lfs_pointer(oid, is_pointer, err);
+	if (phase != TEXTIL_EXT_EXEC_PHASE_PREFLIGHT)
+		return 0;
+	if (!strcmp(filter_name, "p4"))
+		source_prefix = "version https://textil.dev/spec/perforce-pointer/";
+	else if (!strcmp(filter_name, "svn"))
+		source_prefix = "version https://textil.dev/spec/subversion-pointer/";
+	else
+		return 0;
+
+	/* Rust textil-source-pointer owns validation; only select candidates. */
+	return blob_oid_is_pointer(oid, source_prefix, is_pointer, err);
 }
 
 static void textil_ext_collect_takeover_batch(
@@ -985,8 +1026,8 @@ static void textil_ext_collect_takeover_batch(
 		    ext_result.action != TEXTIL_ACTION_TAKEOVER)
 			continue;
 
-		if (textil_ext_blob_oid_is_lfs_pointer(&ce->oid, &is_pointer,
-						       &pointer_err))
+		if (blob_oid_is_takeover_candidate(&ce->oid, filter_name, phase,
+						  &is_pointer, &pointer_err))
 			die("%s", pointer_err.buf);
 		strbuf_release(&pointer_err);
 		if (!is_pointer)
