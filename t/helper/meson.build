@@ -71,6 +71,8 @@ test_tool_sources = [
   'test-submodule.c',
   'test-subprocess.c',
   'test-synthesize.c',
+  'test-textil-ext-executor-server.c',
+  'test-textil-ext-policy.c',
   'test-tool.c',
   'test-trace2.c',
   'test-truncate.c',
