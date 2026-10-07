@@ -1460,6 +1460,7 @@ static int client__stop_server(void)
 int cmd__textil_ext_executor_server(int argc, const char **argv)
 {
 	const char *reply_mode_str = NULL;
+	const char *subcmd;
 
 	const char * const usage[] = {
 		N_("test-tool textil-ext-executor-server <subcommand> [<options>]"),
@@ -1505,7 +1506,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 	if (argc == 2 && !strcmp(argv[1], "SUPPORTS_SIMPLE_IPC"))
 		return 0;
 
-	const char *subcmd = argv[1];
+	subcmd = argv[1];
 
 	argc--;
 	argv++;
@@ -1624,7 +1625,7 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		struct textil_ext_materialize_batch_result result;
 		struct strbuf err_buf = STRBUF_INIT;
 		enum textil_ext_executor_status st;
-		int i;
+		size_t i;
 
 		memset(&batch, 0, sizeof(batch));
 		memset(&item, 0, sizeof(item));
@@ -1725,7 +1726,8 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		struct strbuf err_buf = STRBUF_INIT;
 		enum textil_ext_executor_status st;
 		struct strbuf tmp_input = STRBUF_INIT;
-		int tmp_fd, i;
+		int tmp_fd;
+		size_t i;
 
 		memset(&batch, 0, sizeof(batch));
 		memset(&item, 0, sizeof(item));
