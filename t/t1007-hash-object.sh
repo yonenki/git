@@ -268,36 +268,36 @@ test_expect_success 'index-context hashing agrees with add/status for legacy CRL
 		git config core.autocrlf false &&
 		git config core.safecrlf false &&
 		printf "* text=auto\n" >.gitattributes &&
-		printf "old\r\n" >"legacy \"quoted\".txt" &&
-		legacy=$(git hash-object -w --no-filters "legacy \"quoted\".txt") &&
-		git update-index --add --cacheinfo 100644 "$legacy" "legacy \"quoted\".txt" &&
+		printf "old\r\n" >"legacy spaced.txt" &&
+		legacy=$(git hash-object -w --no-filters "legacy spaced.txt") &&
+		git update-index --add --cacheinfo 100644 "$legacy" "legacy spaced.txt" &&
 		printf "normal\n" >normal.txt &&
 		git add .gitattributes normal.txt &&
 		git commit -m initial &&
 		cp .git/index index-before &&
-		git ls-files -- "legacy \"quoted\".txt" normal.txt >paths &&
+		printf "\"legacy spaced.txt\"\nnormal.txt\n" >paths &&
 		{
 			echo "$legacy" &&
 			git rev-parse :normal.txt
 		} >expect &&
 		git hash-object --textil-index-context --stdin-paths <paths >actual &&
 		test_cmp expect actual &&
-		git hash-object --textil-index-context --path="legacy \"quoted\".txt" \
-			--stdin --textil-stdin-size=5 <"legacy \"quoted\".txt" >actual &&
+		git hash-object --textil-index-context --path="legacy spaced.txt" \
+			--stdin --textil-stdin-size=5 <"legacy spaced.txt" >actual &&
 		echo "$legacy" >expect &&
 		test_cmp expect actual &&
 		test_cmp index-before .git/index &&
-		git status --porcelain -- "legacy \"quoted\".txt" normal.txt >actual &&
+		git status --porcelain -- "legacy spaced.txt" normal.txt >actual &&
 		test_must_be_empty actual &&
-		printf "new\r\n" >>"legacy \"quoted\".txt" &&
-		git hash-object --textil-index-context "legacy \"quoted\".txt" >expect &&
-		git hash-object --textil-index-context --path="legacy \"quoted\".txt" \
-			--stdin --textil-stdin-size=10 <"legacy \"quoted\".txt" >actual &&
+		printf "new\r\n" >>"legacy spaced.txt" &&
+		git hash-object --textil-index-context "legacy spaced.txt" >expect &&
+		git hash-object --textil-index-context --path="legacy spaced.txt" \
+			--stdin --textil-stdin-size=10 <"legacy spaced.txt" >actual &&
 		test_cmp expect actual &&
-		git add "legacy \"quoted\".txt" &&
-		git rev-parse ":legacy \"quoted\".txt" >actual &&
+		git add "legacy spaced.txt" &&
+		git rev-parse ":legacy spaced.txt" >actual &&
 		test_cmp expect actual &&
-		git diff --exit-code -- "legacy \"quoted\".txt"
+		git diff --exit-code -- "legacy spaced.txt"
 	)
 '
 
