@@ -261,6 +261,140 @@ test_expect_success '--stdin outside of repository (uses default hash)' '
 	test_cmp expect actual
 '
 
+test_expect_success 'index-context hashing agrees with add/status for legacy CRLF text=auto' '
+	test_create_repo index-context &&
+	(
+		cd index-context &&
+		git config core.autocrlf false &&
+		git config core.safecrlf false &&
+		printf "* text=auto\n" >.gitattributes &&
+		printf "old\r\n" >"legacy \"quoted\".txt" &&
+		legacy=$(git hash-object -w --no-filters "legacy \"quoted\".txt") &&
+		git update-index --add --cacheinfo 100644 "$legacy" "legacy \"quoted\".txt" &&
+		printf "normal\n" >normal.txt &&
+		git add .gitattributes normal.txt &&
+		git commit -m initial &&
+		cp .git/index index-before &&
+		git ls-files -- "legacy \"quoted\".txt" normal.txt >paths &&
+		{
+			echo "$legacy" &&
+			git rev-parse :normal.txt
+		} >expect &&
+		git hash-object --textil-index-context --stdin-paths <paths >actual &&
+		test_cmp expect actual &&
+		git hash-object --textil-index-context --path="legacy \"quoted\".txt" \
+			--stdin --textil-stdin-size=5 <"legacy \"quoted\".txt" >actual &&
+		echo "$legacy" >expect &&
+		test_cmp expect actual &&
+		test_cmp index-before .git/index &&
+		git status --porcelain -- "legacy \"quoted\".txt" normal.txt >actual &&
+		test_must_be_empty actual &&
+		printf "new\r\n" >>"legacy \"quoted\".txt" &&
+		git hash-object --textil-index-context "legacy \"quoted\".txt" >expect &&
+		git hash-object --textil-index-context --path="legacy \"quoted\".txt" \
+			--stdin --textil-stdin-size=10 <"legacy \"quoted\".txt" >actual &&
+		test_cmp expect actual &&
+		git add "legacy \"quoted\".txt" &&
+		git rev-parse ":legacy \"quoted\".txt" >actual &&
+		test_cmp expect actual &&
+		git diff --exit-code -- "legacy \"quoted\".txt"
+	)
+'
+
+test_expect_success 'known-size input uses ordinary Git clean conversion' '
+	test_create_repo size-conversion &&
+	(
+		cd size-conversion &&
+		git config core.autocrlf false &&
+		git config core.safecrlf false &&
+		echo "normal.txt text=auto" >.gitattributes &&
+		printf "old\n" >normal.txt &&
+		git add .gitattributes normal.txt &&
+		printf "new\r\n" >normal.txt &&
+		git hash-object --no-filters normal.txt >raw &&
+		git hash-object --textil-index-context --path=normal.txt \
+			--stdin --textil-stdin-size=5 <normal.txt >actual &&
+		! test_cmp raw actual &&
+		git add normal.txt &&
+		git rev-parse :normal.txt >expect &&
+		test_cmp expect actual &&
+		git diff --exit-code -- normal.txt &&
+		for size in 4 6
+		do
+			test_must_fail git hash-object --textil-index-context --path=normal.txt \
+				--stdin --textil-stdin-size=$size <normal.txt >actual 2>err &&
+			test_must_be_empty actual &&
+			grep "input size does not match" err || return 1
+		done
+	)
+'
+
+test_expect_success 'known-size unconverted input hashes empty and nonempty streams without writing' '
+	test_create_repo size-stream &&
+	(
+		cd size-stream &&
+		echo "* -text" >.gitattributes &&
+		git hash-object --stdin </dev/null >expect &&
+		git hash-object --textil-index-context --path=plain --stdin \
+			--textil-stdin-size=0 </dev/null >actual &&
+		test_cmp expect actual &&
+		printf "stream\r\n" >input &&
+		git hash-object --no-filters input >expect &&
+		cat input | git hash-object --textil-index-context --path=plain \
+			--stdin --textil-stdin-size=8 >actual &&
+		test_cmp expect actual &&
+		test_must_fail git cat-file -e "$(cat actual)"
+	)
+'
+
+test_expect_success 'known-size unconverted input rejects short and extra data before printing' '
+	(
+		cd size-stream &&
+		printf "stream\r\n" >input &&
+		for size in 0 7 9
+		do
+			cat input | test_must_fail git hash-object --textil-index-context \
+				--path=plain --stdin --textil-stdin-size=$size >actual 2>err &&
+			test_must_be_empty actual &&
+			grep "Unable to hash plain" err || return 1
+		done &&
+		test_must_fail git hash-object --textil-index-context --path=plain \
+			--stdin --textil-stdin-size=1 </dev/null >actual 2>err &&
+		test_must_be_empty actual
+	)
+'
+
+test_expect_success 'index-context input options reject incompatible modes and malformed sizes' '
+	(
+		cd size-stream &&
+		for args in \
+			"--textil-index-context -w plain" \
+			"--textil-index-context -t tree --stdin" \
+			"--textil-index-context --literally --stdin" \
+			"--textil-index-context --no-filters plain" \
+			"--textil-stdin-size=0 --path=plain --stdin" \
+			"--textil-index-context --textil-stdin-size=0 --stdin" \
+			"--textil-index-context --textil-stdin-size=0 --path=plain plain" \
+			"--textil-index-context --textil-stdin-size=0 --path=plain --stdin plain" \
+			"--textil-index-context --textil-stdin-size=0 --stdin-paths"
+		do
+			test_expect_code 129 git hash-object $args </dev/null >actual 2>err &&
+			test_must_be_empty actual || return 1
+		done &&
+		for size in "" -1 +1 " 1" 1x 18446744073709551616
+		do
+			test_expect_code 129 git hash-object --textil-index-context \
+				--path=plain --stdin --textil-stdin-size="$size" \
+				</dev/null >actual 2>err &&
+			test_must_be_empty actual &&
+			grep "textil-stdin-size" err || return 1
+		done
+	) &&
+	nongit test_must_fail git hash-object --textil-index-context \
+		--path=plain --stdin --textil-stdin-size=0 </dev/null >actual 2>err &&
+	test_must_be_empty actual
+'
+
 test_expect_success EXPENSIVE,SIZE_T_IS_64BIT \
 		'files over 4GB hash literally' '
 	test-tool genzeros $((5*1024*1024*1024)) >big &&
