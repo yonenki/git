@@ -70,6 +70,9 @@ int cmd_hash_object(int argc,
 		N_("git hash-object [-t <type>] [-w] [--path=<file> | --no-filters]\n"
 		   "                [--stdin [--literally]] [--] <file>..."),
 		N_("git hash-object [-t <type>] [-w] --stdin-paths [--no-filters]"),
+		N_("git hash-object --textil-index-context [--stdin-paths | <file>...]"),
+		N_("git hash-object --textil-index-context --path=<file> --stdin\n"
+		   "                --textil-stdin-size=<size>"),
 		NULL
 	};
 	const char *type = blob_type;
@@ -77,6 +80,9 @@ int cmd_hash_object(int argc,
 	int stdin_paths = 0;
 	int no_filters = 0;
 	int nongit = 0;
+	int index_context = 0;
+	const char *stdin_size_arg = NULL;
+	size_t stdin_size = 0;
 	unsigned flags = INDEX_FORMAT_CHECK;
 	const char *vpath = NULL;
 	char *vpath_free = NULL;
@@ -91,6 +97,12 @@ int cmd_hash_object(int argc,
 			    N_("just hash any random garbage to create corrupt objects for debugging Git"),
 			    INDEX_FORMAT_CHECK),
 		OPT_STRING( 0 , "path", &vpath, N_("file"), N_("process file as it were from this path")),
+		OPT_BOOL_F(0, "textil-index-context", &index_context,
+			   N_("load the index for read-only blob conversion"),
+			   PARSE_OPT_NONEG),
+		OPT_STRING_F(0, "textil-stdin-size", &stdin_size_arg, N_("size"),
+			     N_("exact logical stdin size with index context"),
+			     PARSE_OPT_NONEG),
 		OPT_END()
 	};
 	int i;
@@ -99,7 +111,7 @@ int cmd_hash_object(int argc,
 	argc = parse_options(argc, argv, prefix, hash_object_options,
 			     hash_object_usage, 0);
 
-	if (flags & INDEX_WRITE_OBJECT)
+	if ((flags & INDEX_WRITE_OBJECT) || index_context)
 		prefix = setup_git_directory(the_repository);
 	else
 		prefix = setup_git_directory_gently(the_repository, &nongit);
@@ -129,13 +141,56 @@ int cmd_hash_object(int argc,
 			errstr = "Can't use --path with --no-filters";
 	}
 
+	if (index_context) {
+		if (flags & INDEX_WRITE_OBJECT)
+			errstr = "Can't use --textil-index-context with -w";
+		else if (strcmp(type, blob_type))
+			errstr = "--textil-index-context requires blob input";
+		else if (no_filters || !(flags & INDEX_FORMAT_CHECK))
+			errstr = "Can't use --textil-index-context with --no-filters or --literally";
+	}
+	if (stdin_size_arg) {
+		char *end;
+		uintmax_t parsed_size;
+
+		if (!index_context || hashstdin != 1 || !vpath ||
+		    !*vpath || stdin_paths || argc)
+			errstr = "--textil-stdin-size requires --textil-index-context, --path and --stdin only";
+		if (!*stdin_size_arg ||
+		    strspn(stdin_size_arg, "0123456789") != strlen(stdin_size_arg)) {
+			errstr = "--textil-stdin-size requires an unsigned decimal size";
+		} else {
+			errno = 0;
+			parsed_size = strtoumax(stdin_size_arg, &end, 10);
+			if (errno || *end || parsed_size > UINT64_MAX ||
+			    parsed_size > SIZE_MAX)
+				errstr = "--textil-stdin-size is out of range";
+			else
+				stdin_size = parsed_size;
+		}
+	}
+
 	if (errstr) {
 		error("%s", errstr);
 		usage_with_options(hash_object_usage, hash_object_options);
 	}
 
-	if (hashstdin)
-		hash_fd(0, type, vpath, flags);
+	if (index_context && repo_read_index(the_repository) < 0)
+		die(_("index file corrupt"));
+
+	if (hashstdin) {
+		if (stdin_size_arg) {
+			struct object_id oid;
+
+			if (index_fd_size(the_repository->index, &oid, 0,
+					  stdin_size, vpath))
+				die("Unable to hash %s", vpath);
+			printf("%s\n", oid_to_hex(&oid));
+			maybe_flush_or_die(stdout, "hash to stdout");
+		} else {
+			hash_fd(0, type, vpath, flags);
+		}
+	}
 
 	for (i = 0 ; i < argc; i++) {
 		const char *arg = argv[i];

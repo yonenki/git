@@ -1053,15 +1053,38 @@ static int index_stream_convert_blob(struct index_state *istate,
 
 static int index_pipe(struct index_state *istate, struct object_id *oid,
 		      int fd, enum object_type type,
-		      const char *path, unsigned flags)
+		      const char *path, unsigned flags,
+		      const size_t *expected_size)
 {
 	struct strbuf sbuf = STRBUF_INIT;
 	int ret;
 
-	if (strbuf_read(&sbuf, fd, 4096) >= 0)
-		ret = index_mem(istate, oid, sbuf.buf, sbuf.len, type, path, flags);
-	else
+	if (expected_size) {
+		char extra;
+		ssize_t got;
+
+		strbuf_grow(&sbuf, *expected_size);
+		got = read_in_full(fd, sbuf.buf, *expected_size);
+		if (got < 0) {
+			ret = -1;
+		} else if ((size_t)got != *expected_size) {
+			ret = error(_("input size does not match --textil-stdin-size"));
+		} else {
+			got = xread(fd, &extra, 1);
+			if (got < 0)
+				ret = -1;
+			else if (got)
+				ret = error(_("input size does not match --textil-stdin-size"));
+			else {
+				strbuf_setlen(&sbuf, *expected_size);
+				ret = index_mem(istate, oid, sbuf.buf, sbuf.len,
+						type, path, flags);
+			}
+		}
+	} else if (strbuf_read(&sbuf, fd, 4096) < 0)
 		ret = -1;
+	else
+		ret = index_mem(istate, oid, sbuf.buf, sbuf.len, type, path, flags);
 	strbuf_release(&sbuf);
 	return ret;
 }
@@ -1162,6 +1185,45 @@ static int hash_blob_stream(struct odb_write_stream *stream,
 	git_hash_final_oid(result_oid, &ctx);
 
 	return 0;
+}
+
+int index_fd_size(struct index_state *istate, struct object_id *oid,
+		  int fd, size_t size, const char *path)
+{
+	int ret;
+
+	/*
+	 * Probe Git's conversion rules before reading content. In particular,
+	 * text=auto may need conversion even when the input turns out binary.
+	 */
+	if (would_convert_to_git(istate, path)) {
+		ret = index_pipe(istate, oid, fd, OBJ_BLOB, path,
+				 INDEX_FORMAT_CHECK, &size);
+	} else {
+		struct odb_write_stream stream;
+		struct object_id result;
+		char extra;
+		ssize_t read_result;
+
+		odb_write_stream_from_fd(&stream, fd, size);
+		ret = hash_blob_stream(&stream, istate->repo->hash_algo,
+				       &result, size);
+		odb_write_stream_release(&stream);
+		if (ret) {
+			ret = error(_("unable to read --textil-stdin-size bytes"));
+		} else {
+			read_result = xread(fd, &extra, 1);
+			if (read_result < 0)
+				ret = error_errno(_("unable to read input"));
+			else if (read_result)
+				ret = error(_("input size does not match --textil-stdin-size"));
+			else
+				oidcpy(oid, &result);
+		}
+	}
+
+	close(fd);
+	return ret;
 }
 
 /*
@@ -1372,7 +1434,7 @@ int index_fd_with_input_path(struct index_state *istate,
 		ret = index_stream_convert_blob(istate, oid, fd, path,
 					input_path, flags);
 	} else if (!S_ISREG(st->st_mode)) {
-		ret = index_pipe(istate, oid, fd, type, path, flags);
+		ret = index_pipe(istate, oid, fd, type, path, flags, NULL);
 	} else if ((st->st_size >= 0 &&
 		    (size_t)st->st_size <= repo_settings_get_big_file_threshold(istate->repo)) ||
 		   type != OBJ_BLOB ||
