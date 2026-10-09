@@ -31,6 +31,12 @@ enum textil_ext_executor_phase {
 	TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT = 2,
 };
 
+enum textil_ext_checkout_admission {
+	TEXTIL_EXT_CHECKOUT_MATERIALIZE = 0,
+	TEXTIL_EXT_CHECKOUT_VERIFIED_TWO_TREE,
+	TEXTIL_EXT_CHECKOUT_VERIFIED_INITIAL_ABSENCE,
+};
+
 /* --- Takeover item (single candidate) ----------------------------------- */
 
 /*
@@ -60,9 +66,7 @@ struct textil_ext_takeover_item {
 	const char * const *capabilities; /* required_capabilities (borrowed) */
 	int nr_capabilities;
 	int projected;              /* preflight disposition; suppress checkout payload */
-	int two_tree_checkout;
-	int old_worktree_verified;
-	int overwrite_allowed;
+	enum textil_ext_checkout_admission checkout_admission;
 	struct cache_entry *checkout_entry; /* borrowed checkout candidate, collection only */
 };
 
@@ -323,14 +327,16 @@ struct index_state; /* forward declaration */
  * batch_out must be zero-initialized by the caller.
  * On return, batch_out->items is heap-allocated (caller must free).
  * Always call textil_ext_takeover_batch_release() + free(items) after use.
+ * Returns -1 on an initial-absence metadata error (message appended to err).
  */
 struct unpack_trees_options;
-void textil_ext_collect_preflight_takeover_batch(
+int textil_ext_collect_preflight_takeover_batch(
 	struct index_state *index,
 	const struct unpack_trees_options *options,
 	const char *operation,
 	const char *repo_root,
-	struct textil_ext_takeover_batch *batch_out);
+	struct textil_ext_takeover_batch *batch_out,
+	struct strbuf *err);
 
 void textil_ext_collect_materialize_takeover_batch(
 	struct index_state *index,

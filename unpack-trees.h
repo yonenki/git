@@ -12,6 +12,7 @@
 struct cache_entry;
 struct unpack_trees_options;
 struct pattern_list;
+struct strbuf;
 
 typedef int (*merge_fn_t)(const struct cache_entry * const *src,
 		struct unpack_trees_options *options);
@@ -125,6 +126,10 @@ enum update_sparsity_result update_sparsity(struct unpack_trees_options *options
 
 int verify_uptodate(const struct cache_entry *ce,
 		    struct unpack_trees_options *o);
+
+/* Metadata only: 1 absent with safe ancestors, 0 collision, -1 stat error. */
+int textil_verify_initial_checkout_absence(const struct cache_entry *ce,
+					   struct strbuf *err);
 
 int threeway_merge(const struct cache_entry * const *stages,
 		   struct unpack_trees_options *o);

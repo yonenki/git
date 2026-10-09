@@ -473,11 +473,11 @@ static int check_updates(struct unpack_trees_options *o,
 			TEXTIL_EXT_EXECUTOR_OK;
 
 		textil_ext_resolve_worktree_root(&main_wt);
-		textil_ext_collect_preflight_takeover_batch(
-			index, o, "checkout",
-			main_wt.buf, &pf_batch);
+		if (textil_ext_collect_preflight_takeover_batch(
+			    index, o, "checkout", main_wt.buf, &pf_batch, &pf_err))
+			pf_status = TEXTIL_EXT_EXECUTOR_ERROR;
 
-		if (pf_batch.nr_items > 0)
+		if (pf_status == TEXTIL_EXT_EXECUTOR_OK && pf_batch.nr_items > 0)
 			pf_status = textil_ext_execute_takeover_batch(
 				&pf_batch, &pf_err);
 
@@ -2536,6 +2536,43 @@ static int check_ok_to_remove(const char *name, int len, int dtype,
 	}
 
 	return add_rejected_path(o, error_type, name);
+}
+
+int textil_verify_initial_checkout_absence(const struct cache_entry *ce,
+					   struct strbuf *err)
+{
+	struct strbuf path = STRBUF_INIT;
+	struct stat st;
+	size_t i;
+	int absent = 0;
+
+	/*
+	 * Do not follow symlink ancestors or infer absence from ENOTDIR.
+	 * Each ancestor and the target is observed once; stop at the first
+	 * absent component. This is only called where force skipped the
+	 * normal verify_absent observation, and does not authorize overwrite.
+	 */
+	strbuf_addstr(&path, ce->name);
+	for (i = 0; i <= path.len; i++) {
+		if (i < path.len && path.buf[i] != '/')
+			continue;
+		path.buf[i] = '\0';
+		if (lstat(path.buf, &st)) {
+			if (errno == ENOENT)
+				absent = 1;
+			else {
+				strbuf_addf(err, _("cannot stat '%s': %s"),
+					    path.buf, strerror(errno));
+				absent = -1;
+			}
+			break;
+		}
+		if (i == path.len || !S_ISDIR(st.st_mode))
+			break;
+		path.buf[i] = '/';
+	}
+	strbuf_release(&path);
+	return absent;
 }
 
 /*
