@@ -203,6 +203,32 @@ test_expect_success 'tree attributes use pinned nested source instead of worktre
 	)
 '
 
+test_expect_success 'non-blob attributes paths keep stock unspecified semantics' '
+	setup_leaf nonblob-attrs &&
+	(
+		cd nonblob-attrs &&
+		mkdir .gitattributes &&
+		echo ignored >.gitattributes/contents &&
+		git add .gitattributes &&
+		git commit -m directory-attributes &&
+		git textil-head-projection --describe >directory &&
+		nul_to_q <directory >actual &&
+		grep "Qasset.uassetQunspecifiedQunspecifiedQQ" actual &&
+		git rm -r .gitattributes &&
+		git update-index --add --cacheinfo 160000,$(git rev-parse HEAD),.gitattributes &&
+		git commit -m gitlink-attributes &&
+		git textil-head-projection --identity-only >identity &&
+		git textil-head-projection --describe >gitlink &&
+		{
+			expect_header identity &&
+			expect_leaf 160000 commit "$(git rev-parse HEAD:.gitattributes)" .gitattributes unspecified unspecified "" &&
+			expect_leaf 100644 blob "$(git rev-parse HEAD:asset.uasset)" asset.uasset unspecified unspecified "" &&
+			printf "end\000"
+		} >expect &&
+		test_cmp_bin expect gitlink
+	)
+'
+
 test_expect_success 'all leaves preserve newline paths and gitlinks without probing blob bodies' '
 	setup_leaf leaves &&
 	(

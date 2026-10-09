@@ -834,6 +834,11 @@ static struct attr_stack *read_attr_from_blob(struct index_state *istate,
 	if (get_tree_entry(istate->repo, tree_oid, path, &oid, &mode))
 		return NULL;
 
+	/* A directory or gitlink named .gitattributes is not an attribute blob. */
+	if ((flags & READ_ATTR_REQUIRE_BLOB) &&
+	    !S_ISREG(mode) && !S_ISLNK(mode))
+		return NULL;
+
 	buf = odb_read_object(istate->repo->objects, &oid, &type, &sz);
 	if (!buf || type != OBJ_BLOB) {
 		free(buf);
