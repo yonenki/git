@@ -54,11 +54,15 @@ enum reply_mode {
 	REPLY_REORDERED,
 	REPLY_CONTROL_CHAR,
 	REPLY_UNKNOWN_KEY,
-	REPLY_OVERSIZED,
+	REPLY_LARGE_INVALID_PKT,
+	REPLY_MESSAGE_MAX,
+	REPLY_MESSAGE_TOO_LONG,
 	REPLY_DUPLICATE_KEY,
 	REPLY_MATERIALIZE_OK,
 	REPLY_MATERIALIZE_REJECTED,
 	REPLY_MATERIALIZE_SRC_PATH_RELATIVE,
+	REPLY_MATERIALIZE_SRC_PATH_MAX,
+	REPLY_MATERIALIZE_SRC_PATH_TOO_LONG,
 	REPLY_MATERIALIZE_SRC_PATH_WITH_STATUS_ERROR,
 	REPLY_MATERIALIZE_OK_WITHOUT_SRC_PATH,
 	REPLY_MATERIALIZE_OK_WITH_MESSAGE,
@@ -72,6 +76,9 @@ enum reply_mode {
 	REPLY_CHECKIN_CONVERT_BAD_POINTER,
 	REPLY_CHECKIN_CONVERT_NON_HEX_POINTER,
 	REPLY_BATCH_CHECKOUT,
+	REPLY_ORDERED_BATCH_CHECKOUT,
+	REPLY_LATER_PREFLIGHT_ERROR,
+	REPLY_LATER_MATERIALIZE_ERROR,
 	REPLY_ADMITTED_CHECKOUT, /* single-path lazy-admission regression */
 	REPLY_CHECKIN_DEFERRED, /* fence_oid for deferred checkins, logged fences */
 	REPLY_CHECKIN_DEFERRED_FENCE_ERROR,
@@ -92,6 +99,9 @@ static struct {
 };
 
 static int trace_request_seq;
+static int preflight_request_nr;
+static int materialize_request_nr;
+static int checkout_items;
 
 /* send-preflight のオプション値。トップレベルで解析する。 */
 static struct {
@@ -146,8 +156,12 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_CONTROL_CHAR;
 	if (!strcmp(s, "unknown-key"))
 		return REPLY_UNKNOWN_KEY;
-	if (!strcmp(s, "oversized"))
-		return REPLY_OVERSIZED;
+	if (!strcmp(s, "large-invalid-pkt"))
+		return REPLY_LARGE_INVALID_PKT;
+	if (!strcmp(s, "message-max"))
+		return REPLY_MESSAGE_MAX;
+	if (!strcmp(s, "message-too-long"))
+		return REPLY_MESSAGE_TOO_LONG;
 	if (!strcmp(s, "duplicate-key"))
 		return REPLY_DUPLICATE_KEY;
 	if (!strcmp(s, "materialize-ok"))
@@ -162,6 +176,10 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_MATERIALIZE_OK_WITHOUT_SRC_PATH;
 	if (!strcmp(s, "materialize-ok-with-message"))
 		return REPLY_MATERIALIZE_OK_WITH_MESSAGE;
+	if (!strcmp(s, "materialize-src-path-max"))
+		return REPLY_MATERIALIZE_SRC_PATH_MAX;
+	if (!strcmp(s, "materialize-src-path-too-long"))
+		return REPLY_MATERIALIZE_SRC_PATH_TOO_LONG;
 	if (!strcmp(s, "materialize-src-path-windows-verbatim"))
 		return REPLY_MATERIALIZE_SRC_PATH_WINDOWS_VERBATIM;
 	if (!strcmp(s, "materialize-src-path-windows-unc"))
@@ -170,6 +188,12 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_MATERIALIZE_CHECKOUT;
 	if (!strcmp(s, "batch-checkout"))
 		return REPLY_BATCH_CHECKOUT;
+	if (!strcmp(s, "ordered-batch-checkout"))
+		return REPLY_ORDERED_BATCH_CHECKOUT;
+	if (!strcmp(s, "later-preflight-error"))
+		return REPLY_LATER_PREFLIGHT_ERROR;
+	if (!strcmp(s, "later-materialize-error"))
+		return REPLY_LATER_MATERIALIZE_ERROR;
 	if (!strcmp(s, "admitted-checkout"))
 		return REPLY_ADMITTED_CHECKOUT;
 	if (!strcmp(s, "materialize-count-mismatch"))
@@ -809,13 +833,38 @@ static int app_cb(void *application_data UNUSED,
 		strbuf_release(&reply);
 		return ret;
 
-	case REPLY_OVERSIZED: {
-		/*
-		 * Return a reply larger than TEXTIL_EXT_MAX_REPLY_SIZE
-		 * (64 KiB).  Generate 65537 bytes of raw padding.
-		 * The size guard rejects before parsing.
-		 */
+	case REPLY_LARGE_INVALID_PKT: {
+		/* Size alone is legal; malformed inner framing is still rejected. */
 		strbuf_addchars(&reply, 'A', 65537);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+	}
+
+	case REPLY_MESSAGE_MAX:
+	case REPLY_MESSAGE_TOO_LONG: {
+		struct strbuf message = STRBUF_INIT;
+		strbuf_addchars(&message, 'x',
+			       server_args.mode == REPLY_MESSAGE_MAX ? 4096 : 4097);
+		build_error_reply(&reply, message.buf);
+		strbuf_release(&message);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+	}
+
+	case REPLY_MATERIALIZE_SRC_PATH_MAX:
+	case REPLY_MATERIALIZE_SRC_PATH_TOO_LONG: {
+		struct strbuf path = STRBUF_INIT;
+		strbuf_addch(&path, '/');
+		strbuf_addchars(&path, 'a',
+			       server_args.mode == REPLY_MATERIALIZE_SRC_PATH_MAX ?
+			       4095 : 4096);
+		packet_buf_write(&reply, "status=ok\n");
+		packet_buf_delim(&reply);
+		packet_buf_write(&reply, "src_path=%s\n", path.buf);
+		packet_buf_flush(&reply);
+		strbuf_release(&path);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
 		return ret;
@@ -1198,6 +1247,9 @@ static int app_cb(void *application_data UNUSED,
 	}
 
 	case REPLY_ADMITTED_CHECKOUT:
+	case REPLY_ORDERED_BATCH_CHECKOUT:
+	case REPLY_LATER_PREFLIGHT_ERROR:
+	case REPLY_LATER_MATERIALIZE_ERROR:
 	case REPLY_BATCH_CHECKOUT: {
 		/*
 		 * Dual-phase handler for batch-first checkout proof.
@@ -1280,16 +1332,35 @@ static int app_cb(void *application_data UNUSED,
 				int seq = trace_request_seq++;
 				fprintf(fp,
 					"{\"seq\":%d,\"phase\":\"%s\","
-					"\"items\":%d,"
+					"\"items\":%d,\"request_bytes\":%lu,"
 					"\"repo_root_present\":%s}\n",
 					seq,
 					is_materialize ? "materialize"
 						       : "preflight",
 					nr_items,
+					(unsigned long)request_len,
 					has_repo_root ? "true" : "false");
 				fclose(fp);
 			}
 		}
+		if ((!is_materialize &&
+		     server_args.mode == REPLY_LATER_PREFLIGHT_ERROR &&
+		     preflight_request_nr++ == 1) ||
+		    (is_materialize &&
+		     server_args.mode == REPLY_LATER_MATERIALIZE_ERROR &&
+		     materialize_request_nr++ == 1)) {
+			int i;
+			build_error_reply(&reply, is_materialize ?
+					  "later materialize slice failed" :
+					  "later preflight slice failed");
+			for (i = 0; i < nr_items; i++)
+				strbuf_release(&item_paths[i]);
+			free(item_paths);
+			ret = reply_cb(reply_data, reply.buf, reply.len);
+			strbuf_release(&reply);
+			return ret;
+		}
+
 
 		if (!is_materialize) {
 			/* One disposition per checkout candidate. */
@@ -1326,6 +1397,11 @@ static int app_cb(void *application_data UNUSED,
 						"materialized-by-textil-batch\n";
 					write_in_full(tmp_fd, content,
 						      strlen(content));
+					if (server_args.mode == REPLY_ORDERED_BATCH_CHECKOUT) {
+						write_in_full(tmp_fd, item_paths[i].buf,
+							      item_paths[i].len);
+						write_in_full(tmp_fd, "\n", 1);
+					}
 					close(tmp_fd);
 				}
 				packet_buf_delim(&reply);
@@ -1484,6 +1560,8 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 			   N_("NDJSON request-shape log (batch-checkout mode)")),
 		OPT_INTEGER(0, "max-wait", &server_args.max_wait_sec,
 			    N_("seconds to wait")),
+		OPT_INTEGER(0, "items", &checkout_items,
+			    N_("number of ordered checkout files to verify")),
 		OPT_STRING(0, "path", &preflight_args.path, N_("path"),
 			   N_("repo-relative path (send-preflight)")),
 		OPT_BOOL(0, "path-inject-lf", &preflight_args.path_inject_lf,
@@ -1519,6 +1597,34 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 
 	if (reply_mode_str)
 		server_args.mode = parse_reply_mode(reply_mode_str);
+
+	if (!strcmp(subcmd, "verify-checkout")) {
+		struct strbuf path = STRBUF_INIT;
+		struct strbuf expected = STRBUF_INIT;
+		struct strbuf actual = STRBUF_INIT;
+		int i, failed = 0;
+
+		if (checkout_items <= 0)
+			die("verify-checkout requires --items greater than zero");
+		for (i = 1; i <= checkout_items; i++) {
+			strbuf_reset(&path);
+			strbuf_reset(&expected);
+			strbuf_reset(&actual);
+			strbuf_addf(&path, "assets/file%05d.bin", i);
+			strbuf_addf(&expected, "materialized-by-textil-batch\n%s\n",
+				    path.buf);
+			if (strbuf_read_file(&actual, path.buf, 0) < 0 ||
+			    strbuf_cmp(&actual, &expected)) {
+				error("incorrect materialized content for %s", path.buf);
+				failed = 1;
+				break;
+			}
+		}
+		strbuf_release(&path);
+		strbuf_release(&expected);
+		strbuf_release(&actual);
+		return failed;
+	}
 
 	if (!strcmp(subcmd, "run-daemon"))
 		return !!daemon__run_server();

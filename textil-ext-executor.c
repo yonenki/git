@@ -268,12 +268,14 @@ static const char *command_for_phase(enum textil_ext_executor_phase phase)
 	BUG("unknown executor phase for command: %d", (int)phase);
 }
 
-static int build_batch_request(
+/* Keep in sync with protocol::MAX_REQUEST_PAYLOAD_SIZE in textil-vcs. */
+#define TEXTIL_EXT_MAX_REQUEST_BYTES (8 * 1024 * 1024)
+
+static int build_batch_header(
 	const struct textil_ext_takeover_batch *batch,
 	struct strbuf *out,
 	struct strbuf *err)
 {
-	int i, j;
 	const char *operation_id = getenv("TEXTIL_GIT_EXT_OPERATION_ID");
 	const char *projection_workspace = getenv("TEXTIL_GIT_EXT_PROJECTION_WORKSPACE");
 
@@ -305,72 +307,119 @@ static int build_batch_request(
 	    batch->deferred_durability)
 		packet_buf_write(out, "durability=deferred\n");
 
-	/* Items (delim-separated) */
-	for (i = 0; i < batch->nr_items; i++) {
-		const struct textil_ext_takeover_item *item = &batch->items[i];
+	return 0;
+}
 
-		/* Validate item values before emission */
-		if (validate_request_value("path", item->path, err))
+static int build_batch_item(
+	const struct textil_ext_takeover_batch *batch,
+	const struct textil_ext_takeover_item *item,
+	struct strbuf *out,
+	struct strbuf *err)
+{
+	int j;
+	/* Validate item values before emission */
+	if (validate_request_value("path", item->path, err))
+		return -1;
+	if (validate_request_value("rule_id", item->rule_id, err))
+		return -1;
+	if (item->attr_filter &&
+	    validate_request_value("attr_filter", item->attr_filter, err))
+		return -1;
+	/*
+	 * Phase-specific required fields:
+	 *   preflight/materialize: blob_oid required, input_path absent
+	 *   checkin_convert: input_path required, blob_oid absent
+	 */
+	if (batch->phase == TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT) {
+		if (!item->input_path)
+			BUG("checkin_convert item missing input_path");
+		if (validate_request_value("input_path", item->input_path, err))
 			return -1;
-		if (validate_request_value("rule_id", item->rule_id, err))
+	} else {
+		if (!item->blob_oid)
+			BUG("preflight/materialize item missing blob_oid");
+		if (validate_request_value("blob_oid", item->blob_oid, err))
 			return -1;
-		if (item->attr_filter &&
-		    validate_request_value("attr_filter", item->attr_filter, err))
+	}
+	if (item->old_blob_oid &&
+	    validate_request_value("old_blob_oid", item->old_blob_oid, err))
+		return -1;
+	for (j = 0; j < item->nr_capabilities; j++) {
+		if (validate_request_value("capability", item->capabilities[j], err))
 			return -1;
-		/*
-		 * Phase-specific required fields:
-		 *   preflight/materialize: blob_oid required, input_path absent
-		 *   checkin_convert: input_path required, blob_oid absent
-		 */
-		if (batch->phase == TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT) {
-			if (!item->input_path)
-				BUG("checkin_convert item missing input_path");
-			if (validate_request_value("input_path",
-						   item->input_path, err))
-				return -1;
-		} else {
-			if (!item->blob_oid)
-				BUG("preflight/materialize item missing blob_oid");
-			if (validate_request_value("blob_oid",
-						   item->blob_oid, err))
-				return -1;
-		}
-		if (item->old_blob_oid &&
-		    validate_request_value("old_blob_oid", item->old_blob_oid, err))
-			return -1;
-		for (j = 0; j < item->nr_capabilities; j++) {
-			if (validate_request_value("capability",
-						   item->capabilities[j], err))
-				return -1;
-		}
-
-		packet_buf_delim(out);
-		packet_buf_write(out, "path=%s\n", item->path);
-		packet_buf_write(out, "rule_id=%s\n", item->rule_id);
-		if (item->attr_filter)
-			packet_buf_write(out, "attr_filter=%s\n",
-					 item->attr_filter);
-		if (batch->phase == TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT)
-			packet_buf_write(out, "input_path=%s\n",
-					 item->input_path);
-		else
-			packet_buf_write(out, "blob_oid=%s\n", item->blob_oid);
-		if (item->old_blob_oid)
-			packet_buf_write(out, "old_blob_oid=%s\n", item->old_blob_oid);
-		if (batch->phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT) {
-			packet_buf_write(out, "checkout_two_tree=%s\n", item->two_tree_checkout ? "true" : "false");
-			packet_buf_write(out, "checkout_verified=%s\n", item->old_worktree_verified ? "true" : "false");
-			packet_buf_write(out, "checkout_overwrite=%s\n", item->overwrite_allowed ? "true" : "false");
-		}
-		packet_buf_write(out, "is_regular_file=%s\n",
-				 item->is_regular_file ? "true" : "false");
-		packet_buf_write(out, "strict=%s\n",
-				 item->strict ? "true" : "false");
-		for (j = 0; j < item->nr_capabilities; j++)
-			packet_buf_write(out, "capability=%s\n",
-					 item->capabilities[j]);
 	}
 
+	packet_buf_delim(out);
+	packet_buf_write(out, "path=%s\n", item->path);
+	packet_buf_write(out, "rule_id=%s\n", item->rule_id);
+	if (item->attr_filter)
+		packet_buf_write(out, "attr_filter=%s\n", item->attr_filter);
+	if (batch->phase == TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT)
+		packet_buf_write(out, "input_path=%s\n", item->input_path);
+	else
+		packet_buf_write(out, "blob_oid=%s\n", item->blob_oid);
+	if (item->old_blob_oid)
+		packet_buf_write(out, "old_blob_oid=%s\n", item->old_blob_oid);
+	if (batch->phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT) {
+		packet_buf_write(out, "checkout_two_tree=%s\n", item->two_tree_checkout ? "true" : "false");
+		packet_buf_write(out, "checkout_verified=%s\n", item->old_worktree_verified ? "true" : "false");
+		packet_buf_write(out, "checkout_overwrite=%s\n", item->overwrite_allowed ? "true" : "false");
+	}
+	packet_buf_write(out, "is_regular_file=%s\n", item->is_regular_file ? "true" : "false");
+	packet_buf_write(out, "strict=%s\n", item->strict ? "true" : "false");
+	for (j = 0; j < item->nr_capabilities; j++)
+		packet_buf_write(out, "capability=%s\n", item->capabilities[j]);
+	return 0;
+}
+
+/*
+ * Build only a contiguous request slice, including the final flush in its
+ * byte budget. An item crossing the boundary is rolled back, not split.
+ * The caller keeps ownership of the borrowed item array.
+ */
+static int build_batch_request(
+	const struct textil_ext_takeover_batch *batch,
+	int start,
+	struct strbuf *out,
+	int *nr_items,
+	struct strbuf *err)
+{
+	size_t max_bytes = TEXTIL_EXT_MAX_REQUEST_BYTES;
+	int i;
+
+	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT)
+		max_bytes = git_env_ulong("GIT_TEST_TEXTIL_EXT_MAX_REQUEST_BYTES",
+					  TEXTIL_EXT_MAX_REQUEST_BYTES);
+	/* A test override may tighten, never relax, the controller boundary. */
+	if (max_bytes > TEXTIL_EXT_MAX_REQUEST_BYTES)
+		max_bytes = TEXTIL_EXT_MAX_REQUEST_BYTES;
+	if (build_batch_header(batch, out, err))
+		return -1;
+	if (max_bytes < 4 || out->len > max_bytes - 4) {
+		strbuf_addf(err, _("textil-ext: request header exceeds %lu byte budget"),
+			    (unsigned long)max_bytes);
+		return -1;
+	}
+
+	*nr_items = 0;
+	for (i = start; i < batch->nr_items; i++) {
+		size_t before = out->len;
+
+		if (build_batch_item(batch, &batch->items[i], out, err))
+			return -1;
+		if (out->len > max_bytes - 4) {
+			strbuf_setlen(out, before);
+			if (!*nr_items ||
+			    batch->phase == TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT) {
+				strbuf_addf(err,
+					_("textil-ext: request item '%s' exceeds %lu byte budget"),
+					batch->items[i].path, (unsigned long)max_bytes);
+				return -1;
+			}
+			break;
+		}
+		(*nr_items)++;
+	}
 	packet_buf_flush(out);
 	return 0;
 }
@@ -378,19 +427,11 @@ static int build_batch_request(
 /* --- pkt-line reply parser ---------------------------------------------- */
 
 /*
- * Size / length limits for executor reply parsing.
- *
- * TEXTIL_EXT_MAX_REPLY_SIZE (64 KiB):
- *   Maximum raw byte length of an IPC reply.  The reply is a small
- *   pkt-line stream (status + optional message + flush) so 64 KiB is
- *   vastly generous.  Rejects oversized payloads before any parsing
- *   to prevent DoS.
- *
- * TEXTIL_EXT_MAX_MESSAGE_LEN (4096 = 4 KiB):
- *   Maximum length of the "message" value.  Messages are
- *   human-readable error descriptions.  4 KiB is sufficient.
+ * Replies scale with the requested item count. Structural parsing owns
+ * validation: bounded individual fields, known unique keys, valid framing
+ * and exactly one ordered result per requested item. There is deliberately
+ * no fixed aggregate reply-size ceiling.
  */
-#define TEXTIL_EXT_MAX_REPLY_SIZE  (64 * 1024)
 #define TEXTIL_EXT_MAX_MESSAGE_LEN 4096
 #define TEXTIL_EXT_MAX_SRC_PATH_LEN 4096
 
@@ -740,8 +781,9 @@ static int parse_executor_response(const char *buf, size_t len,
 	return 0;
 }
 
-static enum textil_ext_executor_status execute_item_value_batch(
+static enum textil_ext_executor_status execute_item_value_slice(
 	const struct textil_ext_takeover_batch *batch,
+	const struct strbuf *request,
 	const char *count_mismatch_label,
 	struct string_list *item_values_out,
 	const char *item_key,
@@ -754,7 +796,6 @@ static enum textil_ext_executor_status execute_item_value_batch(
 	return TEXTIL_EXT_EXECUTOR_ERROR;
 #else
 	const char *endpoint;
-	struct strbuf request = STRBUF_INIT;
 	struct strbuf answer = STRBUF_INIT;
 	struct strbuf status_str = STRBUF_INIT;
 	struct strbuf msg = STRBUF_INIT;
@@ -770,30 +811,15 @@ static enum textil_ext_executor_status execute_item_value_batch(
 		goto done;
 	}
 
-	if (build_batch_request(batch, &request, err)) {
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
 	options.wait_if_busy = 1;
 	options.wait_if_not_found = 0;
 
 	ipc_ret = send_controller_request(batch, endpoint, &options,
-					  &request, &answer);
+					  request, &answer);
 	if (ipc_ret) {
 		strbuf_addf(err,
 			_("textil-ext: failed to connect to endpoint '%s'"),
 			endpoint);
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
-	if (answer.len > TEXTIL_EXT_MAX_REPLY_SIZE) {
-		strbuf_addf(err,
-			_("textil-ext: reply too large (%lu bytes, max %d) "
-			  "from endpoint '%s'"),
-			(unsigned long)answer.len,
-			TEXTIL_EXT_MAX_REPLY_SIZE, endpoint);
 		status = TEXTIL_EXT_EXECUTOR_ERROR;
 		goto done;
 	}
@@ -836,12 +862,76 @@ static enum textil_ext_executor_status execute_item_value_batch(
 
 done:
 	trace_batch_roundtrip(batch, endpoint, status, err->buf, trace_start_ns);
-	strbuf_release(&request);
 	strbuf_release(&answer);
 	strbuf_release(&status_str);
 	strbuf_release(&msg);
 	return status;
 #endif /* SUPPORTS_SIMPLE_IPC */
+}
+
+static enum textil_ext_executor_status execute_item_value_batch(
+	const struct textil_ext_takeover_batch *batch,
+	const char *count_mismatch_label,
+	struct string_list *item_values_out,
+	const char *item_key,
+	struct string_list *fence_oids_out,
+	struct strbuf *err)
+{
+	struct strbuf request = STRBUF_INIT;
+	struct string_list values = STRING_LIST_INIT_DUP;
+	struct string_list oids = STRING_LIST_INIT_DUP;
+	struct textil_ext_takeover_batch slice = *batch;
+	enum textil_ext_executor_status status = TEXTIL_EXT_EXECUTOR_ERROR;
+	int start = 0;
+	size_t i;
+
+	while (start < batch->nr_items) {
+		strbuf_reset(&request);
+		if (build_batch_request(batch, start, &request, &slice.nr_items, err)) {
+			status = TEXTIL_EXT_EXECUTOR_ERROR;
+			goto done;
+		}
+		slice.items = batch->items + start;
+		{
+			struct string_list slice_values = STRING_LIST_INIT_DUP;
+			struct string_list slice_oids = STRING_LIST_INIT_DUP;
+
+			status = execute_item_value_slice(&slice, &request,
+				count_mismatch_label, &slice_values, item_key,
+				fence_oids_out ? &slice_oids : NULL, err);
+			if (status == TEXTIL_EXT_EXECUTOR_OK) {
+				for (i = 0; i < slice_values.nr; i++) {
+					string_list_append_nodup(&values, slice_values.items[i].string);
+					slice_values.items[i].string = NULL;
+				}
+				for (i = 0; i < slice_oids.nr; i++) {
+					string_list_append_nodup(&oids, slice_oids.items[i].string);
+					slice_oids.items[i].string = NULL;
+				}
+			}
+			string_list_clear(&slice_values, 0);
+			string_list_clear(&slice_oids, 0);
+		}
+		if (status != TEXTIL_EXT_EXECUTOR_OK)
+			goto done;
+		start += slice.nr_items;
+	}
+
+	/* Publish ordered results only after every slice has succeeded. */
+	for (i = 0; i < values.nr; i++) {
+		string_list_append_nodup(item_values_out, values.items[i].string);
+		values.items[i].string = NULL;
+	}
+	if (fence_oids_out)
+		for (i = 0; i < oids.nr; i++) {
+			string_list_append_nodup(fence_oids_out, oids.items[i].string);
+			oids.items[i].string = NULL;
+		}
+done:
+	strbuf_release(&request);
+	string_list_clear(&values, 0);
+	string_list_clear(&oids, 0);
+	return status;
 }
 
 /* --- Preflight collection ----------------------------------------------- */
@@ -1119,8 +1209,9 @@ void textil_ext_collect_materialize_takeover_batch(
 
 /* --- Executor ----------------------------------------------------------- */
 
-enum textil_ext_executor_status textil_ext_execute_takeover_batch(
+static enum textil_ext_executor_status execute_preflight_slice(
 	struct textil_ext_takeover_batch *batch,
+	const struct strbuf *request,
 	struct strbuf *err)
 {
 	/* Preconditions (common, evaluated before #ifdef split) */
@@ -1138,7 +1229,6 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 	return TEXTIL_EXT_EXECUTOR_ERROR;
 #else
 	const char *endpoint;
-	struct strbuf request = STRBUF_INIT;
 	struct strbuf answer = STRBUF_INIT;
 	struct strbuf status_str = STRBUF_INIT;
 	struct strbuf msg = STRBUF_INIT;
@@ -1155,18 +1245,12 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 		goto done;
 	}
 
-	/* 2. Build pkt-line request (validates values before emission) */
-	if (build_batch_request(batch, &request, err)) {
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
 	/* 3. Send via simple-ipc */
 	options.wait_if_busy = 1;
 	options.wait_if_not_found = 0;
 
 	ipc_ret = send_controller_request(batch, endpoint, &options,
-					  &request, &answer);
+					  request, &answer);
 	if (ipc_ret) {
 		strbuf_addf(err,
 			_("textil-ext: failed to connect to endpoint '%s'"),
@@ -1175,18 +1259,7 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 		goto done;
 	}
 
-	/* 4. Size guard: reject oversized replies before parsing */
-	if (answer.len > TEXTIL_EXT_MAX_REPLY_SIZE) {
-		strbuf_addf(err,
-			_("textil-ext: reply too large (%lu bytes, max %d) "
-			  "from endpoint '%s'"),
-			(unsigned long)answer.len,
-			TEXTIL_EXT_MAX_REPLY_SIZE, endpoint);
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
-		goto done;
-	}
-
-	/* 5. Parse pkt-line response (preflight: no src_paths) */
+	/* Validate the reply against this slice, not the complete operation. */
 	if (parse_executor_response(answer.buf, answer.len,
 				    &status_str, &msg, NULL, NULL, NULL, batch)) {
 		strbuf_addf(err,
@@ -1216,12 +1289,43 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 
 done:
 	trace_batch_roundtrip(batch, endpoint, status, err->buf, trace_start_ns);
-	strbuf_release(&request);
 	strbuf_release(&answer);
 	strbuf_release(&status_str);
 	strbuf_release(&msg);
 	return status;
 #endif /* SUPPORTS_SIMPLE_IPC */
+}
+
+enum textil_ext_executor_status textil_ext_execute_takeover_batch(
+	struct textil_ext_takeover_batch *batch,
+	struct strbuf *err)
+{
+	struct textil_ext_takeover_batch slice;
+	struct strbuf request = STRBUF_INIT;
+	enum textil_ext_executor_status status = TEXTIL_EXT_EXECUTOR_ERROR;
+	int start = 0;
+
+	if (!batch || !batch->items || batch->nr_items <= 0)
+		BUG("execute_takeover_batch called with invalid batch");
+	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_PREFLIGHT)
+		BUG("execute_takeover_batch called with non-preflight phase");
+	if (!err)
+		BUG("execute_takeover_batch called with NULL err");
+	slice = *batch;
+	while (start < batch->nr_items) {
+		strbuf_reset(&request);
+		if (build_batch_request(batch, start, &request, &slice.nr_items, err)) {
+			status = TEXTIL_EXT_EXECUTOR_ERROR;
+			break;
+		}
+		slice.items = batch->items + start;
+		status = execute_preflight_slice(&slice, &request, err);
+		if (status != TEXTIL_EXT_EXECUTOR_OK)
+			break;
+		start += slice.nr_items;
+	}
+	strbuf_release(&request);
+	return status;
 }
 
 void textil_ext_materialize_batch_result_init(
@@ -1513,9 +1617,9 @@ enum textil_ext_executor_status textil_ext_execute_checkin_convert_batch(
 
 /*
  * OIDs sealed by deferred conversions in this process. A fence request
- * carries about 77 bytes per OID and the controller accepts at most
- * 8 MiB, so the set is fenced early once it reaches this size; every
- * fence still precedes the transaction commit and so the index write.
+ * carries about 77 bytes per OID. The count flush stays comfortably below
+ * TEXTIL_EXT_MAX_REQUEST_BYTES; every fence still precedes the transaction
+ * commit and so the index write.
  */
 #define TEXTIL_EXT_FENCE_MAX_OIDS 65536
 
@@ -1598,8 +1702,7 @@ int textil_ext_flush_deferred_durability(struct strbuf *err)
 			endpoint);
 		goto done;
 	}
-	if (answer.len > TEXTIL_EXT_MAX_REPLY_SIZE ||
-	    parse_executor_response(answer.buf, answer.len, &status_str,
+	if (parse_executor_response(answer.buf, answer.len, &status_str,
 				    &msg, NULL, NULL, NULL, NULL)) {
 		strbuf_addf(err,
 			_("textil-ext: invalid response from endpoint '%s'"),

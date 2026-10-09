@@ -137,7 +137,9 @@ test_expect_success 'preflight has four items; materialize still has only LFS' '
 	{"seq":0,"phase":"preflight","items":4,"repo_root_present":true}
 	{"seq":1,"phase":"materialize","items":1,"repo_root_present":true}
 	EOF
-	test_cmp expect "$TRACE_LOG" &&
+	# Wire byte counts include the platform-dependent worktree root.
+	sed "s/,\"request_bytes\":[0-9][0-9]*//" "$TRACE_LOG" >actual-shape &&
+	test_cmp expect actual-shape &&
 	grep "> path=pointer.bin$" "$PACKET_LOG" >lfs-requests &&
 	test_line_count = 2 lfs-requests &&
 	echo materialized-by-textil-batch >expect-lfs &&

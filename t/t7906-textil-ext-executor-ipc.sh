@@ -393,10 +393,10 @@ test_expect_success 'strict parser: unknown key in response rejected' '
 	)
 '
 
-# === Oversized reply rejection ===
+# === Large malformed reply rejection ===
 
-test_expect_success 'strict parser: oversized reply rejected before parsing' '
-	restart_server oversized &&
+test_expect_success 'strict parser: large malformed reply is rejected structurally' '
+	restart_server large-invalid-pkt &&
 	(
 		cd executor-ipc-repo &&
 		test_must_fail env \
@@ -404,7 +404,7 @@ test_expect_success 'strict parser: oversized reply rejected before parsing' '
 			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
 			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
 			git checkout with-lfs 2>err &&
-		grep "reply too large" err
+		grep "invalid response" err
 	)
 '
 
@@ -893,6 +893,197 @@ test_expect_success 'unsafe .lfsconfig extension commands alone do not disable n
 		git show :unsafe.bin >actual &&
 		grep "version https://git-lfs.github.com/spec/v1" actual
 	)
+'
+
+# === Count-independent replies and byte-bounded checkout requests ===
+
+make_batched_checkout_repo () {
+	git init "$1" &&
+	(
+		cd "$1" &&
+		git config checkout.workers 1 &&
+		echo "*.bin filter=lfs -text" >.gitattributes &&
+		echo main >control.txt &&
+		git add .gitattributes control.txt &&
+		git commit -m base &&
+		git branch -M main &&
+		git checkout -b with-lfs &&
+		echo target >control.txt &&
+		git add control.txt &&
+		write_pointer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 9 >pointer &&
+		blob=$(git hash-object -w pointer) &&
+		test_seq 1 "$2" >numbers &&
+		while read -r number
+		do
+			printf "100644 %s\tassets/file%05d.bin\n" "$blob" "$number" ||
+			return 1
+		done <numbers >index-info &&
+		git update-index --index-info <index-info &&
+		git commit -m "many LFS pointers" &&
+		git checkout -f main &&
+		rm pointer numbers index-info
+	)
+}
+
+check_batch_trace () {
+	max_bytes=$1 &&
+	expected_items=$2 &&
+	preflight_items=0 &&
+	materialize_items=0 &&
+	while read -r line
+	do
+		bytes=${line#*\"request_bytes\":} &&
+		bytes=${bytes%%,*} &&
+		items=${line#*\"items\":} &&
+		items=${items%%,*} &&
+		test "$bytes" -le "$max_bytes" || return 1
+		case "$line" in
+		*\"phase\":\"preflight\"*)
+			preflight_items=$((preflight_items + items))
+			;;
+		*\"phase\":\"materialize\"*)
+			materialize_items=$((materialize_items + items))
+			;;
+		*) return 1 ;;
+		esac
+	done <"$3" &&
+	test "$preflight_items" = "$expected_items" &&
+	test "$materialize_items" = "$expected_items"
+}
+
+test_expect_success 'setup: both-phase policy for large and sliced checkout' '
+	cat >policy-ipc-batched-checkout.json <<-\EOF
+	{
+	  "version": "v1",
+	  "rules": [{
+	    "id": "lfs-takeover",
+	    "phases": ["preflight", "materialize"],
+	    "selector": {"attr_filter_equals": "lfs", "regular_file_only": true},
+	    "action": "takeover",
+	    "strict": true,
+	    "fallback": "deny",
+	    "required_capabilities": ["lfs-preflight", "lfs-materialize"]
+	  }]
+	}
+	EOF
+'
+
+test_expect_success '1000 and 10000 LFS entries accept large replies without extra round trips' '
+	for count in 1000 10000
+	do
+		make_batched_checkout_repo "large-checkout-$count" "$count" &&
+		trace_log="$TRASH_DIRECTORY/large-checkout-$count.ndjson" &&
+		test_when_finished stop_executor_server &&
+		TMPDIR="$TRASH_DIRECTORY" restart_server_with_trace ordered-batch-checkout "$trace_log" &&
+		(
+			cd "large-checkout-$count" &&
+			env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-batched-checkout.json" \
+				TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+				GIT_TEST_CHECKOUT_WORKERS=1 git checkout with-lfs &&
+			test-tool textil-ext-executor-server verify-checkout --items="$count" &&
+			echo target >expected-control &&
+			test_cmp expected-control control.txt &&
+			git rev-parse HEAD >actual-head &&
+			git rev-parse with-lfs >expected-head &&
+			test_cmp expected-head actual-head
+		) &&
+		test_line_count = 2 "$trace_log" &&
+		check_batch_trace 8388608 "$count" "$trace_log" || return 1
+	done
+'
+
+test_expect_success 'byte-bounded slices preserve every materialize result in request order' '
+	make_batched_checkout_repo sliced-checkout 40 &&
+	trace_log="$TRASH_DIRECTORY/sliced-checkout.ndjson" &&
+	test_when_finished stop_executor_server &&
+	TMPDIR="$TRASH_DIRECTORY" restart_server_with_trace ordered-batch-checkout "$trace_log" &&
+	(
+		cd sliced-checkout &&
+		env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-batched-checkout.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			GIT_TEST_CHECKOUT_WORKERS=1 GIT_TEST_TEXTIL_EXT_MAX_REQUEST_BYTES=1024 \
+			git checkout with-lfs &&
+		test-tool textil-ext-executor-server verify-checkout --items=40
+	) &&
+	grep "\"phase\":\"preflight\"" "$trace_log" >preflight-slices &&
+	grep "\"phase\":\"materialize\"" "$trace_log" >materialize-slices &&
+	test_line_count -gt 1 preflight-slices &&
+	test_line_count -gt 1 materialize-slices &&
+	check_batch_trace 1024 40 "$trace_log"
+'
+
+test_expect_success 'later preflight or materialize slice failure precedes all checkout mutation' '
+	for phase in preflight materialize
+	do
+		make_batched_checkout_repo "failed-$phase-slice" 40 &&
+		trace_log="$TRASH_DIRECTORY/failed-$phase-slice.ndjson" &&
+		test_when_finished stop_executor_server &&
+		TMPDIR="$TRASH_DIRECTORY" restart_server_with_trace "later-$phase-error" "$trace_log" &&
+		(
+			cd "failed-$phase-slice" &&
+			echo "keep untracked bytes" >local-note.txt &&
+			cp local-note.txt expected-note &&
+			cp control.txt expected-control &&
+			git status --porcelain --untracked-files=no >before-tracked &&
+			git rev-parse HEAD >before-head &&
+			cp .git/index before-index &&
+			test_must_fail env \
+				TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-batched-checkout.json" \
+				TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+				GIT_TEST_CHECKOUT_WORKERS=1 GIT_TEST_TEXTIL_EXT_MAX_REQUEST_BYTES=1024 \
+				git checkout with-lfs 2>err &&
+			grep "later $phase slice failed" err &&
+			test_cmp before-index .git/index &&
+			git rev-parse HEAD >after-head &&
+			test_cmp before-head after-head &&
+			test_cmp expected-control control.txt &&
+			test_cmp expected-note local-note.txt &&
+			test_path_is_missing assets &&
+			git status --porcelain --untracked-files=no >after-tracked &&
+			test_cmp before-tracked after-tracked
+		) &&
+		grep "\"phase\":\"$phase\"" "$trace_log" >failed-phase-slices &&
+		test_line_count = 2 failed-phase-slices &&
+		if test "$phase" = preflight
+		then
+			! grep "\"phase\":\"materialize\"" "$trace_log"
+		fi || return 1
+	done
+'
+
+test_expect_success 'too-small request budgets reject headers and singleton items explicitly' '
+	restart_server ok &&
+	test_when_finished stop_executor_server &&
+	test_must_fail env TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		GIT_TEST_TEXTIL_EXT_MAX_REQUEST_BYTES=0 \
+		test-tool textil-ext-executor-server send-preflight \
+			--repo-root=/r --operation=x --path=asset.bin >out &&
+	grep "request header exceeds 0 byte budget" out &&
+	test_must_fail env TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		GIT_TEST_TEXTIL_EXT_MAX_REQUEST_BYTES=160 \
+		test-tool textil-ext-executor-server send-preflight \
+			--repo-root=/r --operation=x --path=asset.bin >out &&
+	grep "request item '\''asset.bin'\'' exceeds 160 byte budget" out
+'
+
+test_expect_success 'aggregate cap removal retains exact message and source-path byte bounds' '
+	test_when_finished stop_executor_server &&
+	restart_server message-max &&
+	test_must_fail env TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-preflight --path=asset.bin >out &&
+	grep "takeover error:" out &&
+	restart_server message-too-long &&
+	test_must_fail env TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-preflight --path=asset.bin >out &&
+	grep "invalid response" out &&
+	restart_server materialize-src-path-max &&
+	env TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize >out &&
+	grep "^status=ok$" out &&
+	restart_server materialize-src-path-too-long &&
+	test_must_fail env TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize >out &&
+	grep "invalid response" out
 '
 
 test_done

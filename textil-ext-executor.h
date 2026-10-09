@@ -140,9 +140,10 @@ void textil_ext_materialize_batch_result_release(
 /*
  * Resolve materialize src_paths for a batch.
  *
- * This is the primary hot-path materialize executor API. It sends one batch
- * request over IPC, parses one ordered batch reply, and returns one src_path
- * per batch item in the same order as the request.
+ * This is the primary hot-path materialize executor API. The executor slices
+ * requests only at item boundaries to fit the controller's byte budget,
+ * validates each reply against its slice, and publishes one ordered src_path
+ * per batch item only after every slice succeeds.
  *
  * Preconditions:
  *   - batch->phase == TEXTIL_EXT_EXEC_PHASE_MATERIALIZE
