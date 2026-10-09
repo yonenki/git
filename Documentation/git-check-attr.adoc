@@ -123,6 +123,53 @@ $ git check-attr caveat README
 README: caveat: unspecified
 ---------------
 
+TEXTIL HEAD SOURCE READER
+------------------------
+
+The bundled Textil Git also provides the standalone, read-only
+`git textil-head-projection --identity-only` and
+`git textil-head-projection --describe` commands. They take no path arguments.
+By default both pin HEAD to a tree (or an unborn branch). Describe also accepts
+`--target=<full-object-oid>` to consume an already resolved immutable target
+without reading HEAD again. Symbolic names, revisions and abbreviated IDs are
+not accepted, and a missing or wrong-kind target fails rather than being unborn.
+Both freeze Git's active replacement map and capture the actual consumed system,
+global and common-directory `info/attributes` frames with the effective
+case-matching policy. Their
+SHA-256 context identity covers ordered input paths, enabled/missing/present
+states and consumed bytes, not unrelated configuration. Describe evaluates
+attributes using those captured frames and the pinned tree, never a later
+observation of the external files. Stock external attribute warning/ignore
+semantics remain applicable. Missing or wrong-kind tree-present attribute
+objects fail describe rather than produce an incomplete reusable source.
+Lazy fetching is disabled, so missing source objects cannot trigger network
+access or repository writes.
+
+The machine stream consists exclusively of NUL-terminated fields:
+
+---------------
+source NUL <tree-oid-or-empty> NUL <context-sha256-lower-hex> NUL
+entry NUL <octal-mode> NUL <blob-or-commit> NUL <original-oid> NUL <path> NUL <filter> NUL <lockable> NUL <effective-override-or-empty> NUL
+end NUL
+---------------
+
+Identity mode has no entry records. Describe emits every tree leaf, including
+symlinks, without descending into gitlinks; directory rows are omitted.
+Gitlink attributes are `unspecified` and their override is empty. Other
+attributes use the same four output meanings as `check-attr -z`. Paths are
+unquoted and can contain newlines. An empty effective override means the
+original object; regular blob overrides resolve the frozen replacement chain.
+Both SHA-1 and SHA-256 repository object IDs are supported. Consumers must
+reject incomplete streams, unknown records and trailing bytes.
+
+The command does not select pointer candidates, read ordinary blob bodies or
+request their sizes, run filters or Host callbacks, or write repository state.
+Textil alone selects candidates and uses its existing physical metadata reader.
+Candidate bytes are read from the returned effective OID with replacements
+explicitly disabled; the original tree OID remains the checkout identity.
+A later invocation observes later policy/ref changes. A build's receipt belongs
+to its own consumed frames, not to a separate probe before or after the build.
+
 SEE ALSO
 --------
 linkgit:gitattributes[5].

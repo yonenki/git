@@ -695,6 +695,7 @@ builtin_sources = [
   'builtin/survey.c',
   'builtin/symbolic-ref.c',
   'builtin/tag.c',
+  'builtin/textil-head-projection.c',
   'builtin/unpack-file.c',
   'builtin/unpack-objects.c',
   'builtin/update-index.c',
