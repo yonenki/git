@@ -51,7 +51,7 @@ test_expect_success 'unborn source has no entries; malformed HEAD is not unborn'
 		test_must_fail git textil-head-projection --describe --target=HEAD &&
 		test_must_fail git textil-head-projection --identity-only --describe &&
 		printf "not-a-ref\n" >.git/HEAD &&
-		test_must_fail git textil-head-projection --identity-only
+		test_must_fail git --git-dir=.git textil-head-projection --identity-only
 	)
 '
 
@@ -235,10 +235,15 @@ test_expect_success 'all leaves preserve newline paths and gitlinks without prob
 		cd leaves &&
 		name="line
 break" &&
-		printf "newline\n" >"$name" &&
-		git add "$name" &&
-		git update-index --add --cacheinfo 160000,$(git rev-parse HEAD),child &&
-		git commit -m leaves &&
+		blob=$(printf "newline\n" | git hash-object -w --stdin) &&
+		{
+			printf "100644 blob %s\tasset.uasset\000" "$(git rev-parse HEAD:asset.uasset)" &&
+			printf "160000 commit %s\tchild\000" "$(git rev-parse HEAD)" &&
+			printf "100644 blob %s\t%s\000" "$blob" "$name"
+		} >tree-input &&
+		tree=$(git mktree -z <tree-input) &&
+		commit=$(git commit-tree "$tree" -p HEAD -m leaves) &&
+		git update-ref HEAD "$commit" &&
 		git textil-head-projection --identity-only >identity &&
 		git textil-head-projection --describe >describe &&
 		{

@@ -1,0 +1,30 @@
+git-textil-head-projection(1)
+=============================
+
+NAME
+----
+git-textil-head-projection - Describe a frozen HEAD projection source for Textil
+
+SYNOPSIS
+--------
+[verse]
+'git textil-head-projection' --identity-only
+'git textil-head-projection' --describe [--target=<object-id>]
+
+DESCRIPTION
+-----------
+Read the immutable tree and the effective attribute and replacement context used
+by Textil's pointer-only projection. `--identity-only` emits the source receipt
+without enumerating paths. `--describe` also emits leaf metadata, effective
+`filter` and `lockable` attributes, and immutable replacement-object bindings.
+It does not read pointer bodies or invoke clean/smudge filters.
+
+`--target` accepts a full object ID only with `--describe`. It consumes an
+already-resolved target instead of resolving HEAD again; absent or invalid
+objects remain errors. The output is a NUL-delimited machine stream, not
+human-readable output. See linkgit:git-check-attr[1] for the source-reader wire
+contract and captured attribute authority.
+
+GIT
+---
+Part of the linkgit:git[1] suite
