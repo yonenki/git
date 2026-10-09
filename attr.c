@@ -265,6 +265,8 @@ static const char blank[] = " \t\r\n";
 /* Flags usable in read_attr() and parse_attr_line() family of functions. */
 #define READ_ATTR_MACRO_OK (1<<0)
 #define READ_ATTR_NOFOLLOW (1<<1)
+/* A reusable source cannot silently omit a tree-present policy object. */
+#define READ_ATTR_REQUIRE_BLOB (1<<2)
 
 /*
  * Parse a whitespace-delimited attribute state (i.e., "attr",
@@ -434,6 +436,15 @@ struct attr_stack {
 	unsigned num_matches;
 	unsigned alloc;
 	struct match_attr **attrs;
+};
+
+struct attr_source_context {
+	struct attr_stack *external;
+	struct attr_stack *info;
+	struct object_id tree_oid;
+	int has_tree;
+	int ignore_case;
+	int bootstrapped;
 };
 
 static void attr_stack_free(struct attr_stack *e)
@@ -622,6 +633,11 @@ void attr_check_clear(struct attr_check *check)
 	check->all_attrs_nr = 0;
 
 	drop_attr_stack(&check->stack);
+	if (check->source_context) {
+		drop_attr_stack(&check->source_context->external);
+		drop_attr_stack(&check->source_context->info);
+		FREE_AND_NULL(check->source_context);
+	}
 }
 
 void attr_check_free(struct attr_check *check)
@@ -690,7 +706,9 @@ void git_attr_set_direction(enum git_attr_direction new_direction)
 	direction = new_direction;
 }
 
-static struct attr_stack *read_attr_from_file(const char *path, unsigned flags)
+static struct attr_stack *read_attr_from_file_with_context(const char *path,
+							 unsigned flags,
+							 struct git_hash_ctx *context)
 {
 	struct strbuf buf = STRBUF_INIT;
 	int fd;
@@ -698,6 +716,11 @@ static struct attr_stack *read_attr_from_file(const char *path, unsigned flags)
 	struct attr_stack *res;
 	int lineno = 0;
 	struct stat st;
+	struct git_hash_ctx content;
+	unsigned char digest[GIT_SHA256_RAWSZ];
+
+	if (context)
+		git_hash_update(context, path, strlen(path) + 1);
 
 	if (flags & READ_ATTR_NOFOLLOW)
 		fd = open_nofollow(path, O_RDONLY);
@@ -705,31 +728,63 @@ static struct attr_stack *read_attr_from_file(const char *path, unsigned flags)
 		fd = open(path, O_RDONLY);
 
 	if (fd < 0) {
+		if (context) {
+			const char *state = is_missing_file_error(errno) ?
+				"missing" : "unreadable";
+			git_hash_update(context, state, strlen(state) + 1);
+		}
 		warn_on_fopen_errors(path);
 		return NULL;
 	}
 	fp = xfdopen(fd, "r");
 	if (fstat(fd, &st)) {
+		if (context)
+			git_hash_update(context, "unstatable", sizeof("unstatable"));
 		warning_errno(_("cannot fstat gitattributes file '%s'"), path);
 		fclose(fp);
 		return NULL;
 	}
 	if (st.st_size >= ATTR_MAX_FILE_SIZE) {
+		if (context)
+			git_hash_update(context, "too-large", sizeof("too-large"));
 		warning(_("ignoring overly large gitattributes file '%s'"), path);
 		fclose(fp);
 		return NULL;
 	}
 
+	if (context) {
+		git_hash_update(context, "present", sizeof("present"));
+		git_hash_init(&content, &hash_algos[GIT_HASH_SHA256]);
+	}
 	CALLOC_ARRAY(res, 1);
-	while (strbuf_getline(&buf, fp) != EOF) {
+	while (strbuf_getwholeline(&buf, fp, '\n') != EOF) {
+		if (context)
+			git_hash_update(&content, buf.buf, buf.len);
+		/* Match strbuf_getline(), after hashing the consumed bytes. */
+		if (buf.len && buf.buf[buf.len - 1] == '\n') {
+			strbuf_setlen(&buf, buf.len - 1);
+			if (buf.len && buf.buf[buf.len - 1] == '\r')
+				strbuf_setlen(&buf, buf.len - 1);
+		}
 		if (!lineno && starts_with(buf.buf, utf8_bom))
 			strbuf_remove(&buf, 0, strlen(utf8_bom));
 		handle_attr_line(res, buf.buf, path, ++lineno, flags);
+	}
+	if (context) {
+		git_hash_update(context, ferror(fp) ? "read-error" : "complete",
+				ferror(fp) ? sizeof("read-error") : sizeof("complete"));
+		git_hash_final(digest, &content);
+		git_hash_update(context, digest, sizeof(digest));
 	}
 
 	fclose(fp);
 	strbuf_release(&buf);
 	return res;
+}
+
+static struct attr_stack *read_attr_from_file(const char *path, unsigned flags)
+{
+	return read_attr_from_file_with_context(path, flags, NULL);
 }
 
 static struct attr_stack *read_attr_from_buf(char *buf, size_t length,
@@ -779,9 +834,16 @@ static struct attr_stack *read_attr_from_blob(struct index_state *istate,
 	if (get_tree_entry(istate->repo, tree_oid, path, &oid, &mode))
 		return NULL;
 
+	/* A directory or gitlink named .gitattributes is not an attribute blob. */
+	if ((flags & READ_ATTR_REQUIRE_BLOB) &&
+	    !S_ISREG(mode) && !S_ISLNK(mode))
+		return NULL;
+
 	buf = odb_read_object(istate->repo->objects, &oid, &type, &sz);
 	if (!buf || type != OBJ_BLOB) {
 		free(buf);
+		if (flags & READ_ATTR_REQUIRE_BLOB)
+			die(_("unable to read attributes blob '%s'"), path);
 		return NULL;
 	}
 
@@ -907,15 +969,78 @@ static void push_stack(struct attr_stack **attr_stack_p,
 	}
 }
 
+void git_attr_capture_source(struct attr_check *check,
+			     const struct object_id *tree_oid,
+			     struct git_hash_ctx *context)
+{
+	struct attr_source_context *source;
+	struct attr_stack *e;
+	unsigned flags = READ_ATTR_MACRO_OK;
+	const char *path;
+
+	if (check->stack || check->source_context)
+		BUG("attribute source must be captured before evaluation");
+	CALLOC_ARRAY(source, 1);
+	check->source_context = source;
+	source->ignore_case = !!ignore_case;
+	source->has_tree = !!tree_oid;
+	if (tree_oid)
+		oidcpy(&source->tree_oid, tree_oid);
+	git_hash_update(context, source->ignore_case ? "casefold" : "case-sensitive",
+			source->ignore_case ? sizeof("casefold") : sizeof("case-sensitive"));
+
+	e = read_attr_from_array(builtin_attr);
+	push_stack(&source->external, e, NULL, 0);
+	git_hash_update(context, "system", sizeof("system"));
+	if (git_attr_system_is_enabled()) {
+		e = read_attr_from_file_with_context(git_attr_system_file(),
+						    flags, context);
+		push_stack(&source->external, e, NULL, 0);
+	} else {
+		git_hash_update(context, "disabled", sizeof("disabled"));
+	}
+	git_hash_update(context, "global", sizeof("global"));
+	path = git_attr_global_file();
+	if (path) {
+		e = read_attr_from_file_with_context(path, flags, context);
+		push_stack(&source->external, e, NULL, 0);
+	} else {
+		git_hash_update(context, "unselected", sizeof("unselected"));
+	}
+	git_hash_update(context, "info", sizeof("info"));
+	if (startup_info->have_repository)
+		source->info = read_attr_from_file_with_context(
+			git_path_info_attributes(), flags, context);
+	else
+		git_hash_update(context, "no-repository", sizeof("no-repository"));
+	if (!source->info)
+		CALLOC_ARRAY(source->info, 1);
+}
+
 static void bootstrap_attr_stack(struct index_state *istate,
 				 const struct object_id *tree_oid,
-				 struct attr_stack **stack)
+				 struct attr_stack **stack,
+				 struct attr_source_context *source)
 {
 	struct attr_stack *e;
 	unsigned flags = READ_ATTR_MACRO_OK;
 
 	if (*stack)
 		return;
+
+	if (source) {
+		if (source->bootstrapped)
+			BUG("captured attribute frames cannot be reloaded");
+		source->bootstrapped = 1;
+		*stack = source->external;
+		source->external = NULL;
+		e = read_attr(istate, tree_oid, GITATTRIBUTES_FILE,
+			      flags | READ_ATTR_NOFOLLOW | READ_ATTR_REQUIRE_BLOB);
+		push_stack(stack, e, xstrdup(""), 0);
+		push_stack(stack, source->info, NULL, 0);
+		source->info = NULL;
+		return;
+	}
 
 	/* builtin frame */
 	e = read_attr_from_array(builtin_attr);
@@ -950,7 +1075,8 @@ static void bootstrap_attr_stack(struct index_state *istate,
 static void prepare_attr_stack(struct index_state *istate,
 			       const struct object_id *tree_oid,
 			       const char *path, int dirlen,
-			       struct attr_stack **stack)
+			       struct attr_stack **stack,
+			       struct attr_source_context *source)
 {
 	struct attr_stack *info;
 	struct strbuf pathbuf = STRBUF_INIT;
@@ -970,7 +1096,7 @@ static void prepare_attr_stack(struct index_state *istate,
 	 * .gitattributes in deeper directories to shallower ones,
 	 * and finally use the built-in set as the default.
 	 */
-	bootstrap_attr_stack(istate, tree_oid, stack);
+	bootstrap_attr_stack(istate, tree_oid, stack, source);
 
 	/*
 	 * Pop the "info" one that is always at the top of the stack.
@@ -1025,7 +1151,9 @@ static void prepare_attr_stack(struct index_state *istate,
 		strbuf_add(&pathbuf, path + pathbuf.len, (len - pathbuf.len));
 		strbuf_addf(&pathbuf, "/%s", GITATTRIBUTES_FILE);
 
-		next = read_attr(istate, tree_oid, pathbuf.buf, READ_ATTR_NOFOLLOW);
+		next = read_attr(istate, tree_oid, pathbuf.buf,
+				 READ_ATTR_NOFOLLOW |
+				 (source ? READ_ATTR_REQUIRE_BLOB : 0));
 
 		/* reset the pathbuf to not include "/.gitattributes" */
 		strbuf_setlen(&pathbuf, len);
@@ -1183,7 +1311,8 @@ static void collect_some_attrs(struct index_state *istate,
 		dirlen = 0;
 	}
 
-	prepare_attr_stack(istate, tree_oid, path, dirlen, &check->stack);
+	prepare_attr_stack(istate, tree_oid, path, dirlen, &check->stack,
+			   check->source_context);
 	all_attrs_init(&g_attr_hashmap, check);
 	determine_macros(check->all_attrs, check->stack);
 
@@ -1327,7 +1456,16 @@ void git_check_attr(struct index_state *istate,
 		    struct attr_check *check)
 {
 	int i;
-	const struct object_id *tree_oid = default_attr_source();
+	const struct object_id *tree_oid = check->source_context ?
+		NULL : default_attr_source();
+	int saved_ignore_case = ignore_case;
+
+	if (check->source_context) {
+		if (!check->source_context->has_tree)
+			BUG("cannot evaluate an unborn attribute source");
+		tree_oid = &check->source_context->tree_oid;
+		ignore_case = check->source_context->ignore_case;
+	}
 
 	collect_some_attrs(istate, tree_oid, path, check);
 
@@ -1338,6 +1476,7 @@ void git_check_attr(struct index_state *istate,
 			value = compute_builtin_attr(istate, path, check->all_attrs[n].attr);
 		check->items[i].value = value;
 	}
+	ignore_case = saved_ignore_case;
 }
 
 void git_all_attrs(struct index_state *istate,

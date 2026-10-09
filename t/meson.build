@@ -972,6 +972,7 @@ integration_tests = [
   't7817-grep-sparse-checkout.sh',
   't7900-maintenance.sh',
   't7912-textil-ext-source-preflight.sh',
+  't7913-textil-head-projection.sh',
   't8001-annotate.sh',
   't8002-blame.sh',
   't8003-blame-corner-cases.sh',

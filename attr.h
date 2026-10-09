@@ -133,6 +133,9 @@ struct git_attr;
 /* opaque structures used internally for attribute collection */
 struct all_attrs_item;
 struct attr_stack;
+struct attr_source_context;
+struct object_id;
+struct git_hash_ctx;
 
 /*
  * The textual object name for the tree-ish used by git_check_attr()
@@ -187,6 +190,7 @@ struct attr_check {
 	int all_attrs_nr;
 	struct all_attrs_item *all_attrs;
 	struct attr_stack *stack;
+	struct attr_source_context *source_context;
 };
 
 struct attr_check *attr_check_alloc(void);
@@ -212,6 +216,17 @@ const char *git_attr_name(const struct git_attr *);
 void git_check_attr(struct index_state *istate,
 		    const char *path,
 		    struct attr_check *check);
+
+/*
+ * Capture external frames once, hash their consumed inputs into context, and
+ * pin subsequent git_check_attr() calls to tree_oid and the current case
+ * policy. NULL tree_oid is permitted for an identity-only unborn source.
+ * For a standalone, single-threaded reader: do not change attr direction or
+ * duplicate the check after capture. attr_check_free() releases the capture.
+ */
+void git_attr_capture_source(struct attr_check *check,
+			     const struct object_id *tree_oid,
+			     struct git_hash_ctx *context);
 
 /*
  * Retrieve all attributes that apply to the specified path.
