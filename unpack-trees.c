@@ -2539,11 +2539,13 @@ static int check_ok_to_remove(const char *name, int len, int dtype,
 }
 
 int textil_verify_initial_checkout_absence(const struct cache_entry *ce,
+					   struct strbuf *path,
 					   struct strbuf *err)
 {
-	struct strbuf path = STRBUF_INIT;
+	const char *name = ce->name;
+	const char *slash = strchr(name, '/');
 	struct stat st;
-	size_t i;
+	size_t len = ce_namelen(ce), i = slash ? slash - name : len;
 	int absent = 0;
 
 	/*
@@ -2551,27 +2553,35 @@ int textil_verify_initial_checkout_absence(const struct cache_entry *ce,
 	 * Each ancestor and the target is observed once; stop at the first
 	 * absent component. This is only called where force skipped the
 	 * normal verify_absent observation, and does not authorize overwrite.
+	 * Basenames need no copy; nested targets reuse the batch's scratch.
 	 */
-	strbuf_addstr(&path, ce->name);
-	for (i = 0; i <= path.len; i++) {
-		if (i < path.len && path.buf[i] != '/')
+	if (slash) {
+		strbuf_reset(path);
+		strbuf_addstr(path, name);
+		name = path->buf;
+	}
+	for (; i <= len; i++) {
+		if (i < len && name[i] != '/')
 			continue;
-		path.buf[i] = '\0';
-		if (lstat(path.buf, &st)) {
+		if (i < len)
+			path->buf[i] = '\0';
+		if (lstat(name, &st)) {
 			if (errno == ENOENT)
 				absent = 1;
 			else {
 				strbuf_addf(err, _("cannot stat '%s': %s"),
-					    path.buf, strerror(errno));
+					    name, strerror(errno));
 				absent = -1;
 			}
+			if (i < len)
+				path->buf[i] = '/';
 			break;
 		}
-		if (i == path.len || !S_ISDIR(st.st_mode))
+		if (i < len)
+			path->buf[i] = '/';
+		if (i == len || !S_ISDIR(st.st_mode))
 			break;
-		path.buf[i] = '/';
 	}
-	strbuf_release(&path);
 	return absent;
 }
 

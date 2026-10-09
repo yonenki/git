@@ -1099,6 +1099,7 @@ int textil_ext_collect_preflight_takeover_batch(
 	int two_tree = options->merge && options->fn == twoway_merge &&
 		options->internal.merge_size == 2;
 	int overwrite = options->reset != UNPACK_RESET_NONE;
+	struct strbuf absence_path = STRBUF_INIT;
 
 	textil_ext_collect_takeover_batch(index, operation, repo_root,
 					  TEXTIL_EXT_EXEC_PHASE_PREFLIGHT,
@@ -1137,14 +1138,17 @@ int textil_ext_collect_preflight_takeover_batch(
 			 */
 			if (!absent && options->reset == UNPACK_RESET_OVERWRITE_UNTRACKED)
 				absent = textil_verify_initial_checkout_absence(
-					item->checkout_entry, err);
-			if (absent < 0)
+					item->checkout_entry, &absence_path, err);
+			if (absent < 0) {
+				strbuf_release(&absence_path);
 				return -1;
+			}
 			if (absent)
 				item->checkout_admission =
 					TEXTIL_EXT_CHECKOUT_VERIFIED_INITIAL_ABSENCE;
 		}
 	}
+	strbuf_release(&absence_path);
 	return 0;
 }
 
