@@ -15,6 +15,10 @@ struct strbuf;
 #define CONV_EOL_RENORMALIZE  (1<<2) /* Convert CRLF to LF */
 #define CONV_EOL_KEEP_CRLF    (1<<3) /* Keep CRLF line endings as is */
 #define CONV_WRITE_OBJECT     (1<<4) /* Content is written to the index */
+/* Unknown takeover content may only be used to report changed/no display. */
+#define CONV_TEXTIL_COMPARE_ONLY (1<<5)
+/* Not an ordinary conversion error: the permitted comparison is unknown. */
+#define CONV_TEXTIL_UNKNOWN (-2)
 
 extern int global_conv_flags_eol;
 
@@ -105,7 +109,7 @@ const char *get_wt_convert_stats_ascii(const char *path);
 const char *get_convert_attr_ascii(struct index_state *istate,
 				   const char *path);
 
-/* returns 1 if *dst was used */
+/* Returns 1 if *dst was used, 0 if unchanged, CONV_TEXTIL_UNKNOWN if unknown. */
 int convert_to_git(struct index_state *istate,
 		   const char *path, const char *src, size_t len,
 		   struct strbuf *dst, int conv_flags);
@@ -147,8 +151,9 @@ static inline int would_convert_to_git(struct index_state *istate,
 {
 	return convert_to_git(istate, path, NULL, 0, NULL, 0);
 }
-/* Precondition: would_convert_to_git_filter_fd(path) == true */
-void convert_to_git_filter_fd(struct index_state *istate,
+/* Precondition: would_convert_to_git_filter_fd(path) == true.
+ * Returns 0 on success, CONV_TEXTIL_UNKNOWN if compare-only content is unknown. */
+int convert_to_git_filter_fd(struct index_state *istate,
 			      const char *path, int fd,
 			      struct strbuf *dst,
 			      int conv_flags, const char *input_path);

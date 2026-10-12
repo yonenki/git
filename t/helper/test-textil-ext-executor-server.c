@@ -26,6 +26,11 @@
 #include "write-or-die.h"
 #include "repository.h"
 #include "setup.h"
+#include "diff.h"
+#include "diffcore.h"
+#include "read-cache-ll.h"
+#include "textil-ext-policy.h"
+#include "hex.h"
 
 #ifndef SUPPORTS_SIMPLE_IPC
 int cmd__textil_ext_executor_server(int argc, const char **argv)
@@ -43,6 +48,8 @@ enum reply_mode {
 	REPLY_OK,
 	REPLY_REJECTED,
 	REPLY_ERROR,
+	REPLY_REJECTED_CONNECT_MESSAGE,
+	REPLY_ERROR_ENDPOINT_MESSAGE,
 	REPLY_INVALID_PKT,
 	REPLY_ECHO,
 	REPLY_VALIDATE_REQUEST,
@@ -82,6 +89,7 @@ enum reply_mode {
 	REPLY_ADMITTED_CHECKOUT, /* single-path lazy-admission regression */
 	REPLY_CHECKIN_DEFERRED, /* fence_oid for deferred checkins, logged fences */
 	REPLY_CHECKIN_DEFERRED_FENCE_ERROR,
+	REPLY_CHECKIN_CONTENT, /* Return exact input bytes, including empty input. */
 };
 
 static struct {
@@ -134,6 +142,10 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_REJECTED;
 	if (!strcmp(s, "error"))
 		return REPLY_ERROR;
+	if (!strcmp(s, "rejected-connect-message"))
+		return REPLY_REJECTED_CONNECT_MESSAGE;
+	if (!strcmp(s, "error-endpoint-message"))
+		return REPLY_ERROR_ENDPOINT_MESSAGE;
 	if (!strcmp(s, "invalid-pkt"))
 		return REPLY_INVALID_PKT;
 	if (!strcmp(s, "echo"))
@@ -212,6 +224,8 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_CHECKIN_DEFERRED;
 	if (!strcmp(s, "checkin-deferred-fence-error"))
 		return REPLY_CHECKIN_DEFERRED_FENCE_ERROR;
+	if (!strcmp(s, "checkin-content"))
+		return REPLY_CHECKIN_CONTENT;
 	die("unknown reply-mode: '%s'", s);
 }
 
@@ -725,13 +739,19 @@ static int app_cb(void *application_data UNUSED,
 		return ret;
 
 	case REPLY_REJECTED:
-		build_rejected_reply(&reply, "mock rejection");
+	case REPLY_REJECTED_CONNECT_MESSAGE:
+		build_rejected_reply(&reply,
+			server_args.mode == REPLY_REJECTED_CONNECT_MESSAGE ?
+			"failed to connect to endpoint (controller rejection)" : "mock rejection");
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
 		return ret;
 
 	case REPLY_ERROR:
-		build_error_reply(&reply, "mock error");
+	case REPLY_ERROR_ENDPOINT_MESSAGE:
+		build_error_reply(&reply,
+			server_args.mode == REPLY_ERROR_ENDPOINT_MESSAGE ?
+			"TEXTIL_GIT_EXT_ENDPOINT is not set (controller error)" : "mock error");
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
 		return ret;
@@ -1128,6 +1148,39 @@ static int app_cb(void *application_data UNUSED,
 			ret = reply_cb(reply_data, reply.buf, reply.len);
 		}
 		strbuf_release(&reason);
+		strbuf_release(&reply);
+		return ret;
+	}
+
+	case REPLY_CHECKIN_CONTENT: {
+		size_t pos = 0;
+		struct string_list inputs = STRING_LIST_INIT_DUP;
+		size_t i;
+
+		for (;;) {
+			const char *line, *key, *val;
+			size_t line_len, key_len, val_len;
+			enum pktline_mem_status st = pktline_read_mem(request, request_len,
+								     &pos, &line, &line_len);
+			if (st == PKTLINE_MEM_FLUSH || st == PKTLINE_MEM_ERROR)
+				break;
+			if (st == PKTLINE_MEM_DATA &&
+			    !parse_kv(line, line_len, &key, &key_len, &val, &val_len) &&
+			    kv_matches(key, key_len, "input_path"))
+				string_list_append_nodup(&inputs, xmemdupz(val, val_len));
+		}
+		packet_buf_write(&reply, "status=ok\n");
+		for (i = 0; i < inputs.nr; i++) {
+			struct strbuf content = STRBUF_INIT;
+			if (strbuf_read_file(&content, inputs.items[i].string, 0) < 0)
+				die_errno("cannot read checkin input");
+			packet_buf_delim(&reply);
+			packet_buf_write_hex_pointer(&reply, content.buf);
+			strbuf_release(&content);
+		}
+		packet_buf_flush(&reply);
+		string_list_clear(&inputs, 0);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
 		return ret;
 	}
@@ -1598,6 +1651,32 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 	if (reply_mode_str)
 		server_args.mode = parse_reply_mode(reply_mode_str);
 
+	if (!strcmp(subcmd, "worktree-patch-id")) {
+		struct diff_options diffopt;
+		struct object_id oid;
+		const struct cache_entry *ce;
+		int pos;
+
+		setup_git_directory(the_repository);
+		textil_ext_policy_init();
+		if (repo_read_index(the_repository) < 0)
+			die("cannot read index");
+		pos = index_name_pos(the_repository->index, preflight_args.path,
+				     strlen(preflight_args.path));
+		if (pos < 0)
+			die("path is not in the index");
+		ce = the_repository->index->cache[pos];
+		repo_diff_setup(the_repository, &diffopt);
+		diff_change(&diffopt, ce->ce_mode, ce->ce_mode, &ce->oid,
+			    null_oid(the_repository->hash_algo), 1, 0,
+			    ce->name, 0, 0);
+		diffcore_std(&diffopt);
+		if (diff_flush_patch_id(&diffopt, &oid, 1))
+			return 1;
+		printf("%s\n", oid_to_hex(&oid));
+		return 0;
+	}
+
 	if (!strcmp(subcmd, "verify-checkout")) {
 		struct strbuf path = STRBUF_INIT;
 		struct strbuf expected = STRBUF_INIT;
@@ -1713,6 +1792,15 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 		case TEXTIL_EXT_EXECUTOR_ERROR:
 			printf("status=error\n");
 			break;
+		case TEXTIL_EXT_EXECUTOR_ENDPOINT_UNSET:
+			printf("status=endpoint-unset\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_CONNECT_FAILED:
+			printf("status=connect-failed\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_INVALID:
+			printf("status=invalid\n");
+			break;
 		}
 		if (err_buf.len)
 			printf("message=%s\n", err_buf.buf);
@@ -1772,6 +1860,15 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 			break;
 		case TEXTIL_EXT_EXECUTOR_ERROR:
 			printf("status=error\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_ENDPOINT_UNSET:
+			printf("status=endpoint-unset\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_CONNECT_FAILED:
+			printf("status=connect-failed\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_INVALID:
+			printf("status=invalid\n");
 			break;
 		}
 		for (i = 0; i < result.src_paths.nr; i++)
@@ -1883,6 +1980,15 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 			break;
 		case TEXTIL_EXT_EXECUTOR_ERROR:
 			printf("status=error\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_ENDPOINT_UNSET:
+			printf("status=endpoint-unset\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_CONNECT_FAILED:
+			printf("status=connect-failed\n");
+			break;
+		case TEXTIL_EXT_EXECUTOR_INVALID:
+			printf("status=invalid\n");
 			break;
 		}
 		for (i = 0; i < pointers.nr; i++)

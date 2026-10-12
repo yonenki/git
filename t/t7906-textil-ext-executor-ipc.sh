@@ -475,7 +475,7 @@ test_expect_success 'materialize-src-path-relative: C-side validates absolute pa
 		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
 		test-tool textil-ext-executor-server send-materialize \
 			--name="$IPC_PATH" >out &&
-	grep "^status=error$" out
+	grep "^status=invalid$" out
 '
 
 test_expect_success MINGW 'materialize-src-path-windows-verbatim: C-side accepts verbatim drive path' '
@@ -504,7 +504,7 @@ test_expect_success 'materialize-ok-without-src-path: ok with zero src_paths is 
 		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
 		test-tool textil-ext-executor-server send-materialize \
 			--name="$IPC_PATH" >out &&
-	grep "^status=error$" out
+	grep "^status=invalid$" out
 '
 
 test_expect_success 'materialize-ok-with-message: message forbidden for materialize ok' '
@@ -513,7 +513,7 @@ test_expect_success 'materialize-ok-with-message: message forbidden for material
 		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
 		test-tool textil-ext-executor-server send-materialize \
 			--name="$IPC_PATH" >out &&
-	grep "^status=error$" out
+	grep "^status=invalid$" out
 '
 
 test_expect_success 'materialize-src-path-with-status-error: delim after non-ok is rejected' '
@@ -522,7 +522,7 @@ test_expect_success 'materialize-src-path-with-status-error: delim after non-ok 
 		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
 		test-tool textil-ext-executor-server send-materialize \
 			--name="$IPC_PATH" >out &&
-	grep "^status=error$" out
+	grep "^status=invalid$" out
 '
 
 # === Materialize src_path count mismatch ===
@@ -533,7 +533,7 @@ test_expect_success 'materialize-count-mismatch: src_path count != batch items i
 		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
 		test-tool textil-ext-executor-server send-materialize \
 			--name="$IPC_PATH" >out &&
-	grep "^status=error$" out
+	grep "^status=invalid$" out
 '
 
 # === Preflight API contract (BUG guard) ===
@@ -704,7 +704,7 @@ test_expect_success 'checkin_convert-bad-pointer: odd/non-hex pointer is invalid
 		test_must_fail env TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
 			test-tool textil-ext-executor-server send-checkin-convert \
 				--name="$IPC_PATH" >out &&
-		grep "^status=error$" out &&
+		grep "^status=invalid$" out &&
 		grep "invalid response" out || return 1
 	done
 '

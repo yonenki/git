@@ -90,6 +90,12 @@ static const char *executor_status_name(enum textil_ext_executor_status status)
 		return "not_implemented";
 	case TEXTIL_EXT_EXECUTOR_ERROR:
 		return "error";
+	case TEXTIL_EXT_EXECUTOR_ENDPOINT_UNSET:
+		return "endpoint_unset";
+	case TEXTIL_EXT_EXECUTOR_CONNECT_FAILED:
+		return "connect_failed";
+	case TEXTIL_EXT_EXECUTOR_INVALID:
+		return "invalid";
 	}
 	return "unknown";
 }
@@ -100,7 +106,7 @@ static const char *executor_status_name(enum textil_ext_executor_status status)
  * named after the phase with the batch size, so request counts and their
  * cost can be read from GIT_TRACE2_EVENT without the Textil trace file.
  */
-static int send_controller_request(
+static enum textil_ext_executor_status send_controller_request(
 	const struct textil_ext_takeover_batch *batch,
 	const char *endpoint,
 	const struct ipc_client_connect_options *options,
@@ -108,15 +114,22 @@ static int send_controller_request(
 	struct strbuf *answer)
 {
 	const char *phase = phase_to_string(batch->phase);
-	int ret;
+	struct ipc_client_connection *connection = NULL;
+	enum textil_ext_executor_status status;
 
 	trace2_region_enter("textil-ext", phase, the_repository);
 	trace2_data_intmax("textil-ext", the_repository, "items",
 			   batch->nr_items);
-	ret = ipc_client_send_command(endpoint, options,
-				      request->buf, request->len, answer);
+	if (ipc_client_try_connect(endpoint, options, &connection) != IPC_STATE__LISTENING)
+		status = TEXTIL_EXT_EXECUTOR_CONNECT_FAILED;
+	else {
+		status = ipc_client_send_command_to_connection(
+			connection, request->buf, request->len, answer) ?
+			TEXTIL_EXT_EXECUTOR_ERROR : TEXTIL_EXT_EXECUTOR_OK;
+		ipc_client_close_connection(connection);
+	}
 	trace2_region_leave("textil-ext", phase, the_repository);
-	return ret;
+	return status;
 }
 #endif
 
@@ -801,26 +814,28 @@ static enum textil_ext_executor_status execute_item_value_slice(
 	struct strbuf msg = STRBUF_INIT;
 	struct ipc_client_connect_options options
 		= IPC_CLIENT_CONNECT_OPTIONS_INIT;
-	int ipc_ret;
+	enum textil_ext_executor_status ipc_status;
 	enum textil_ext_executor_status status;
 	uint64_t trace_start_ns = (uint64_t)getnanotime();
 
 	endpoint = endpoint_from_env(err);
 	if (!endpoint) {
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
+		status = TEXTIL_EXT_EXECUTOR_ENDPOINT_UNSET;
 		goto done;
 	}
 
 	options.wait_if_busy = 1;
 	options.wait_if_not_found = 0;
 
-	ipc_ret = send_controller_request(batch, endpoint, &options,
-					  request, &answer);
-	if (ipc_ret) {
+	ipc_status = send_controller_request(batch, endpoint, &options,
+					    request, &answer);
+	if (ipc_status != TEXTIL_EXT_EXECUTOR_OK) {
 		strbuf_addf(err,
-			_("textil-ext: failed to connect to endpoint '%s'"),
+			ipc_status == TEXTIL_EXT_EXECUTOR_CONNECT_FAILED ?
+			_("textil-ext: failed to connect to endpoint '%s'") :
+			_("textil-ext: failed to exchange request with endpoint '%s'"),
 			endpoint);
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
+		status = ipc_status;
 		goto done;
 	}
 
@@ -830,7 +845,7 @@ static enum textil_ext_executor_status execute_item_value_slice(
 		strbuf_addf(err,
 			_("textil-ext: invalid response from endpoint '%s'"),
 			endpoint);
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
+		status = TEXTIL_EXT_EXECUTOR_INVALID;
 		goto done;
 	}
 
@@ -841,7 +856,7 @@ static enum textil_ext_executor_status execute_item_value_slice(
 				count_mismatch_label, item_key,
 				(unsigned long)item_values_out->nr,
 				batch->nr_items);
-			status = TEXTIL_EXT_EXECUTOR_ERROR;
+			status = TEXTIL_EXT_EXECUTOR_INVALID;
 			goto done;
 		}
 		status = TEXTIL_EXT_EXECUTOR_OK;
@@ -1234,14 +1249,14 @@ static enum textil_ext_executor_status execute_preflight_slice(
 	struct strbuf msg = STRBUF_INIT;
 	struct ipc_client_connect_options options
 		= IPC_CLIENT_CONNECT_OPTIONS_INIT;
-	int ipc_ret;
+	enum textil_ext_executor_status ipc_status;
 	enum textil_ext_executor_status status;
 	uint64_t trace_start_ns = (uint64_t)getnanotime();
 
 	/* 1. Resolve endpoint */
 	endpoint = endpoint_from_env(err);
 	if (!endpoint) {
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
+		status = TEXTIL_EXT_EXECUTOR_ENDPOINT_UNSET;
 		goto done;
 	}
 
@@ -1249,13 +1264,15 @@ static enum textil_ext_executor_status execute_preflight_slice(
 	options.wait_if_busy = 1;
 	options.wait_if_not_found = 0;
 
-	ipc_ret = send_controller_request(batch, endpoint, &options,
-					  request, &answer);
-	if (ipc_ret) {
+	ipc_status = send_controller_request(batch, endpoint, &options,
+					    request, &answer);
+	if (ipc_status != TEXTIL_EXT_EXECUTOR_OK) {
 		strbuf_addf(err,
-			_("textil-ext: failed to connect to endpoint '%s'"),
+			ipc_status == TEXTIL_EXT_EXECUTOR_CONNECT_FAILED ?
+			_("textil-ext: failed to connect to endpoint '%s'") :
+			_("textil-ext: failed to exchange request with endpoint '%s'"),
 			endpoint);
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
+		status = ipc_status;
 		goto done;
 	}
 
@@ -1265,7 +1282,7 @@ static enum textil_ext_executor_status execute_preflight_slice(
 		strbuf_addf(err,
 			_("textil-ext: invalid response from endpoint '%s'"),
 			endpoint);
-		status = TEXTIL_EXT_EXECUTOR_ERROR;
+		status = TEXTIL_EXT_EXECUTOR_INVALID;
 		goto done;
 	}
 
@@ -1755,7 +1772,7 @@ static int queue_deferred_fence(const struct string_list *fence_oids,
 }
 
 /* Convert one item, queue its sealed OID if deferred, read the pointer. */
-static int run_single_checkin(struct textil_ext_takeover_batch *batch,
+static enum textil_ext_executor_status run_single_checkin(struct textil_ext_takeover_batch *batch,
 			      struct textil_ext_takeover_item *item,
 			      const char *repo_root, const char *path,
 			      struct strbuf *dst, struct strbuf *err)
@@ -1765,7 +1782,7 @@ static int run_single_checkin(struct textil_ext_takeover_batch *batch,
 	enum textil_ext_executor_status st;
 	const char *hex;
 	size_t len;
-	int ret = -1;
+	enum textil_ext_executor_status ret = TEXTIL_EXT_EXECUTOR_ERROR;
 
 	batch->phase = TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT;
 	batch->operation = "checkin";
@@ -1777,21 +1794,20 @@ static int run_single_checkin(struct textil_ext_takeover_batch *batch,
 	st = textil_ext_execute_checkin_convert_batch(batch, &pointers,
 						      &fence_oids, err);
 	if (st != TEXTIL_EXT_EXECUTOR_OK) {
-		error("textil-ext: checkin_convert failed for '%s': %s",
-		      path, err->buf);
+		ret = st;
 		goto done;
 	}
 	if (fence_oids.nr && !batch->deferred_durability) {
 		strbuf_addstr(err, _("textil-ext: fence_oid in an immediate checkin reply"));
+		ret = TEXTIL_EXT_EXECUTOR_INVALID;
 		error("textil-ext: checkin_convert failed for '%s': %s",
 		      path, err->buf);
 		goto done;
 	}
-	if (queue_deferred_fence(&fence_oids, err)) {
-		error("textil-ext: checkin_convert failed for '%s': %s",
-		      path, err->buf);
-		goto done;
-	}
+	/* A fence failure concerns already sealed objects, not this conversion.
+	 * It must never inherit the compare-only unavailability permission. */
+	if (queue_deferred_fence(&fence_oids, err))
+		die(_("textil-ext: early durability fence failed: %s"), err->buf);
 
 	/* The parser validated the inline hex pointer, including empty input. */
 	hex = pointers.items[0].string;
@@ -1800,7 +1816,7 @@ static int run_single_checkin(struct textil_ext_takeover_batch *batch,
 	strbuf_grow(dst, len);
 	hex_to_bytes((unsigned char *)dst->buf, hex, len);
 	strbuf_setlen(dst, len);
-	ret = 0;
+	ret = TEXTIL_EXT_EXECUTOR_OK;
 done:
 	string_list_clear(&pointers, 0);
 	string_list_clear(&fence_oids, 0);
@@ -1809,7 +1825,7 @@ done:
 
 /* --- Checkin convert one-to-buf helper ---------------------------------- */
 
-int textil_ext_checkin_convert_one_to_buf(
+enum textil_ext_executor_status textil_ext_checkin_convert_one_to_buf(
 	const char *path,
 	const char *src, size_t src_len,
 	const char *attr_filter,
@@ -1821,7 +1837,8 @@ int textil_ext_checkin_convert_one_to_buf(
 	struct textil_ext_takeover_batch batch;
 	struct textil_ext_takeover_item item;
 	struct strbuf tmp_path = STRBUF_INIT;
-	int tmp_fd, ret = -1;
+	int tmp_fd;
+	enum textil_ext_executor_status ret;
 
 	memset(&batch, 0, sizeof(batch));
 	memset(&item, 0, sizeof(item));
@@ -1838,14 +1855,14 @@ int textil_ext_checkin_convert_one_to_buf(
 	if (tmp_fd < 0) {
 		error_errno("textil-ext: cannot create temp file for checkin");
 		strbuf_release(&tmp_path);
-		return -1;
+		return TEXTIL_EXT_EXECUTOR_ERROR;
 	}
 	if (write_in_full(tmp_fd, src, src_len) < 0) {
 		error_errno("textil-ext: write to temp file failed");
 		close(tmp_fd);
 		unlink(tmp_path.buf);
 		strbuf_release(&tmp_path);
-		return -1;
+		return TEXTIL_EXT_EXECUTOR_ERROR;
 	}
 	close(tmp_fd);
 
@@ -1870,7 +1887,7 @@ int textil_ext_checkin_convert_one_to_buf(
 
 /* --- Checkin convert fd-to-buf helper (streaming, no full-memory copy) --- */
 
-int textil_ext_checkin_convert_fd_to_buf(
+enum textil_ext_executor_status textil_ext_checkin_convert_fd_to_buf(
 	const char *path,
 	int input_fd,
 	const char *input_path,
@@ -1883,7 +1900,8 @@ int textil_ext_checkin_convert_fd_to_buf(
 	struct textil_ext_takeover_batch batch;
 	struct textil_ext_takeover_item item;
 	struct strbuf tmp_path = STRBUF_INIT;
-	int tmp_fd = -1, ret = -1;
+	int tmp_fd = -1;
+	enum textil_ext_executor_status ret;
 	int remove_input_path = 0;
 
 	memset(&batch, 0, sizeof(batch));
@@ -1904,7 +1922,7 @@ int textil_ext_checkin_convert_fd_to_buf(
 			error_errno("textil-ext: cannot create "
 				    "checkin temp file");
 			strbuf_release(&tmp_path);
-			return -1;
+			return TEXTIL_EXT_EXECUTOR_ERROR;
 		}
 		remove_input_path = 1;
 		if (copy_fd(input_fd, tmp_fd)) {
@@ -1912,7 +1930,7 @@ int textil_ext_checkin_convert_fd_to_buf(
 			close(tmp_fd);
 			unlink(tmp_path.buf);
 			strbuf_release(&tmp_path);
-			return -1;
+			return TEXTIL_EXT_EXECUTOR_ERROR;
 		}
 		close(tmp_fd);
 	}

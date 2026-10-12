@@ -1032,10 +1032,19 @@ static void generate_submodule_summary(struct summary_cb *info,
 		} else if (S_ISLNK(p->mod_dst) || S_ISREG(p->mod_dst)) {
 			struct stat st;
 			int fd = open(p->sm_path, O_RDONLY);
+			int ret = -1;
 
-			if (fd < 0 || fstat(fd, &st) < 0 ||
-			    index_fd(the_repository->index, &p->oid_dst, fd, &st, OBJ_BLOB,
-				     p->sm_path, 0))
+			if (fd >= 0) {
+				if (fstat(fd, &st) < 0)
+					close(fd);
+				else
+					ret = index_fd(the_repository->index, &p->oid_dst,
+						       fd, &st, OBJ_BLOB, p->sm_path,
+						       INDEX_TEXTIL_COMPARE_ONLY);
+			}
+			if (ret == INDEX_TEXTIL_UNKNOWN)
+				return; /* Omit only an unavailable comparison. */
+			if (ret)
 				error(_("couldn't hash object from '%s'"), p->sm_path);
 		} else {
 			/* for a submodule removal (mode:0000000), don't warn */

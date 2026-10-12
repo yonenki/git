@@ -17,8 +17,8 @@
  *
  * Env contract:
  *   TEXTIL_GIT_EXT_ENDPOINT - path to the IPC socket/pipe.
- *     Must be set when a takeover rule matches.
- *     Unset/empty is a fatal error (not a silent fallback).
+ *     Required for takeover, except explicitly compare-only checkin callers
+ *     which may treat ENDPOINT_UNSET / CONNECT_FAILED as unknown content.
  */
 
 #define TEXTIL_GIT_EXT_ENDPOINT "TEXTIL_GIT_EXT_ENDPOINT"
@@ -89,6 +89,9 @@ enum textil_ext_executor_status {
 	TEXTIL_EXT_EXECUTOR_REJECTED = 1,
 	TEXTIL_EXT_EXECUTOR_NOT_IMPLEMENTED = 2,
 	TEXTIL_EXT_EXECUTOR_ERROR = 3,
+	TEXTIL_EXT_EXECUTOR_ENDPOINT_UNSET,
+	TEXTIL_EXT_EXECUTOR_CONNECT_FAILED,
+	TEXTIL_EXT_EXECUTOR_INVALID,
 };
 
 /* --- Executor API ------------------------------------------------------- */
@@ -223,9 +226,9 @@ int textil_ext_flush_deferred_durability(struct strbuf *err);
  * checkin_convert batch, calls the executor, and decodes the returned
  * inline pointer into dst.
  *
- * Returns 0 on success, -1 on any failure (error() already emitted).
+ * Returns the executor status; local I/O failures return ERROR.
  */
-int textil_ext_checkin_convert_one_to_buf(
+enum textil_ext_executor_status textil_ext_checkin_convert_one_to_buf(
 	const char *path,
 	const char *src, size_t src_len,
 	const char *attr_filter,
@@ -242,9 +245,9 @@ int textil_ext_checkin_convert_one_to_buf(
  * 1-item checkin_convert batch, calls the executor, and decodes the returned
  * inline pointer into dst.
  *
- * Returns 0 on success, -1 on any failure (error() already emitted).
+ * Returns the executor status; local I/O failures return ERROR.
  */
-int textil_ext_checkin_convert_fd_to_buf(
+enum textil_ext_executor_status textil_ext_checkin_convert_fd_to_buf(
 	const char *path,
 	int input_fd,
 	const char *input_path,

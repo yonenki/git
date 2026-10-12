@@ -89,6 +89,8 @@ void diff_queued_diff_prefetch(void *repository);
 struct diff_populate_filespec_options {
 	unsigned check_size_only : 1;
 	unsigned check_binary : 1;
+	/* Only stat-unmatch filtering: unknown retains the changed pair. */
+	unsigned textil_compare_only : 1;
 
 	/*
 	 * If an object is missing, diff_populate_filespec() will invoke this

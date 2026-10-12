@@ -32,12 +32,15 @@
 
 static int get_conv_flags(unsigned flags)
 {
+	int conv_flags = flags & INDEX_TEXTIL_COMPARE_ONLY ?
+		CONV_TEXTIL_COMPARE_ONLY : 0;
+
 	if (flags & INDEX_RENORMALIZE)
-		return CONV_EOL_RENORMALIZE;
+		return conv_flags | CONV_EOL_RENORMALIZE;
 	else if (flags & INDEX_WRITE_OBJECT)
-		return global_conv_flags_eol | CONV_WRITE_OBJECT;
+		return conv_flags | global_conv_flags_eol | CONV_WRITE_OBJECT;
 	else
-		return 0;
+		return conv_flags;
 }
 
 static void fill_loose_path(struct strbuf *buf,
@@ -998,8 +1001,13 @@ static int index_mem(struct index_state *istate,
 	 * Convert blobs to git internal format
 	 */
 	if ((type == OBJ_BLOB) && path) {
-		if (convert_to_git(istate, path, buf, size, &nbuf,
-				   get_conv_flags(flags))) {
+		int converted = convert_to_git(istate, path, buf, size, &nbuf,
+					       get_conv_flags(flags));
+		if (converted < 0) {
+			strbuf_release(&nbuf);
+			return converted == CONV_TEXTIL_UNKNOWN ? INDEX_TEXTIL_UNKNOWN : converted;
+		}
+		if (converted) {
 			buf = nbuf.buf;
 			size = nbuf.len;
 		}
@@ -1038,8 +1046,12 @@ static int index_stream_convert_blob(struct index_state *istate,
 	assert(path);
 	ASSERT(would_convert_to_git_filter_fd(istate, path));
 
-	convert_to_git_filter_fd(istate, path, fd, &sbuf,
-				 get_conv_flags(flags), input_path);
+	ret = convert_to_git_filter_fd(istate, path, fd, &sbuf,
+				       get_conv_flags(flags), input_path);
+	if (ret) {
+		strbuf_release(&sbuf);
+		return ret == CONV_TEXTIL_UNKNOWN ? INDEX_TEXTIL_UNKNOWN : ret;
+	}
 
 	if (write_object)
 		ret = odb_write_object(istate->repo->objects, sbuf.buf, sbuf.len, OBJ_BLOB,
@@ -1487,8 +1499,11 @@ int index_path(struct index_state *istate, struct object_id *oid,
 		fd = open(path, O_RDONLY);
 		if (fd < 0)
 			return error_errno("open(\"%s\")", path);
-		if (index_fd_with_input_path(istate, oid, fd, st, OBJ_BLOB,
-					     path, flags, path) < 0)
+		rc = index_fd_with_input_path(istate, oid, fd, st, OBJ_BLOB,
+					     path, flags, path);
+		if (rc == INDEX_TEXTIL_UNKNOWN)
+			return rc;
+		if (rc < 0)
 			return error(_("%s: failed to insert into database"),
 				     path);
 		break;
