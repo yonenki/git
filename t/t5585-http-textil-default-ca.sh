@@ -9,6 +9,8 @@ the GIT_SSL_* environment. Every value that is set is used.'
 . ./test-lib.sh
 
 LIB_HTTPD_SSL=1
+# The SSL server is also an HTTPS (CONNECT) proxy for the proxy CA cases.
+LIB_HTTPD_PROXY=1
 . "$TEST_DIRECTORY"/lib-httpd.sh
 start_httpd
 
@@ -81,6 +83,23 @@ test_expect_success 'http.sslCAPath alone suppresses the default CAINFO' '
 test_expect_success 'empty default values are ignored' '
 	test_must_fail env TEXTIL_GIT_DEFAULT_SSL_CAINFO= \
 		TEXTIL_GIT_DEFAULT_SSL_CAPATH= git ls-remote "$URL"
+'
+
+PROXY="https://proxuser:proxpass@$HTTPD_DEST"
+
+test_expect_success 'HTTPS proxy is verified with the default CAINFO alone' '
+	test_must_fail git -c http.proxy="$PROXY" ls-remote "$URL" &&
+	TEXTIL_GIT_DEFAULT_SSL_CAINFO="$PWD/server-ca.pem" \
+		git -c http.proxy="$PROXY" ls-remote "$URL"
+'
+
+test_expect_success 'http.proxySSLCAInfo takes precedence over the default for the proxy' '
+	test_must_fail env TEXTIL_GIT_DEFAULT_SSL_CAINFO="$PWD/server-ca.pem" \
+		git -c http.proxy="$PROXY" \
+		-c http.proxySSLCAInfo="$PWD/other-ca.pem" ls-remote "$URL" &&
+	TEXTIL_GIT_DEFAULT_SSL_CAINFO="$PWD/other-ca.pem" \
+		git -c http.proxy="$PROXY" -c http.sslCAInfo="$PWD/server-ca.pem" \
+		-c http.proxySSLCAInfo="$PWD/server-ca.pem" ls-remote "$URL"
 '
 
 test_done
