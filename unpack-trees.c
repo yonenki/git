@@ -558,7 +558,6 @@ static int check_updates(struct unpack_trees_options *o,
 			if (ce->ce_flags & CE_WT_REMOVE)
 				BUG("both update and delete flags are set on %s",
 				    ce->name);
-			ce->ce_flags &= ~CE_UPDATE;
 			errs |= checkout_entry(ce, &state, NULL, NULL);
 
 			if (last_pc_queue_size == pc_queue_size())
@@ -570,6 +569,21 @@ static int check_updates(struct unpack_trees_options *o,
 					      progress, &cnt);
 	stop_progress(&progress);
 	errs |= finish_delayed_checkout(&state, o->verbose_update);
+	/*
+	 * Keep CE_UPDATE until all native checkout work has settled, including
+	 * parallel workers and delayed filters. Successful regular-file writes
+	 * refresh their stat and set CE_UPTODATE; only failed replacements must
+	 * lose inherited projection ownership so status can see the old bytes.
+	 */
+	for (i = 0; i < index->cache_nr; i++) {
+		struct cache_entry *ce = index->cache[i];
+
+		if (must_checkout(ce)) {
+			if (S_ISREG(ce->ce_mode) && !ce_uptodate(ce))
+				ce->ce_flags &= ~CE_SKIP_WORKTREE;
+			ce->ce_flags &= ~CE_UPDATE;
+		}
+	}
 	git_attr_set_direction(GIT_ATTR_CHECKIN);
 
 	/* checkout wave 完了後にキャッシュを解放する */
