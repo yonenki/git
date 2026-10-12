@@ -558,7 +558,13 @@ static int check_updates(struct unpack_trees_options *o,
 			if (ce->ce_flags & CE_WT_REMOVE)
 				BUG("both update and delete flags are set on %s",
 				    ce->name);
-			ce->ce_flags &= ~CE_UPDATE;
+			/*
+			 * This entry is being materialized, not projected or
+			 * excluded by sparse checkout. Do not carry the old
+			 * content's skip-worktree bit into the replacement:
+			 * an unlink/write failure must remain visible to status.
+			 */
+			ce->ce_flags &= ~(CE_UPDATE | CE_SKIP_WORKTREE);
 			errs |= checkout_entry(ce, &state, NULL, NULL);
 
 			if (last_pc_queue_size == pc_queue_size())

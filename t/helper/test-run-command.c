@@ -18,6 +18,7 @@
 #include "string-list.h"
 #include "thread-utils.h"
 #include "wildmatch.h"
+#include "wrapper.h"
 
 static int number_callbacks;
 static int parallel_next(struct child_process *cp,
@@ -439,6 +440,27 @@ static int inherit_handle_child(void)
 	return 0;
 }
 
+/* Keep a mapping alive while a child attempts a legacy Windows unlink. */
+static int run_command_mapped(int argc, const char **argv)
+{
+	struct child_process proc = CHILD_PROCESS_INIT;
+	struct stat st;
+	void *mapping;
+	int fd, ret;
+
+	if (argc < 4)
+		die("usage: test-tool run-command mapped <file> <command> [<args>...]");
+	fd = xopen(argv[2], O_RDONLY);
+	if (fstat(fd, &st) || !st.st_size)
+		die_errno("could not stat nonempty file '%s'", argv[2]);
+	mapping = xmmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	strvec_pushv(&proc.args, argv + 3);
+	ret = run_command(&proc);
+	munmap(mapping, st.st_size);
+	return ret;
+}
+
 int cmd__run_command(int argc, const char **argv)
 {
 	struct child_process proc = CHILD_PROCESS_INIT;
@@ -454,6 +476,8 @@ int cmd__run_command(int argc, const char **argv)
 		return inherit_handle(argv[0]);
 	if (!strcmp(argv[1], "inherited-handle-child"))
 		return inherit_handle_child();
+	if (argc > 1 && !strcmp(argv[1], "mapped"))
+		return run_command_mapped(argc, argv);
 
 	if (argc >= 2 && !strcmp(argv[1], "quote-stress-test"))
 		return !!quote_stress_test(argc - 1, argv + 1);
