@@ -1155,6 +1155,24 @@ static int get_curl_http_version_opt(const char *version_string, long *opt)
 	return -1; /* not found */
 }
 
+/*
+ * Textil runtime default CA, the lowest-priority CA source. It is applied
+ * only when neither a CA file nor a CA directory was determined from the
+ * config or the GIT_SSL_* environment (the caller checks this). Every
+ * non-empty value is used, like Git passes CAINFO and CAPATH independently.
+ */
+static void set_textil_default_ca(CURL *result, CURLoption cainfo_option,
+				  CURLoption capath_option)
+{
+	const char *cainfo = getenv("TEXTIL_GIT_DEFAULT_SSL_CAINFO");
+	const char *capath = getenv("TEXTIL_GIT_DEFAULT_SSL_CAPATH");
+
+	if (cainfo && *cainfo)
+		curl_easy_setopt(result, cainfo_option, cainfo);
+	if (capath && *capath)
+		curl_easy_setopt(result, capath_option, capath);
+}
+
 static CURL *get_curl_handle(void)
 {
 	CURL *result = curl_easy_init();
@@ -1258,11 +1276,17 @@ static CURL *get_curl_handle(void)
 	    !http_schannel_use_ssl_cainfo) {
 		curl_easy_setopt(result, CURLOPT_CAINFO, NULL);
 		curl_easy_setopt(result, CURLOPT_PROXY_CAINFO, NULL);
-	} else if (ssl_cainfo != NULL || http_proxy_ssl_ca_info != NULL) {
+	} else {
 		if (ssl_cainfo)
 			curl_easy_setopt(result, CURLOPT_CAINFO, ssl_cainfo);
+		else if (!ssl_capath)
+			set_textil_default_ca(result, CURLOPT_CAINFO,
+					      CURLOPT_CAPATH);
 		if (http_proxy_ssl_ca_info)
 			curl_easy_setopt(result, CURLOPT_PROXY_CAINFO, http_proxy_ssl_ca_info);
+		else
+			set_textil_default_ca(result, CURLOPT_PROXY_CAINFO,
+					      CURLOPT_PROXY_CAPATH);
 	}
 
 	if (curl_low_speed_limit > 0 && curl_low_speed_time > 0) {
