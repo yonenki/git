@@ -388,11 +388,13 @@ static int check_roundtrip(const char *enc_name)
 
 static const char *default_encoding = "UTF-8";
 
-static int textil_ext_checkin_endpoint_unavailable(const struct strbuf *err)
+static int textil_ext_checkin_may_be_unknown(
+	int conv_flags, enum textil_ext_executor_status status)
 {
-	return err->len &&
-		(strstr(err->buf, "TEXTIL_GIT_EXT_ENDPOINT is not set") ||
-		 strstr(err->buf, "failed to connect to endpoint"));
+	return (conv_flags & CONV_TEXTIL_COMPARE_ONLY) &&
+		!(conv_flags & CONV_WRITE_OBJECT) &&
+		(status == TEXTIL_EXT_EXECUTOR_ENDPOINT_UNSET ||
+		 status == TEXTIL_EXT_EXECUTOR_CONNECT_FAILED);
 }
 
 static int encode_to_git(const char *path, const char *src, size_t src_len,
@@ -1477,8 +1479,8 @@ int convert_to_git(struct index_state *istate,
 	 * instead of the blob only when the probe says "no conversion",
 	 * and then each file would be converted through the controller.
 	 *
-	 * The real conversion covers both object-write (CONV_WRITE_OBJECT)
-	 * and canonicalization for status/diff (global_conv_flags_eol).
+	 * Real conversion is fail-closed unless the caller explicitly permits
+	 * unknown content for a comparison that cannot affect stored objects.
 	 */
 	if (!src && !dst) {
 		struct textil_ext_eval_result ext_result;
@@ -1496,25 +1498,18 @@ int convert_to_git(struct index_state *istate,
 		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
 			struct strbuf main_wt = STRBUF_INIT;
 			struct strbuf cc_err = STRBUF_INIT;
+			enum textil_ext_executor_status status;
 			textil_ext_resolve_worktree_root(&main_wt);
-			if (textil_ext_checkin_convert_one_to_buf(
-				    path, src, len,
-				    conv_attrs_filter_name(&ca),
-				    &ext_result,
-				    main_wt.buf,
-				    dst, &cc_err)) {
-				int fail_open = !(conv_flags & CONV_WRITE_OBJECT) &&
-					textil_ext_checkin_endpoint_unavailable(&cc_err);
-				strbuf_release(&main_wt);
-				if (!fail_open)
-					die(_("textil-ext: checkin_convert failed for '%s': %s"),
-					    path, cc_err.buf);
-				strbuf_release(&cc_err);
-			} else {
-				strbuf_release(&main_wt);
-				strbuf_release(&cc_err);
-				return 1;
-			}
+			status = textil_ext_checkin_convert_one_to_buf(
+				path, src, len, conv_attrs_filter_name(&ca),
+				&ext_result, main_wt.buf, dst, &cc_err);
+			strbuf_release(&main_wt);
+			if (status != TEXTIL_EXT_EXECUTOR_OK &&
+			    !textil_ext_checkin_may_be_unknown(conv_flags, status))
+				die(_("textil-ext: checkin_convert failed for '%s': %s"),
+				    path, cc_err.buf);
+			strbuf_release(&cc_err);
+			return status == TEXTIL_EXT_EXECUTOR_OK ? 1 : CONV_TEXTIL_UNKNOWN;
 		}
 	}
 
@@ -1543,7 +1538,7 @@ int convert_to_git(struct index_state *istate,
 	return ret | ident_to_git(src, len, dst, ca.ident);
 }
 
-void convert_to_git_filter_fd(struct index_state *istate,
+int convert_to_git_filter_fd(struct index_state *istate,
 			      const char *path, int fd, struct strbuf *dst,
 			      int conv_flags, const char *input_path)
 {
@@ -1568,33 +1563,18 @@ void convert_to_git_filter_fd(struct index_state *istate,
 		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
 			struct strbuf main_wt = STRBUF_INIT;
 			struct strbuf cc_err = STRBUF_INIT;
+			enum textil_ext_executor_status status;
 			textil_ext_resolve_worktree_root(&main_wt);
-			if (textil_ext_checkin_convert_fd_to_buf(
-				    path, fd, input_path,
-				    conv_attrs_filter_name(&ca),
-				    &ext_result,
-				    main_wt.buf,
-				    dst, &cc_err)) {
-				int fail_open = !(conv_flags & CONV_WRITE_OBJECT) &&
-					textil_ext_checkin_endpoint_unavailable(&cc_err);
-				strbuf_release(&main_wt);
-				if (!fail_open)
-					die(_("textil-ext: checkin_convert failed for '%s': %s"),
-					    path, cc_err.buf);
-				strbuf_release(&cc_err);
-				if (!ca.drv) {
-					/* An LFS pointer is never empty. Do not
-					 * Do not reread it just to report it
-					 * dirty while the controller is down.
-					 */
-					strbuf_reset(dst);
-					return;
-				}
-			} else {
-				strbuf_release(&main_wt);
-				strbuf_release(&cc_err);
-				return;
-			}
+			status = textil_ext_checkin_convert_fd_to_buf(
+				path, fd, input_path, conv_attrs_filter_name(&ca),
+				&ext_result, main_wt.buf, dst, &cc_err);
+			strbuf_release(&main_wt);
+			if (status != TEXTIL_EXT_EXECUTOR_OK &&
+			    !textil_ext_checkin_may_be_unknown(conv_flags, status))
+				die(_("textil-ext: checkin_convert failed for '%s': %s"),
+				    path, cc_err.buf);
+			strbuf_release(&cc_err);
+			return status == TEXTIL_EXT_EXECUTOR_OK ? 0 : CONV_TEXTIL_UNKNOWN;
 		}
 	}
 
@@ -1606,6 +1586,7 @@ void convert_to_git_filter_fd(struct index_state *istate,
 	encode_to_git(path, dst->buf, dst->len, dst, ca.working_tree_encoding, conv_flags);
 	crlf_to_git(istate, path, dst->buf, dst->len, dst, ca.crlf_action, conv_flags);
 	ident_to_git(dst->buf, dst->len, dst, ca.ident);
+	return 0;
 }
 
 static int convert_to_working_tree_ca_internal(const struct conv_attrs *ca,

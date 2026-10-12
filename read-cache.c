@@ -241,7 +241,7 @@ static int ce_compare_data(struct index_state *istate,
 	if (fd >= 0) {
 		struct object_id oid;
 		if (!index_fd_with_input_path(istate, &oid, fd, st, OBJ_BLOB,
-					  ce->name, 0, ce->name))
+					  ce->name, INDEX_TEXTIL_COMPARE_ONLY, ce->name))
 			match = !oideq(&oid, &ce->oid);
 		/* index_fd() closed the file descriptor already */
 	}

@@ -131,7 +131,8 @@ static int use_wt_file(struct repository *repo,
 		int fd = open(buf.buf, O_RDONLY);
 
 		if (fd >= 0 &&
-		    !index_fd(repo->index, &wt_oid, fd, &st, OBJ_BLOB, name, 0)) {
+		    !index_fd(repo->index, &wt_oid, fd, &st, OBJ_BLOB, name,
+			      INDEX_TEXTIL_COMPARE_ONLY)) {
 			if (is_null_oid(oid)) {
 				oidcpy(oid, &wt_oid);
 				use = 1;

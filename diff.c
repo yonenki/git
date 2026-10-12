@@ -4509,6 +4509,9 @@ int diff_populate_filespec(struct repository *r,
 	if (conv_flags & CONV_EOL_RNDTRP_DIE)
 		conv_flags = CONV_EOL_RNDTRP_WARN;
 
+	if (options && options->textil_compare_only)
+		conv_flags |= CONV_TEXTIL_COMPARE_ONLY;
+
 	if (!DIFF_FILE_VALID(s))
 		die("internal error: asking to populate invalid file.");
 	if (S_ISDIR(s->mode))
@@ -4602,7 +4605,15 @@ int diff_populate_filespec(struct repository *r,
 		/*
 		 * Convert from working tree format to canonical git format
 		 */
-		if (convert_to_git(r->index, s->path, s->data, s->size, &buf, conv_flags)) {
+		int converted = convert_to_git(r->index, s->path, s->data, s->size,
+					       &buf, conv_flags);
+		if (converted < 0) {
+			diff_free_filespec_blob(s);
+			s->size = 0;
+			strbuf_release(&buf);
+			return -1;
+		}
+		if (converted) {
 			size_t size = 0;
 			diff_free_filespec_blob(s);
 			s->data = strbuf_detach(&buf, &size);
@@ -5000,19 +5011,25 @@ static void run_diff_cmd(const struct external_diff *pgm,
 	}
 }
 
-static void diff_fill_oid_info(struct diff_filespec *one, struct index_state *istate)
+static void diff_fill_oid_info(struct diff_filespec *one, struct index_state *istate,
+			       unsigned flags)
 {
 	if (DIFF_FILE_VALID(one)) {
 		if (!one->oid_valid) {
 			struct stat st;
+			int ret;
 			if (one->is_stdin) {
 				oidclr(&one->oid, the_repository->hash_algo);
 				return;
 			}
 			if (lstat(one->path, &st) < 0)
 				die_errno("stat '%s'", one->path);
-			if (index_path(istate, &one->oid, one->path, &st, 0))
-				die("cannot hash %s", one->path);
+			ret = index_path(istate, &one->oid, one->path, &st, flags);
+			if (ret) {
+				if (ret != INDEX_TEXTIL_UNKNOWN)
+					die("cannot hash %s", one->path);
+				oidclr(&one->oid, the_repository->hash_algo);
+			}
 		}
 	}
 	else
@@ -5059,8 +5076,8 @@ static void run_diff(struct diff_filepair *p, struct diff_options *o)
 		return;
 	}
 
-	diff_fill_oid_info(one, o->repo->index);
-	diff_fill_oid_info(two, o->repo->index);
+	diff_fill_oid_info(one, o->repo->index, INDEX_TEXTIL_COMPARE_ONLY);
+	diff_fill_oid_info(two, o->repo->index, INDEX_TEXTIL_COMPARE_ONLY);
 
 	if (!pgm &&
 	    DIFF_FILE_VALID(one) && DIFF_FILE_VALID(two) &&
@@ -5115,8 +5132,8 @@ static void run_diffstat(struct diff_filepair *p, struct diff_options *o,
 	if (o->prefix_length)
 		strip_prefix(o->prefix_length, &name, &other);
 
-	diff_fill_oid_info(p->one, o->repo->index);
-	diff_fill_oid_info(p->two, o->repo->index);
+	diff_fill_oid_info(p->one, o->repo->index, INDEX_TEXTIL_COMPARE_ONLY);
+	diff_fill_oid_info(p->two, o->repo->index, INDEX_TEXTIL_COMPARE_ONLY);
 
 	builtin_diffstat(name, other, p->one, p->two,
 			 diffstat, o, p);
@@ -5140,8 +5157,8 @@ static void run_checkdiff(struct diff_filepair *p, struct diff_options *o)
 	if (o->prefix_length)
 		strip_prefix(o->prefix_length, &name, &other);
 
-	diff_fill_oid_info(p->one, o->repo->index);
-	diff_fill_oid_info(p->two, o->repo->index);
+	diff_fill_oid_info(p->one, o->repo->index, INDEX_TEXTIL_COMPARE_ONLY);
+	diff_fill_oid_info(p->two, o->repo->index, INDEX_TEXTIL_COMPARE_ONLY);
 
 	builtin_checkdiff(name, other, attr_path, p->one, p->two, o);
 }
@@ -6938,8 +6955,8 @@ static int diff_get_patch_id(struct diff_options *options, struct object_id *oid
 		if (DIFF_PAIR_UNMERGED(p))
 			continue;
 
-		diff_fill_oid_info(p->one, options->repo->index);
-		diff_fill_oid_info(p->two, options->repo->index);
+		diff_fill_oid_info(p->one, options->repo->index, 0);
+		diff_fill_oid_info(p->two, options->repo->index, 0);
 
 		len1 = remove_space(p->one->path, strlen(p->one->path));
 		len2 = remove_space(p->two->path, strlen(p->two->path));
@@ -7358,11 +7375,15 @@ static int diff_filespec_is_identical(struct repository *r,
 				      struct diff_filespec *one,
 				      struct diff_filespec *two)
 {
+	struct diff_populate_filespec_options options = {
+		.textil_compare_only = 1,
+	};
+
 	if (S_ISGITLINK(one->mode))
 		return 0;
-	if (diff_populate_filespec(r, one, NULL))
+	if (diff_populate_filespec(r, one, &options))
 		return 0;
-	if (diff_populate_filespec(r, two, NULL))
+	if (diff_populate_filespec(r, two, &options))
 		return 0;
 	return !memcmp(one->data, two->data, one->size);
 }
@@ -7372,6 +7393,7 @@ static int diff_filespec_check_stat_unmatch(struct repository *r,
 {
 	struct diff_populate_filespec_options dpf_options = {
 		.check_size_only = 1,
+		.textil_compare_only = 1,
 		.missing_object_cb = diff_queued_diff_prefetch,
 		.missing_object_data = r,
 	};
