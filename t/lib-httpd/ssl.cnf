@@ -4,5 +4,9 @@ RANDFILE                = $ENV::RANDFILE_PATH
 default_bits            = 2048
 distinguished_name      = req_distinguished_name
 prompt                  = no
+# Verifying clients match an IP host against subjectAltName, not commonName.
+x509_extensions         = req_ext
 [ req_distinguished_name ]
 commonName              = 127.0.0.1
+[ req_ext ]
+subjectAltName          = IP:127.0.0.1
