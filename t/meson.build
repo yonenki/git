@@ -974,6 +974,7 @@ integration_tests = [
   't7900-maintenance.sh',
   't7912-textil-ext-source-preflight.sh',
   't7913-textil-ext-compare-only.sh',
+  't7915-textil-head-projection.sh',
   't8001-annotate.sh',
   't8002-blame.sh',
   't8003-blame-corner-cases.sh',

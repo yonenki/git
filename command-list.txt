@@ -197,6 +197,7 @@ git-svn                                 foreignscminterface
 git-switch                              mainporcelain           history
 git-symbolic-ref                        plumbingmanipulators
 git-tag                                 mainporcelain           history
+git-textil-head-projection              plumbinginterrogators
 git-unpack-file                         plumbinginterrogators
 git-unpack-objects                      plumbingmanipulators
 git-update-index                        plumbingmanipulators

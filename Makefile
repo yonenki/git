@@ -1503,6 +1503,7 @@ BUILTIN_OBJS += builtin/submodule--helper.o
 BUILTIN_OBJS += builtin/survey.o
 BUILTIN_OBJS += builtin/symbolic-ref.o
 BUILTIN_OBJS += builtin/tag.o
+BUILTIN_OBJS += builtin/textil-head-projection.o
 BUILTIN_OBJS += builtin/unpack-file.o
 BUILTIN_OBJS += builtin/unpack-objects.o
 BUILTIN_OBJS += builtin/update-index.o
