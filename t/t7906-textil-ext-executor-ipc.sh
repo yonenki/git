@@ -48,6 +48,24 @@ write_pointer () {
 	EOF
 }
 
+ADMISSION_PACKET_LOG="$TRASH_DIRECTORY/admission-packets.log"
+
+admission_git () {
+	env \
+		TEXTIL_GIT_EXT_POLICY_PATH="$POLICY_PATH" \
+		TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		GIT_TRACE_PACKET="$ADMISSION_PACKET_LOG" \
+		git -c filter.lfs.process= -c filter.lfs.smudge=cat \
+			-c filter.lfs.required=false "$@"
+}
+
+expect_admission () {
+	grep "> checkout_admission=$1\$" "$ADMISSION_PACKET_LOG" >admissions &&
+	test_line_count = "$2" admissions &&
+	! grep "> checkout_\\(two_tree\\|verified\\|overwrite\\)=" "$ADMISSION_PACKET_LOG"
+}
+
 # === Setup ===
 
 test_expect_success 'setup: create repo with lfs-tracked files' '
@@ -605,6 +623,218 @@ test_expect_success 'new-path admission: switch overwrites an ignored target wit
 			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
 			git switch target &&
 		test_cmp expect target.bin
+	)
+'
+
+test_expect_success 'setup initial admission source with a nested LFS target' '
+	git init admission-source &&
+	(
+		cd admission-source &&
+		git config filter.lfs.process "" &&
+		git config filter.lfs.clean cat &&
+		git config filter.lfs.smudge cat &&
+		git config filter.lfs.required false &&
+		echo "*.bin filter=lfs -text" >.gitattributes &&
+		mkdir nested &&
+		write_pointer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 9 >target.bin &&
+		cp target.bin nested/asset.bin &&
+		git add . &&
+		git commit -m first &&
+		git tag first &&
+		write_pointer bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 9 >target.bin &&
+		git add target.bin &&
+		git commit -m second &&
+		git tag second
+	)
+'
+
+test_expect_success 'initial forced checkout admits only positively absent targets' '
+	restart_server admitted-checkout &&
+	git clone --local --no-checkout admission-source admission-absent &&
+	rm -f "$ADMISSION_PACKET_LOG" &&
+	(
+		cd admission-absent &&
+		admission_git checkout -q -f first &&
+		test_path_is_missing target.bin &&
+		test_path_is_missing nested/asset.bin &&
+		git ls-files -t target.bin nested/asset.bin >actual &&
+		printf "S nested/asset.bin\nS target.bin\n" >expect &&
+		test_cmp expect actual &&
+		expect_admission verified_initial_absence 2 &&
+		! grep "> old_blob_oid=" "$ADMISSION_PACKET_LOG"
+	)
+'
+
+test_expect_success 'initial force separates an existing target from its absent sibling' '
+	git clone --local --no-checkout admission-source admission-existing &&
+	echo accepted-before-checkout >admission-existing/target.bin &&
+	rm -f "$ADMISSION_PACKET_LOG" &&
+	(
+		cd admission-existing &&
+		admission_git checkout -q -f first &&
+		printf "materialized-by-textil-batch\n" >expect &&
+		test_cmp expect target.bin &&
+		test_path_is_missing nested/asset.bin &&
+		git ls-files -t target.bin nested/asset.bin >actual &&
+		printf "S nested/asset.bin\nH target.bin\n" >expect &&
+		test_cmp expect actual &&
+		expect_admission materialize 1 &&
+		expect_admission verified_initial_absence 1
+	)
+'
+
+test_expect_success 'initial force directory collision materializes instead of claiming absence' '
+	git clone --local --no-checkout admission-source admission-directory &&
+	mkdir admission-directory/target.bin &&
+	echo untracked >admission-directory/target.bin/contents &&
+	rm -f "$ADMISSION_PACKET_LOG" &&
+	(
+		cd admission-directory &&
+		admission_git checkout -q -f first &&
+		printf "materialized-by-textil-batch\n" >expect &&
+		test_cmp expect target.bin &&
+		expect_admission materialize 1 &&
+		expect_admission verified_initial_absence 1
+	)
+'
+
+test_expect_success 'initial force non-directory ancestor is a collision, not absence' '
+	git clone --local --no-checkout admission-source admission-ancestor &&
+	echo ancestor-content >admission-ancestor/nested &&
+	rm -f "$ADMISSION_PACKET_LOG" &&
+	(
+		cd admission-ancestor &&
+		admission_git checkout -q -f first &&
+		printf "materialized-by-textil-batch\n" >expect &&
+		test_cmp expect nested/asset.bin &&
+		test_path_is_missing target.bin &&
+		expect_admission materialize 1 &&
+		expect_admission verified_initial_absence 1
+	)
+'
+
+test_expect_success SYMLINKS 'initial force symlink ancestor is never absence or authority over its referent' '
+	git clone --local --no-checkout admission-source admission-symlink &&
+	mkdir admission-referent &&
+	echo keep-referent >admission-referent/asset.bin &&
+	ln -s ../admission-referent admission-symlink/nested &&
+	rm -f "$ADMISSION_PACKET_LOG" &&
+	(
+		cd admission-symlink &&
+		admission_git checkout -q -f first &&
+		printf "materialized-by-textil-batch\n" >expect &&
+		test_cmp expect nested/asset.bin &&
+		echo keep-referent >expect &&
+		test_cmp expect ../admission-referent/asset.bin &&
+		expect_admission materialize 1 &&
+		expect_admission verified_initial_absence 1
+	)
+'
+
+test_expect_success POSIXPERM,SANITY 'initial absence metadata error fails before any preflight or writes' '
+	git clone --local --no-checkout admission-source admission-permission &&
+	mkdir admission-permission/nested &&
+	chmod 000 admission-permission/nested &&
+	test_when_finished "chmod 755 admission-permission/nested" &&
+	rm -f "$ADMISSION_PACKET_LOG" &&
+	(
+		cd admission-permission &&
+		test_expect_code 128 admission_git checkout -q -f first 2>err &&
+		grep "cannot stat" err &&
+		test_path_is_missing target.bin &&
+		! grep "> checkout_admission=" "$ADMISSION_PACKET_LOG"
+	)
+'
+
+test_expect_success 'ordinary two-tree checkout retains predecessor and verified admission' '
+	git clone --local --no-checkout admission-source admission-normal &&
+	git -C admission-normal -c filter.lfs.process= -c filter.lfs.smudge=cat \
+		-c filter.lfs.required=false checkout first &&
+	rm -f "$ADMISSION_PACKET_LOG" &&
+	(
+		cd admission-normal &&
+		git rev-parse first:target.bin >old &&
+		admission_git checkout second &&
+		expect_admission verified_two_tree 1 &&
+		grep "> old_blob_oid=$(cat old)\$" "$ADMISSION_PACKET_LOG" &&
+		git ls-files -t target.bin >actual &&
+		echo "S target.bin" >expect &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'ordinary dirty checkout rejects without preflight or overwriting user bytes' '
+	git clone --local --no-checkout admission-source admission-dirty &&
+	git -C admission-dirty -c filter.lfs.process= -c filter.lfs.smudge=cat \
+		-c filter.lfs.required=false checkout first &&
+	echo user-modification >admission-dirty/target.bin &&
+	rm -f "$ADMISSION_PACKET_LOG" &&
+	(
+		cd admission-dirty &&
+		test_expect_code 1 admission_git checkout second 2>err &&
+		grep "would be overwritten" err &&
+		echo user-modification >expect &&
+		test_cmp expect target.bin &&
+		test "$(git rev-parse HEAD)" = "$(git rev-parse first)" &&
+		! grep "> checkout_admission=" "$ADMISSION_PACKET_LOG"
+	)
+'
+
+test_expect_success 'force on an indexed target still materializes with its real predecessor' '
+	rm -f "$ADMISSION_PACKET_LOG" &&
+	(
+		cd admission-dirty &&
+		git rev-parse first:target.bin >old &&
+		admission_git checkout -q -f second &&
+		printf "materialized-by-textil-batch\n" >expect &&
+		test_cmp expect target.bin &&
+		expect_admission materialize 1 &&
+		grep "> old_blob_oid=$(cat old)\$" "$ADMISSION_PACKET_LOG" &&
+		! grep "> checkout_admission=verified_initial_absence\$" "$ADMISSION_PACKET_LOG"
+	)
+'
+
+test_expect_success 'initial non-force checkout keeps untracked collision rejection' '
+	git clone --local --no-checkout admission-source admission-untracked &&
+	echo untracked-user-content >admission-untracked/target.bin &&
+	rm -f "$ADMISSION_PACKET_LOG" &&
+	(
+		cd admission-untracked &&
+		test_expect_code 1 admission_git checkout first 2>err &&
+		grep "would be overwritten" err &&
+		echo untracked-user-content >expect &&
+		test_cmp expect target.bin &&
+		! grep "> checkout_admission=" "$ADMISSION_PACKET_LOG"
+	)
+'
+
+test_expect_success 'stock submodule initialization emits initial absence and preserves parent gitlink' '
+	git init admission-parent &&
+	(
+		cd admission-parent &&
+		git -c protocol.file.allow=always -c filter.lfs.process= \
+			-c filter.lfs.smudge=cat -c filter.lfs.required=false \
+			submodule add ../admission-source child &&
+		git -C child -c filter.lfs.process= -c filter.lfs.smudge=cat \
+			-c filter.lfs.required=false checkout first &&
+		git add .gitmodules child &&
+		git commit -m child
+	) &&
+	git clone --local admission-parent admission-parent-clone &&
+	rm -f "$ADMISSION_PACKET_LOG" &&
+	(
+		cd admission-parent-clone &&
+		git ls-files --stage child >parent-before &&
+		admission_git -c protocol.file.allow=always submodule update --init &&
+		git ls-files --stage child >parent-after &&
+		test_cmp parent-before parent-after &&
+		test_path_is_missing child/target.bin &&
+		test_path_is_missing child/nested/asset.bin &&
+		git -C child ls-files -t target.bin nested/asset.bin >actual &&
+		printf "S nested/asset.bin\nS target.bin\n" >expect &&
+		test_cmp expect actual &&
+		expect_admission verified_initial_absence 2 &&
+		! grep "> old_blob_oid=" "$ADMISSION_PACKET_LOG"
 	)
 '
 

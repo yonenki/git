@@ -281,8 +281,19 @@ static const char *command_for_phase(enum textil_ext_executor_phase phase)
 	BUG("unknown executor phase for command: %d", (int)phase);
 }
 
-/* Keep in sync with protocol::MAX_REQUEST_PAYLOAD_SIZE in textil-vcs. */
-#define TEXTIL_EXT_MAX_REQUEST_BYTES (8 * 1024 * 1024)
+static const char *checkout_admission_to_string(
+	enum textil_ext_checkout_admission admission)
+{
+	switch (admission) {
+	case TEXTIL_EXT_CHECKOUT_MATERIALIZE:
+		return "materialize";
+	case TEXTIL_EXT_CHECKOUT_VERIFIED_TWO_TREE:
+		return "verified_two_tree";
+	case TEXTIL_EXT_CHECKOUT_VERIFIED_INITIAL_ABSENCE:
+		return "verified_initial_absence";
+	}
+	BUG("unknown checkout admission: %d", (int)admission);
+}
 
 static int build_batch_header(
 	const struct textil_ext_takeover_batch *batch,
@@ -373,11 +384,9 @@ static int build_batch_item(
 		packet_buf_write(out, "blob_oid=%s\n", item->blob_oid);
 	if (item->old_blob_oid)
 		packet_buf_write(out, "old_blob_oid=%s\n", item->old_blob_oid);
-	if (batch->phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT) {
-		packet_buf_write(out, "checkout_two_tree=%s\n", item->two_tree_checkout ? "true" : "false");
-		packet_buf_write(out, "checkout_verified=%s\n", item->old_worktree_verified ? "true" : "false");
-		packet_buf_write(out, "checkout_overwrite=%s\n", item->overwrite_allowed ? "true" : "false");
-	}
+	if (batch->phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT)
+		packet_buf_write(out, "checkout_admission=%s\n",
+				 checkout_admission_to_string(item->checkout_admission));
 	packet_buf_write(out, "is_regular_file=%s\n", item->is_regular_file ? "true" : "false");
 	packet_buf_write(out, "strict=%s\n", item->strict ? "true" : "false");
 	for (j = 0; j < item->nr_capabilities; j++)
@@ -1179,36 +1188,70 @@ static void textil_ext_collect_takeover_batch(
 	}
 }
 
-void textil_ext_collect_preflight_takeover_batch(
+int textil_ext_collect_preflight_takeover_batch(
 	struct index_state *index,
 	const struct unpack_trees_options *options,
 	const char *operation,
 	const char *repo_root,
-	struct textil_ext_takeover_batch *batch_out)
+	struct textil_ext_takeover_batch *batch_out,
+	struct strbuf *err)
 {
 	int i;
 	struct index_state *source_index = options->src_index;
 	int two_tree = options->merge && options->fn == twoway_merge &&
 		options->internal.merge_size == 2;
+	int overwrite = options->reset != UNPACK_RESET_NONE;
+	struct strbuf absence_path = STRBUF_INIT;
+
 	textil_ext_collect_takeover_batch(index, operation, repo_root,
 					  TEXTIL_EXT_EXEC_PHASE_PREFLIGHT,
 					  batch_out);
 	for (i = 0; i < batch_out->nr_items; i++) {
 		struct textil_ext_takeover_item *item = &batch_out->items[i];
 		int pos = index_name_pos(source_index, item->path, strlen(item->path));
-		item->two_tree_checkout = two_tree;
-		item->overwrite_allowed = options->reset != UNPACK_RESET_NONE;
+
+		item->checkout_admission = TEXTIL_EXT_CHECKOUT_MATERIALIZE;
 		if (pos >= 0 && !ce_stage(source_index->cache[pos])) {
 			const struct cache_entry *old = source_index->cache[pos];
+
 			item->old_blob_oid = xstrdup(oid_to_hex(&old->oid));
-			item->old_worktree_verified = two_tree && !item->overwrite_allowed &&
-				S_ISREG(old->ce_mode) && !(old->ce_flags & CE_CONFLICTED) &&
-				!(!options->skip_sparse_checkout && ce_skip_worktree(old) &&
-				  (old->ce_flags & CE_NEW_SKIP_WORKTREE));
-		} else if (pos < 0 && two_tree && !item->overwrite_allowed) {
-			item->old_worktree_verified = item->checkout_entry->textil_worktree_absent;
+			if (two_tree && !overwrite &&
+			    S_ISREG(old->ce_mode) && !(old->ce_flags & CE_CONFLICTED) &&
+			    !(!options->skip_sparse_checkout && ce_skip_worktree(old) &&
+			      (old->ce_flags & CE_NEW_SKIP_WORKTREE)))
+				item->checkout_admission = TEXTIL_EXT_CHECKOUT_VERIFIED_TWO_TREE;
+		} else if (pos < 0) {
+			int next = -pos - 1;
+			int absent = item->checkout_entry->textil_worktree_absent;
+
+			if (two_tree && !overwrite && absent) {
+				item->checkout_admission = TEXTIL_EXT_CHECKOUT_VERIFIED_TWO_TREE;
+				continue;
+			}
+			/* A stage-only entry is still an indexed predecessor. */
+			if (!options->initial_checkout || !options->update ||
+			    options->index_only ||
+			    (next < source_index->cache_nr &&
+			     !strcmp(source_index->cache[next]->name, item->path)))
+				continue;
+			/*
+			 * Forced initial checkout skipped verify_absent(). Probe
+			 * only these selected takeover targets, before any mutation.
+			 */
+			if (!absent && options->reset == UNPACK_RESET_OVERWRITE_UNTRACKED)
+				absent = textil_verify_initial_checkout_absence(
+					item->checkout_entry, &absence_path, err);
+			if (absent < 0) {
+				strbuf_release(&absence_path);
+				return -1;
+			}
+			if (absent)
+				item->checkout_admission =
+					TEXTIL_EXT_CHECKOUT_VERIFIED_INITIAL_ABSENCE;
 		}
 	}
+	strbuf_release(&absence_path);
+	return 0;
 }
 
 void textil_ext_collect_materialize_takeover_batch(

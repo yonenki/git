@@ -234,7 +234,7 @@ static enum reply_mode parse_reply_mode(const char *s)
  * Prevents allocation bombs in the test helper.
  * 1 MiB is generous for any realistic preflight batch.
  */
-#define MAX_VALIDATE_REQUEST_SIZE (1024 * 1024)
+#define MAX_VALIDATE_REQUEST_SIZE TEXTIL_EXT_MAX_REQUEST_BYTES
 
 /* --- In-memory pkt-line reader (same as executor, local copy) ----------- */
 
@@ -340,6 +340,20 @@ static int val_equals(const char *val, size_t val_len,
 	       !memcmp(val, expected, val_len);
 }
 
+static int parse_checkout_admission(const char *val, size_t val_len,
+				    enum textil_ext_checkout_admission *admission)
+{
+	if (val_equals(val, val_len, "materialize"))
+		*admission = TEXTIL_EXT_CHECKOUT_MATERIALIZE;
+	else if (val_equals(val, val_len, "verified_two_tree"))
+		*admission = TEXTIL_EXT_CHECKOUT_VERIFIED_TWO_TREE;
+	else if (val_equals(val, val_len, "verified_initial_absence"))
+		*admission = TEXTIL_EXT_CHECKOUT_VERIFIED_INITIAL_ABSENCE;
+	else
+		return -1;
+	return 0;
+}
+
 /*
  * Structural pkt-line v1 validation of a batch request.
  *
@@ -370,6 +384,7 @@ static int validate_batch_request(const char *req, size_t req_len,
 	int nr_items = 0;
 	int in_header = 1;
 	int has_path = 0, has_rule_id = 0;
+	int has_checkout_admission = 0;
 	int command_is_preflight = 0, phase_is_preflight = 0;
 	int command_is_checkin_convert = 0, phase_is_checkin_convert = 0;
 
@@ -403,6 +418,10 @@ static int validate_batch_request(const char *req, size_t req_len,
 				if (!has_rule_id) {
 					strbuf_addstr(reason,
 						      "item missing rule_id");
+					return 0;
+				}
+				if (phase_is_preflight && !has_checkout_admission) {
+					strbuf_addstr(reason, "item missing checkout_admission");
 					return 0;
 				}
 			}
@@ -452,10 +471,15 @@ static int validate_batch_request(const char *req, size_t req_len,
 						      "item missing rule_id");
 					return 0;
 				}
+				if (phase_is_preflight && !has_checkout_admission) {
+					strbuf_addstr(reason, "item missing checkout_admission");
+					return 0;
+				}
 			}
 			nr_items++;
 			has_path = 0;
 			has_rule_id = 0;
+			has_checkout_admission = 0;
 			continue;
 		}
 
@@ -554,6 +578,20 @@ static int validate_batch_request(const char *req, size_t req_len,
 						      "non-empty");
 					return 0;
 				}
+			} else if (kv_matches(key, key_len, "checkout_admission")) {
+				enum textil_ext_checkout_admission admission;
+
+				if (!phase_is_preflight || has_checkout_admission ||
+				    parse_checkout_admission(val, val_len, &admission)) {
+					strbuf_addstr(reason, "invalid checkout_admission");
+					return 0;
+				}
+				has_checkout_admission = 1;
+			} else if (kv_matches(key, key_len, "checkout_two_tree") ||
+				   kv_matches(key, key_len, "checkout_verified") ||
+				   kv_matches(key, key_len, "checkout_overwrite")) {
+				strbuf_addstr(reason, "legacy checkout admission");
+				return 0;
 			}
 			/* Accept other item fields without validation */
 		}
@@ -1315,11 +1353,25 @@ static int app_cb(void *application_data UNUSED,
 		int in_header = 1;
 		int is_materialize = 0;
 		int has_repo_root = 0;
-		int checkout_verified = 0;
+		enum textil_ext_checkout_admission cur_admission =
+			TEXTIL_EXT_CHECKOUT_MATERIALIZE;
 		int nr_items = 0;
-		struct strbuf *item_paths = NULL;
+		struct {
+			struct strbuf path;
+			enum textil_ext_checkout_admission admission;
+		} *items = NULL;
 		int alloc_items = 0;
 		struct strbuf cur_path = STRBUF_INIT;
+		struct strbuf reason = STRBUF_INIT;
+
+		if (!validate_batch_request(request, request_len, &reason)) {
+			build_error_reply(&reply, reason.buf);
+			strbuf_release(&reason);
+			ret = reply_cb(reply_data, reply.buf, reply.len);
+			strbuf_release(&reply);
+			return ret;
+		}
+		strbuf_release(&reason);
 
 		/* First pass: detect phase and collect item paths */
 		for (;;) {
@@ -1335,15 +1387,15 @@ static int app_cb(void *application_data UNUSED,
 				break;
 			if (st == PKTLINE_MEM_DELIM) {
 				if (!in_header && cur_path.len) {
-					ALLOC_GROW(item_paths, nr_items + 1,
-						   alloc_items);
-					strbuf_init(&item_paths[nr_items], 0);
-					strbuf_addbuf(&item_paths[nr_items],
-						      &cur_path);
+					ALLOC_GROW(items, nr_items + 1, alloc_items);
+					items[nr_items].path = cur_path;
+					items[nr_items].admission = cur_admission;
+					strbuf_init(&cur_path, 0);
 					nr_items++;
 				}
 				in_header = 0;
 				strbuf_reset(&cur_path);
+				cur_admission = TEXTIL_EXT_CHECKOUT_MATERIALIZE;
 				continue;
 			}
 			if (st != PKTLINE_MEM_DATA)
@@ -1365,18 +1417,19 @@ static int app_cb(void *application_data UNUSED,
 				      &val, &val_len)) {
 				if (kv_matches(key, key_len, "path"))
 					strbuf_add(&cur_path, val, val_len);
-				else if (kv_matches(key, key_len, "checkout_verified") &&
-					 val_len == 4 && !memcmp(val, "true", 4))
-					checkout_verified = 1;
+				else if (kv_matches(key, key_len, "checkout_admission"))
+					parse_checkout_admission(val, val_len, &cur_admission);
 			}
 		}
 		if (!in_header && cur_path.len) {
-			ALLOC_GROW(item_paths, nr_items + 1, alloc_items);
-			strbuf_init(&item_paths[nr_items], 0);
-			strbuf_addbuf(&item_paths[nr_items], &cur_path);
+			ALLOC_GROW(items, nr_items + 1, alloc_items);
+			items[nr_items].path = cur_path;
+			items[nr_items].admission = cur_admission;
+			strbuf_init(&cur_path, 0);
 			nr_items++;
 		}
 		strbuf_release(&cur_path);
+		/* Admission belongs to an item, never to the whole batch. */
 
 		/* trace-log に request shape を記録する */
 		if (server_args.trace_log_path) {
@@ -1407,8 +1460,8 @@ static int app_cb(void *application_data UNUSED,
 					  "later materialize slice failed" :
 					  "later preflight slice failed");
 			for (i = 0; i < nr_items; i++)
-				strbuf_release(&item_paths[i]);
-			free(item_paths);
+				strbuf_release(&items[i].path);
+			free(items);
 			ret = reply_cb(reply_data, reply.buf, reply.len);
 			strbuf_release(&reply);
 			return ret;
@@ -1422,13 +1475,14 @@ static int app_cb(void *application_data UNUSED,
 			for (i = 0; i < nr_items; i++) {
 				packet_buf_delim(&reply);
 				packet_buf_write(&reply, "disposition=%s\n",
-					server_args.mode == REPLY_ADMITTED_CHECKOUT && checkout_verified
+					server_args.mode == REPLY_ADMITTED_CHECKOUT &&
+					items[i].admission != TEXTIL_EXT_CHECKOUT_MATERIALIZE
 						? "projected" : "materialize");
 			}
 			packet_buf_flush(&reply);
 			for (i = 0; i < nr_items; i++)
-				strbuf_release(&item_paths[i]);
-			free(item_paths);
+				strbuf_release(&items[i].path);
+			free(items);
 			ret = reply_cb(reply_data, reply.buf, reply.len);
 			strbuf_release(&reply);
 			return ret;
@@ -1451,8 +1505,8 @@ static int app_cb(void *application_data UNUSED,
 					write_in_full(tmp_fd, content,
 						      strlen(content));
 					if (server_args.mode == REPLY_ORDERED_BATCH_CHECKOUT) {
-						write_in_full(tmp_fd, item_paths[i].buf,
-							      item_paths[i].len);
+						write_in_full(tmp_fd, items[i].path.buf,
+							      items[i].path.len);
 						write_in_full(tmp_fd, "\n", 1);
 					}
 					close(tmp_fd);
@@ -1461,10 +1515,10 @@ static int app_cb(void *application_data UNUSED,
 				packet_buf_write(&reply, "src_path=%s\n",
 						 tmp_path.buf);
 				strbuf_release(&tmp_path);
-				strbuf_release(&item_paths[i]);
+				strbuf_release(&items[i].path);
 			}
 			packet_buf_flush(&reply);
-			free(item_paths);
+			free(items);
 			ret = reply_cb(reply_data, reply.buf, reply.len);
 			strbuf_release(&reply);
 			return ret;

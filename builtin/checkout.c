@@ -762,6 +762,7 @@ static int reset_tree(struct tree *tree, const struct checkout_opts *o,
 
 	memset(&opts, 0, sizeof(opts));
 	opts.head_idx = -1;
+	opts.initial_checkout = is_index_unborn(the_repository->index);
 	opts.update = worktree;
 	opts.skip_unmerged = !worktree;
 	opts.reset = o->force ? UNPACK_RESET_OVERWRITE_UNTRACKED :
