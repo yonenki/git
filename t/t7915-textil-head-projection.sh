@@ -8,6 +8,16 @@ context_of () {
 	nul_to_q <"$1" | cut -dQ -f3
 }
 
+source_of () {
+	printf "%s:%s" "$(nul_to_q <"$1" | cut -dQ -f2)" "$(context_of "$1")"
+}
+
+expect_conditional_description () {
+	git textil-head-projection --describe >unconditional &&
+	git textil-head-projection --describe --if-source-changed="$1" >conditional &&
+	test_cmp_bin unconditional conditional
+}
+
 expect_header () {
 	context=$(context_of "$1") &&
 	printf "source\000%s\000%s\000" "$(git rev-parse HEAD^{tree})" "$context"
@@ -408,6 +418,78 @@ test_expect_success PIPE 'replacement map stays frozen while the live ref change
 		! test_cmp_bin identity changed
 	)
 	}
+'
+
+test_expect_success 'conditional source reuses identity and describes changed trees in either object format' '
+	for format in sha1 sha256
+	do
+		git init --object-format="$format" "conditional-$format" &&
+		(
+			cd "conditional-$format" &&
+			echo original >asset &&
+			git add asset &&
+			git commit -m original &&
+			git textil-head-projection --identity-only >identity &&
+			source=$(source_of identity) &&
+			git textil-head-projection --describe --if-source-changed="$source" >conditional &&
+			test_cmp_bin identity conditional &&
+			echo changed >asset &&
+			git add asset &&
+			git commit -m changed &&
+			expect_conditional_description "$source" &&
+			git textil-head-projection --identity-only >changed-identity &&
+			git textil-head-projection --describe \
+				--target="$(git rev-parse HEAD)" \
+				--if-source-changed="$(source_of changed-identity)" >conditional-target &&
+			test_cmp_bin changed-identity conditional-target
+		) || return 1
+	done
+'
+
+test_expect_success 'conditional source observes policy and replacement changes at the same HEAD' '
+	setup_leaf conditional-policy &&
+	(
+		cd conditional-policy &&
+		git textil-head-projection --identity-only >identity &&
+		source=$(source_of identity) &&
+		: >.git/info/attributes &&
+		expect_conditional_description "$source" &&
+		git textil-head-projection --identity-only >identity &&
+		source=$(source_of identity) &&
+		printf "*.uasset filter=lfs lockable\n" >.git/info/attributes &&
+		expect_conditional_description "$source" &&
+		git textil-head-projection --identity-only >identity &&
+		source=$(source_of identity) &&
+		printf "*.uasset -filter -lockable\n" >global-attributes &&
+		git config core.attributesFile "$PWD/global-attributes" &&
+		expect_conditional_description "$source" &&
+		git textil-head-projection --identity-only >identity &&
+		source=$(source_of identity) &&
+		original=$(git rev-parse HEAD:asset.uasset) &&
+		replacement=$(echo replacement | git hash-object -w --stdin) &&
+		git replace "$original" "$replacement" &&
+		expect_conditional_description "$source"
+	)
+'
+
+test_expect_success 'conditional source handles unborn HEAD and rejects malformed receipts' '
+	test_create_repo conditional-unborn &&
+	(
+		cd conditional-unborn &&
+		git textil-head-projection --identity-only >identity &&
+		source=$(source_of identity) &&
+		git textil-head-projection --describe --if-source-changed="$source" >conditional &&
+		test_cmp_bin identity conditional &&
+		test_must_fail git textil-head-projection --identity-only --if-source-changed="$source" &&
+		for invalid in missing-colon :short :$(test_oid zero)z "short:$(context_of identity)" \
+			"$(test_oid zero):$(context_of identity):extra"
+		do
+			test_must_fail git textil-head-projection --describe --if-source-changed="$invalid" ||
+			return 1
+		done &&
+		printf "not-a-ref\n" >.git/HEAD &&
+		test_must_fail git --git-dir=.git textil-head-projection --describe --if-source-changed="$source"
+	)
 '
 
 test_done

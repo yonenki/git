@@ -13,7 +13,8 @@
 #include "tree.h"
 
 static const char * const textil_head_projection_usage[] = {
-	N_("git textil-head-projection (--identity-only | --describe [--target=<object-oid>])"),
+	N_("git textil-head-projection (--identity-only | --describe [--target=<object-oid>]"
+	   " [--if-source-changed=<tree>:<context>])"),
 	NULL
 };
 
@@ -100,6 +101,23 @@ static struct tree *resolved_target_tree(struct repository *repo,
 	return tree;
 }
 
+static void parse_source_hint(struct repository *repo, const char *hint,
+			      struct object_id *tree, struct object_id *context)
+{
+	const char *separator = strchr(hint, ':');
+
+	if (!separator ||
+	    (separator != hint &&
+	     ((size_t)(separator - hint) != repo->hash_algo->hexsz ||
+	      get_oid_hex_algop(hint, tree, repo->hash_algo))) ||
+	    strlen(separator + 1) != hash_algos[GIT_HASH_SHA256].hexsz ||
+	    get_oid_hex_algop(separator + 1, context, &hash_algos[GIT_HASH_SHA256]))
+		die(_("projection source must be <full-tree-oid>:<SHA-256-context> "
+		      "or :<SHA-256-context> for unborn HEAD"));
+	if (separator == hint)
+		oidclr(tree, repo->hash_algo);
+}
+
 struct projection_description {
 	struct repository *repo;
 	struct attr_check *check;
@@ -150,6 +168,8 @@ int cmd_textil_head_projection(int argc, const char **argv, const char *prefix,
 {
 	enum { MODE_UNSET, MODE_IDENTITY, MODE_DESCRIBE } mode = MODE_UNSET;
 	const char *target = NULL;
+	const char *source_hint = NULL;
+	struct object_id expected_tree, expected_context;
 	struct option options[] = {
 		OPT_CMDMODE(0, "identity-only", &mode,
 			    N_("emit only the frozen HEAD source identity"), MODE_IDENTITY),
@@ -157,6 +177,8 @@ int cmd_textil_head_projection(int argc, const char **argv, const char *prefix,
 			    N_("describe HEAD leaves using the frozen source"), MODE_DESCRIBE),
 		OPT_STRING(0, "target", &target, N_("object-oid"),
 			   N_("describe an already resolved immutable target instead of HEAD")),
+		OPT_STRING(0, "if-source-changed", &source_hint, N_("tree:context"),
+			   N_("omit leaves when the captured source equals this receipt")),
 		OPT_END()
 	};
 	struct git_hash_ctx context;
@@ -176,8 +198,10 @@ int cmd_textil_head_projection(int argc, const char **argv, const char *prefix,
 			     textil_head_projection_usage, 0);
 	if (argc || mode == MODE_UNSET)
 		usage_with_options(textil_head_projection_usage, options);
-	if (target && mode != MODE_DESCRIBE)
+	if ((target || source_hint) && mode != MODE_DESCRIBE)
 		usage_with_options(textil_head_projection_usage, options);
+	if (source_hint)
+		parse_source_hint(repo, source_hint, &expected_tree, &expected_context);
 
 	git_hash_init(&context, &hash_algos[GIT_HASH_SHA256]);
 	git_hash_update(&context, "textil-head-projection", sizeof("textil-head-projection"));
@@ -189,7 +213,9 @@ int cmd_textil_head_projection(int argc, const char **argv, const char *prefix,
 	git_hash_final_oid(&context_oid, &context);
 	printf("source%c%s%c%s%c", 0, tree ? oid_to_hex(&tree->object.oid) : "", 0,
 	       oid_to_hex(&context_oid), 0);
-	if (mode == MODE_DESCRIBE && tree)
+	if (mode == MODE_DESCRIBE && tree &&
+	    !(source_hint && oideq(&expected_tree, &tree->object.oid) &&
+	      oideq(&expected_context, &context_oid)))
 		ret = !!read_tree(repo, tree, &pathspec, describe_entry, &description);
 	if (!ret)
 		printf("end%c", 0);
