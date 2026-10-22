@@ -191,15 +191,15 @@ int cmd_textil_head_projection(int argc, const char **argv, const char *prefix,
 	};
 	int ret = 0;
 
-	/* This reader must not fetch or write a missing promisor object. */
-	fetch_if_missing = 0;
-	repo_config(repo, git_default_config, NULL);
 	argc = parse_options(argc, argv, prefix, options,
 			     textil_head_projection_usage, 0);
 	if (argc || mode == MODE_UNSET)
 		usage_with_options(textil_head_projection_usage, options);
 	if ((target || source_hint) && mode != MODE_DESCRIBE)
 		usage_with_options(textil_head_projection_usage, options);
+	/* This reader must not fetch or write a missing promisor object. */
+	repo->fetch_if_missing = 0;
+	repo_config(repo, git_default_config, NULL);
 	if (source_hint)
 		parse_source_hint(repo, source_hint, &expected_tree, &expected_context);
 

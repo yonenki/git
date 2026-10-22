@@ -45,6 +45,13 @@ expect_one_leaf () {
 	printf "end\000"
 }
 
+test_expect_success 'help does not require a repository' '
+	nongit git textil-head-projection -h >usage &&
+	test_grep "^usage: git textil-head-projection " usage &&
+	nongit git textil-head-projection --help-all >usage &&
+	test_grep "^usage: git textil-head-projection " usage
+'
+
 test_expect_success 'unborn source has no entries; malformed HEAD is not unborn' '
 	test_create_repo unborn &&
 	(

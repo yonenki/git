@@ -23,8 +23,8 @@
  *****************************************************************/
 
 struct odb_filtered_read_stream {
-	struct odb_read_stream base;
-	struct odb_read_stream *upstream;
+	struct odb_stream base;
+	struct odb_stream *upstream;
 	struct stream_filter *filter;
 	char ibuf[FILTER_BUFFER];
 	char obuf[FILTER_BUFFER];
@@ -33,14 +33,14 @@ struct odb_filtered_read_stream {
 	int input_finished;
 };
 
-static int close_istream_filtered(struct odb_read_stream *_fs)
+static int close_istream_filtered(struct odb_stream *_fs)
 {
 	struct odb_filtered_read_stream *fs = (struct odb_filtered_read_stream *)_fs;
 	free_stream_filter(fs->filter);
-	return odb_read_stream_close(fs->upstream);
+	return odb_stream_close(fs->upstream);
 }
 
-static ssize_t read_istream_filtered(struct odb_read_stream *_fs, char *buf,
+static ssize_t read_istream_filtered(struct odb_stream *_fs, char *buf,
 				     size_t sz)
 {
 	struct odb_filtered_read_stream *fs = (struct odb_filtered_read_stream *)_fs;
@@ -89,7 +89,7 @@ static ssize_t read_istream_filtered(struct odb_read_stream *_fs, char *buf,
 
 		/* refill the input from the upstream */
 		if (!fs->input_finished) {
-			fs->i_end = odb_read_stream_read(fs->upstream, fs->ibuf, FILTER_BUFFER);
+			fs->i_end = odb_stream_read(fs->upstream, fs->ibuf, FILTER_BUFFER);
 			if (fs->i_end < 0)
 				return -1;
 			if (fs->i_end)
@@ -100,8 +100,8 @@ static ssize_t read_istream_filtered(struct odb_read_stream *_fs, char *buf,
 	return filled;
 }
 
-static struct odb_read_stream *attach_stream_filter(struct odb_read_stream *st,
-						    struct stream_filter *filter)
+static struct odb_stream *attach_stream_filter(struct odb_stream *st,
+					       struct stream_filter *filter)
 {
 	struct odb_filtered_read_stream *fs;
 
@@ -180,7 +180,7 @@ void odb_inflate_reader_release(struct odb_inflate_reader *reader)
  * static helpers variables and functions for users of streaming interface
  *****************************************************************************/
 
-static int istream_source(struct odb_read_stream **out,
+static int istream_source(struct odb_stream **out,
 			  struct object_database *odb,
 			  const struct object_id *oid, unsigned flags)
 {
@@ -189,7 +189,6 @@ static int istream_source(struct odb_read_stream **out,
 
 	if (!odb_source_read_object_stream(out, odb->inmemory_objects, oid))
 		return 0;
-	odb_prepare_alternates(odb);
 	for (source = odb->sources; source; source = source->next)
 		if (!odb_source_read_object_stream(out, source, oid))
 			return 0;
@@ -213,22 +212,22 @@ static int istream_source(struct odb_read_stream **out,
  * Users of streaming interface
  ****************************************************************/
 
-int odb_read_stream_close(struct odb_read_stream *st)
+int odb_stream_close(struct odb_stream *st)
 {
 	int r = st->close(st);
 	free(st);
 	return r;
 }
 
-ssize_t odb_read_stream_read(struct odb_read_stream *st, void *buf, size_t sz)
+ssize_t odb_stream_read(struct odb_stream *st, void *buf, size_t sz)
 {
 	return st->read(st, buf, sz);
 }
 
-static struct odb_read_stream *open_istream_raw(struct object_database *odb,
-					       const struct object_id *oid, unsigned flags)
+static struct odb_stream *open_istream_raw(struct object_database *odb,
+					  const struct object_id *oid, unsigned flags)
 {
-	struct odb_read_stream *st;
+	struct odb_stream *st;
 	struct object_id storage_oid;
 
 	if (repo_oid_to_algop(odb->repo, oid, odb->repo->hash_algo, &storage_oid) ||
@@ -237,27 +236,27 @@ static struct odb_read_stream *open_istream_raw(struct object_database *odb,
 	return st;
 }
 
-struct odb_read_stream *odb_read_stream_open_raw(struct object_database *odb,
-						 const struct object_id *oid)
+struct odb_stream *odb_stream_from_object_raw(struct object_database *odb,
+					      const struct object_id *oid)
 {
 	return open_istream_raw(odb, oid, 0);
 }
 
-struct odb_read_stream *odb_read_stream_open(struct object_database *odb,
-					     const struct object_id *oid,
-					     struct stream_filter *filter)
+struct odb_stream *odb_stream_from_object(struct object_database *odb,
+					  const struct object_id *oid,
+					  struct stream_filter *filter)
 {
 	const struct object_id *real = lookup_replace_object(odb->repo, oid);
-	struct odb_read_stream *st = open_istream_raw(odb, real, OBJECT_INFO_DIE_IF_CORRUPT);
+	struct odb_stream *st = open_istream_raw(odb, real, OBJECT_INFO_DIE_IF_CORRUPT);
 
 	if (!st)
 		return NULL;
 
 	if (filter) {
 		/* Add "&& !is_null_stream_filter(filter)" for performance */
-		struct odb_read_stream *nst = attach_stream_filter(st, filter);
+		struct odb_stream *nst = attach_stream_filter(st, filter);
 		if (!nst) {
-			odb_read_stream_close(st);
+			odb_stream_close(st);
 			return NULL;
 		}
 		st = nst;
@@ -266,32 +265,23 @@ struct odb_read_stream *odb_read_stream_open(struct object_database *odb,
 	return st;
 }
 
-ssize_t odb_write_stream_read(struct odb_write_stream *st, void *buf, size_t sz)
-{
-	return st->read(st, buf, sz);
-}
-
-void odb_write_stream_release(struct odb_write_stream *st)
-{
-	free(st->data);
-}
-
 int odb_stream_blob_to_fd(struct object_database *odb,
 			  int fd,
 			  const struct object_id *oid,
 			  struct stream_filter *filter,
 			  int can_seek)
 {
-	struct odb_read_stream *st;
+	struct odb_stream *st;
 	ssize_t kept = 0;
 	int result = -1;
 	struct git_hash_ctx hash;
+	int hash_initialized = 0;
 	struct object_id actual;
 	const struct object_id *real = lookup_replace_object(odb->repo, oid);
 	const struct git_hash_algo *algo = &hash_algos[real->algo];
 	char header[MAX_HEADER_LEN];
 
-	st = odb_read_stream_open(odb, oid, filter);
+	st = odb_stream_from_object(odb, oid, filter);
 	if (!st) {
 		if (filter)
 			free_stream_filter(filter);
@@ -302,13 +292,14 @@ int odb_stream_blob_to_fd(struct object_database *odb,
 	if (!filter) {
 		int header_len = format_object_header(header, sizeof(header),
 						      OBJ_BLOB, st->size);
-		algo->init_fn(&hash);
+		git_hash_init(&hash, algo);
+		hash_initialized = 1;
 		git_hash_update(&hash, header, header_len);
 	}
 	for (;;) {
 		char buf[1024 * 16];
 		ssize_t wrote, holeto;
-		ssize_t readlen = odb_read_stream_read(st, buf, sizeof(buf));
+		ssize_t readlen = odb_stream_read(st, buf, sizeof(buf));
 
 		if (readlen < 0)
 			goto close_and_exit;
@@ -340,6 +331,7 @@ int odb_stream_blob_to_fd(struct object_database *odb,
 		goto close_and_exit;
 	if (!filter) {
 		git_hash_final_oid(&actual, &hash);
+		hash_initialized = 0;
 		if (!oideq(&actual, real)) {
 			error("blob %s has incorrect object hash", oid_to_hex(real));
 			goto close_and_exit;
@@ -348,47 +340,55 @@ int odb_stream_blob_to_fd(struct object_database *odb,
 	result = 0;
 
  close_and_exit:
-	odb_read_stream_close(st);
+	if (hash_initialized)
+		git_hash_discard(&hash);
+	odb_stream_close(st);
 	return result;
 }
 
-struct read_object_fd_data {
+struct fd_stream {
+	struct odb_stream base;
 	int fd;
 	size_t remaining;
 };
 
-static ssize_t read_object_fd(struct odb_write_stream *stream,
-			      unsigned char *buf, size_t len)
+static ssize_t fd_stream_read(struct odb_stream *stream,
+			      char *buf, size_t len)
 {
-	struct read_object_fd_data *data = stream->data;
+	struct fd_stream *fds = container_of(stream, struct fd_stream, base);
 	ssize_t read_result;
 	size_t count;
 
-	if (stream->is_finished)
+	if (!fds->remaining)
 		return 0;
 
-	count = data->remaining < len ? data->remaining : len;
-	read_result = read_in_full(data->fd, buf, count);
+	count = fds->remaining < len ? fds->remaining : len;
+	read_result = read_in_full(fds->fd, buf, count);
 	if (read_result < 0 || (size_t)read_result != count)
 		return -1;
 
-	data->remaining -= count;
-	if (!data->remaining)
-		stream->is_finished = 1;
+	fds->remaining -= count;
 
 	return read_result;
 }
 
-void odb_write_stream_from_fd(struct odb_write_stream *stream, int fd,
-			      size_t size)
+static int fd_stream_close(struct odb_stream *stream UNUSED)
 {
-	struct read_object_fd_data *data;
+	/* The file descriptor is owned by the caller for now. */
+	return 0;
+}
 
-	CALLOC_ARRAY(data, 1);
-	data->fd = fd;
-	data->remaining = size;
+struct odb_stream *odb_stream_from_fd(int fd, size_t size, enum object_type type)
+{
+	struct fd_stream *fds;
 
-	stream->data = data;
-	stream->read = read_object_fd;
-	stream->is_finished = 0;
+	CALLOC_ARRAY(fds, 1);
+	fds->base.read = fd_stream_read;
+	fds->base.close = fd_stream_close;
+	fds->base.size = size;
+	fds->base.type = type;
+	fds->fd = fd;
+	fds->remaining = size;
+
+	return &fds->base;
 }

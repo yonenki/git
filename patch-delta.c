@@ -111,7 +111,7 @@ void *patch_delta(const void *src_buf, size_t src_size,
 }
 
 struct delta_stream_reader {
-	struct odb_read_stream *stream;
+	struct odb_stream *stream;
 	size_t pos, len, remaining;
 	unsigned char buffer[16384];
 };
@@ -129,7 +129,7 @@ static int read_delta_bytes(struct delta_stream_reader *reader, void *buf, size_
 			ssize_t read;
 			n = reader->remaining < sizeof(reader->buffer) ?
 				reader->remaining : sizeof(reader->buffer);
-			read = odb_read_stream_read(reader->stream, reader->buffer, n);
+			read = odb_stream_read(reader->stream, reader->buffer, n);
 			if (read <= 0)
 				return -1;
 			reader->pos = 0;
@@ -166,7 +166,7 @@ static int read_delta_size(struct delta_stream_reader *reader, size_t *size)
 }
 
 enum patch_delta_result patch_delta_to_file(int base_fd, size_t base_size,
-			struct odb_read_stream *delta, int result_fd,
+			struct odb_stream *delta, int result_fd,
 			size_t *result_size)
 {
 	struct delta_stream_reader reader = {
@@ -225,7 +225,7 @@ enum patch_delta_result patch_delta_to_file(int base_fd, size_t base_size,
 			return PATCH_DELTA_INVALID;
 		}
 	}
-	if (remaining || odb_read_stream_read(delta, &extra, 1) != 0)
+	if (remaining || odb_stream_read(delta, &extra, 1) != 0)
 		goto bad_length;
 	return PATCH_DELTA_OK;
 
