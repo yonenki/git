@@ -96,6 +96,12 @@ struct conv_attrs {
 void convert_attrs(struct index_state *istate,
 		   struct conv_attrs *ca, const char *path);
 
+/* Independent index views; the caller frees each check with attr_check_free(). */
+struct attr_check;
+struct attr_check *convert_attrs_check_alloc(void);
+void convert_attrs_with_check(struct index_state *istate, struct conv_attrs *ca,
+			      const char *path, struct attr_check *check);
+
 /*
  * Return the raw gitattributes filter= value from conv_attrs, or NULL.
  */

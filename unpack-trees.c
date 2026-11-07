@@ -18,6 +18,7 @@
 #include "progress.h"
 #include "refs.h"
 #include "attr.h"
+#include "convert.h"
 #include "read-cache.h"
 #include "split-index.h"
 #include "sparse-index.h"
@@ -427,12 +428,11 @@ static int must_checkout(const struct cache_entry *ce,
 static int textil_is_identity_lfs(struct index_state *index, const char *path,
 				 struct attr_check *check)
 {
-	git_check_attr(index, path, check);
-	return !ATTR_UNSET(check->items[0].value) &&
-		!strcmp(check->items[0].value, "lfs") &&
-		ATTR_FALSE(check->items[1].value) &&
-		(ATTR_FALSE(check->items[2].value) || ATTR_UNSET(check->items[2].value)) &&
-		ATTR_UNSET(check->items[3].value);
+	struct conv_attrs ca;
+	const char *filter;
+	convert_attrs_with_check(index, &ca, path, check);
+	filter = conv_attrs_filter_name(&ca);
+	return filter && !strcmp(filter, "lfs") && textil_ext_identity_conversion(&ca);
 }
 
 static int textil_attributes_changed(struct index_state *a, struct index_state *b)
@@ -464,8 +464,8 @@ static int textil_reclassify_lfs_entries(struct unpack_trees_options *o,
 	if (!textil_attributes_changed(index, o->src_index) &&
 	    !textil_attributes_changed(o->src_index, index))
 		return 0;
-	old_attrs = attr_check_initl("filter", "text", "ident", "working-tree-encoding", NULL);
-	new_attrs = attr_check_initl("filter", "text", "ident", "working-tree-encoding", NULL);
+	old_attrs = convert_attrs_check_alloc();
+	new_attrs = convert_attrs_check_alloc();
 	for (i = 0; i < index->cache_nr; i++) {
 		struct cache_entry *entry = index->cache[i];
 		const struct cache_entry *old;
