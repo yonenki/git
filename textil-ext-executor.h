@@ -29,6 +29,7 @@ enum textil_ext_executor_phase {
 	TEXTIL_EXT_EXEC_PHASE_PREFLIGHT = 0,
 	TEXTIL_EXT_EXEC_PHASE_MATERIALIZE = 1,
 	TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT = 2,
+	TEXTIL_EXT_EXEC_PHASE_CHECKOUT_FILE = 3,
 };
 
 /* Keep in sync with protocol::MAX_REQUEST_PAYLOAD_SIZE in textil-vcs. */
@@ -68,7 +69,7 @@ struct textil_ext_takeover_item {
 	int strict;                  /* rule.strict */
 	const char * const *capabilities; /* required_capabilities (borrowed) */
 	int nr_capabilities;
-	int projected;              /* preflight disposition; suppress checkout payload */
+	int projected;              /* 0 bytes, 1 old namespace projection, 2 native placeholder */
 	enum textil_ext_checkout_admission checkout_admission;
 	struct cache_entry *checkout_entry; /* borrowed checkout candidate, collection only */
 };
@@ -87,6 +88,8 @@ struct textil_ext_takeover_batch {
 	 * commits, i.e. before Git can reference the returned pointers.
 	 */
 	int deferred_durability;
+	uint64_t output_handle;     /* CHECKOUT_FILE only; exact Git-owned output */
+	unsigned long output_process;
 };
 
 /* --- Executor status ---------------------------------------------------- */
@@ -104,17 +107,17 @@ enum textil_ext_executor_status {
 /* --- Executor API ------------------------------------------------------- */
 
 /*
- * Execute a preflight takeover batch (preflight phase only).
+ * Execute ordered preflight or exact-output checkout dispositions.
  *
  * The executor does NOT die() on runtime failure; the caller is
- * responsible for fail-fast control.  However, calling with a
- * non-preflight phase is a programming error and triggers BUG().
+ * responsible for fail-fast control. Byte materialization and clean conversion
+ * have separate executor APIs; passing those phases here triggers BUG().
  *
  * Returns TEXTIL_EXT_EXECUTOR_OK on success.
  * On failure, returns a non-OK status and appends a message to err.
  *
  * Preconditions:
- *   - batch->phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT (BUG otherwise)
+ *   - batch->phase is PREFLIGHT or CHECKOUT_FILE (BUG otherwise)
  *   - batch->nr_items > 0
  *
  * For materialize, use textil_ext_resolve_materialize_batch() instead.
@@ -126,6 +129,22 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 struct textil_ext_eval_result; /* forward declaration (textil-ext-policy.h) */
 struct object_id; /* forward declaration (hash.h) */
 struct strbuf; /* forward declaration */
+struct conv_attrs;
+struct tempfile;
+int textil_ext_identity_conversion(const struct conv_attrs *ca);
+int textil_ext_placeholder_cache_lookup(const char *path, const char *oid_hex);
+/* 1 installed (including native empty), 0 MaterializeBytes, -1 typed failure. */
+int textil_ext_try_install_placeholder(const char *path, const struct object_id *oid,
+	const char *filter, const struct textil_ext_eval_result *eval, int out_fd,
+	struct strbuf *err);
+struct tempfile *textil_ext_open_checkout_temp(const char *path, unsigned int mode);
+int textil_ext_publish_checkout_temp(struct tempfile **temp, const char *path);
+int textil_ext_materialize_to_fd(const char *path, const struct object_id *oid,
+	const char *filter, const struct textil_ext_eval_result *eval, int out_fd,
+	struct strbuf *err);
+struct index_state;
+/* Metadata-only for identity takeover; never expose sparse backing as bytes. */
+int textil_ext_open_clean_input(struct index_state *index, const char *path);
 
 /*
  * Ordered materialize resolution result.

@@ -697,7 +697,7 @@ static enum git_attr_direction direction;
 
 void git_attr_set_direction(enum git_attr_direction new_direction)
 {
-	if (is_bare_repository() && new_direction != GIT_ATTR_INDEX)
+	if (is_bare_repository(the_repository) && new_direction != GIT_ATTR_INDEX)
 		BUG("non-INDEX attr direction in a bare repo");
 
 	if (new_direction != direction)
@@ -910,7 +910,7 @@ static struct attr_stack *read_attr(struct index_state *istate,
 		res = read_attr_from_index(istate, path, flags);
 	} else if (tree_oid) {
 		res = read_attr_from_blob(istate, tree_oid, path, flags);
-	} else if (!is_bare_repository()) {
+	} else if (!is_bare_repository(the_repository)) {
 		if (direction == GIT_ATTR_CHECKOUT) {
 			res = read_attr_from_index(istate, path, flags);
 			if (!res)
@@ -982,7 +982,7 @@ void git_attr_capture_source(struct attr_check *check,
 		BUG("attribute source must be captured before evaluation");
 	CALLOC_ARRAY(source, 1);
 	check->source_context = source;
-	source->ignore_case = !!ignore_case;
+	source->ignore_case = !!repo_ignore_case(the_repository);
 	source->has_tree = !!tree_oid;
 	if (tree_oid)
 		oidcpy(&source->tree_oid, tree_oid);
@@ -1458,13 +1458,15 @@ void git_check_attr(struct index_state *istate,
 	int i;
 	const struct object_id *tree_oid = check->source_context ?
 		NULL : default_attr_source();
-	int saved_ignore_case = ignore_case;
+	struct repo_config_values *cfg = check->source_context ?
+		repo_config_values(the_repository) : NULL;
+	int saved_ignore_case = cfg ? cfg->ignore_case : 0;
 
 	if (check->source_context) {
 		if (!check->source_context->has_tree)
 			BUG("cannot evaluate an unborn attribute source");
 		tree_oid = &check->source_context->tree_oid;
-		ignore_case = check->source_context->ignore_case;
+		cfg->ignore_case = check->source_context->ignore_case;
 	}
 
 	collect_some_attrs(istate, tree_oid, path, check);
@@ -1476,7 +1478,8 @@ void git_check_attr(struct index_state *istate,
 			value = compute_builtin_attr(istate, path, check->all_attrs[n].attr);
 		check->items[i].value = value;
 	}
-	ignore_case = saved_ignore_case;
+	if (cfg)
+		cfg->ignore_case = saved_ignore_case;
 }
 
 void git_all_attrs(struct index_state *istate,

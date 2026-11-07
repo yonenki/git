@@ -9,7 +9,7 @@ SYNOPSIS
 --------
 [verse]
 'git textil-head-projection' --identity-only
-'git textil-head-projection' --describe [--target=<object-id>]
+'git textil-head-projection' --describe [--target=<object-id>] [--if-source-changed=<tree>:<context>]
 
 DESCRIPTION
 -----------
@@ -24,6 +24,14 @@ already-resolved target instead of resolving HEAD again; absent or invalid
 objects remain errors. The output is a NUL-delimited machine stream, not
 human-readable output. See linkgit:git-check-attr[1] for the source-reader wire
 contract and captured attribute authority.
+
+`--if-source-changed` accepts the tree object ID and SHA-256 context from a
+previous source receipt, separated by `:`. An unborn receipt has an empty tree
+field. It is valid only with `--describe`. Git captures the current source once:
+if it equals the receipt, the response is byte-identical to `--identity-only`
+and does not enumerate leaves; otherwise it is byte-identical to ordinary
+`--describe` for that captured source. The receipt is a hint, never authority
+for HEAD, attributes or replacement objects. Invalid receipts remain errors.
 
 GIT
 ---

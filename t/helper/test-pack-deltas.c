@@ -49,7 +49,7 @@ static void write_ref_delta(struct hashfile *f,
 {
 	unsigned char header[MAX_PACK_OBJECT_HEADER];
 	unsigned long compressed_size, hdrlen;
-	size_t size, base_size, delta_size;
+	size_t size, base_size, delta_size = 0;
 	enum object_type type;
 	void *base_buf, *delta_buf;
 	void *buf = odb_read_object(the_repository->objects,

@@ -96,6 +96,7 @@ struct conv_attrs {
 void convert_attrs(struct index_state *istate,
 		   struct conv_attrs *ca, const char *path);
 
+
 /*
  * Return the raw gitattributes filter= value from conv_attrs, or NULL.
  */

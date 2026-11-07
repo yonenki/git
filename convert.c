@@ -1334,8 +1334,7 @@ static struct attr_check *check;
 void convert_attrs(struct index_state *istate,
 		   struct conv_attrs *ca, const char *path)
 {
-	struct attr_check_item *ccheck = NULL;
-
+	struct attr_check_item *ccheck;
 	if (!check) {
 		check = attr_check_initl("crlf", "ident", "filter",
 					 "eol", "text", "working-tree-encoding",
@@ -1383,6 +1382,7 @@ void convert_attrs(struct index_state *istate,
 		ca->crlf_action = CRLF_AUTO_INPUT;
 }
 
+
 const char *conv_attrs_filter_name(const struct conv_attrs *ca)
 {
 	if (ca)
@@ -1419,7 +1419,8 @@ int would_convert_to_git_filter_fd(struct index_state *istate, const char *path)
 	textil_ext_evaluate_for_checkin(
 		conv_attrs_filter_name(&ca), 1, &ext_result);
 	if (ext_result.matched &&
-	    ext_result.action == TEXTIL_ACTION_TAKEOVER)
+	    ext_result.action == TEXTIL_ACTION_TAKEOVER &&
+	    textil_ext_identity_conversion(&ca))
 		return 1;
 	if (!ca.drv)
 		return 0;
@@ -1487,7 +1488,8 @@ int convert_to_git(struct index_state *istate,
 		textil_ext_evaluate_for_checkin(
 			conv_attrs_filter_name(&ca), 1, &ext_result);
 		if (ext_result.matched &&
-		    ext_result.action == TEXTIL_ACTION_TAKEOVER)
+		    ext_result.action == TEXTIL_ACTION_TAKEOVER &&
+		    textil_ext_identity_conversion(&ca))
 			return 1;
 	}
 	if (src && dst) {
@@ -1495,7 +1497,8 @@ int convert_to_git(struct index_state *istate,
 		textil_ext_evaluate_for_checkin(
 			conv_attrs_filter_name(&ca), 1, &ext_result);
 		if (ext_result.matched &&
-		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
+		    ext_result.action == TEXTIL_ACTION_TAKEOVER &&
+		    textil_ext_identity_conversion(&ca)) {
 			struct strbuf main_wt = STRBUF_INIT;
 			struct strbuf cc_err = STRBUF_INIT;
 			enum textil_ext_executor_status status;
@@ -1560,7 +1563,8 @@ int convert_to_git_filter_fd(struct index_state *istate,
 		textil_ext_evaluate_for_checkin(
 			conv_attrs_filter_name(&ca), 1, &ext_result);
 		if (ext_result.matched &&
-		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
+		    ext_result.action == TEXTIL_ACTION_TAKEOVER &&
+		    textil_ext_identity_conversion(&ca)) {
 			struct strbuf main_wt = STRBUF_INIT;
 			struct strbuf cc_err = STRBUF_INIT;
 			enum textil_ext_executor_status status;

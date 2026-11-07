@@ -20,6 +20,7 @@
 #include "string-list.h"
 #include "convert.h"
 #include "copy.h"
+#include "tempfile.h"
 
 /*
  * Materialize a single file to an open fd.
@@ -28,7 +29,7 @@
  * single-item IPC only if the cache has no entry (non-wave single-file
  * checkout). The hot checkout wave path always hits the cache.
  */
-static int textil_ext_materialize_to_fd(const char *ce_name,
+int textil_ext_materialize_to_fd(const char *ce_name,
 					const struct object_id *ce_oid,
 					const char *attr_filter,
 					const struct textil_ext_eval_result *eval_result,
@@ -47,6 +48,12 @@ static int textil_ext_materialize_to_fd(const char *ce_name,
 		if (ret)
 			return error("textil-ext: copy_fd failed for '%s'", ce_name);
 		return 0;
+	}
+	{
+		int installed = textil_ext_try_install_placeholder(
+			ce_name, ce_oid, attr_filter, eval_result, out_fd, err);
+		if (installed)
+			return installed;
 	}
 
 	/* cache miss: 単発の checkout（wave 外）向け single-item fallback */
@@ -367,11 +374,14 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 			conv_attrs_filter_name(ca), 1, &ext_result);
 
 		if (ext_result.matched &&
-		    ext_result.action == TEXTIL_ACTION_TAKEOVER) {
+		    ext_result.action == TEXTIL_ACTION_TAKEOVER &&
+		    textil_ext_identity_conversion(ca)) {
 			struct strbuf pointer_err = STRBUF_INIT;
 			int is_pointer = 0;
 			struct strbuf mat_err = STRBUF_INIT;
 			int out_fd;
+			struct tempfile *temp_output = NULL;
+			const char *output_path;
 
 			if (textil_ext_blob_oid_is_lfs_pointer(&ce->oid,
 							       &is_pointer,
@@ -384,7 +394,15 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 			if (!is_pointer)
 				goto no_takeover;
 
-			out_fd = open_output_fd(path, ce, to_tempfile);
+			if (to_tempfile) {
+				out_fd = open_output_fd(path, ce, 1);
+				output_path = path;
+			} else {
+				temp_output = textil_ext_open_checkout_temp(path,
+					(ce->ce_mode & 0100) ? 0777 : 0666);
+				out_fd = temp_output ? get_tempfile_fd(temp_output) : -1;
+				output_path = temp_output ? get_tempfile_path(temp_output) : NULL;
+			}
 			if (out_fd < 0) {
 				error_errno("unable to create file %s", path);
 				strbuf_release(&mat_err);
@@ -398,16 +416,31 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 				    conv_attrs_filter_name(ca),
 				    &ext_result,
 				    out_fd, &mat_err);
-				if (mat_rc) {
-					close(out_fd);
+				if (mat_rc < 0) {
+					error("%s", mat_err.buf);
+					if (to_tempfile) {
+						close(out_fd);
+						unlink(output_path);
+					} else {
+						delete_tempfile(&temp_output);
+					}
 					strbuf_release(&mat_err);
 					return -1;
 				}
+				if (mat_rc > 0)
+					ce->ce_flags &= ~CE_SKIP_WORKTREE;
 			}
 
-			if (!to_tempfile)
-				fstat_done = fstat_checkout_output(out_fd, state, &st);
-			close(out_fd);
+			if ((to_tempfile ? close(out_fd) : close_tempfile_gently(temp_output)) ||
+			    (!to_tempfile && textil_ext_publish_checkout_temp(&temp_output, path))) {
+				error_errno("unable to publish file %s", path);
+				if (to_tempfile)
+					unlink(output_path);
+				else
+					delete_tempfile(&temp_output);
+				strbuf_release(&mat_err);
+				return -1;
+			}
 			strbuf_release(&mat_err);
 			goto finish;
 		}
@@ -433,7 +466,8 @@ no_takeover:
 		 * We can't make a real symlink; write out a regular file entry
 		 * with the symlink destination as its contents.
 		 */
-		if (!has_symlinks || to_tempfile)
+		if (!repo_has_symlinks(state->istate && state->istate->repo ?
+				       state->istate->repo : the_repository) || to_tempfile)
 			goto write_file_entry;
 
 		ret = create_symlink(state->istate, new_blob, path);

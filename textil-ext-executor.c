@@ -20,6 +20,7 @@
 #include "trace2.h"
 #include "strmap.h"
 #include "parse.h"
+#include "tempfile.h"
 
 #ifdef SUPPORTS_SIMPLE_IPC
 #include "simple-ipc.h"
@@ -29,6 +30,22 @@
 #define ENV_OPERATION_ID "TEXTIL_GIT_EXT_OPERATION_ID"
 
 static const char *phase_to_string(enum textil_ext_executor_phase phase);
+static char *make_cache_key(const char *path, const char *oid_hex);
+static struct strmap placeholder_cache = STRMAP_INIT;
+
+int textil_ext_identity_conversion(const struct conv_attrs *ca)
+{
+	return ca->crlf_action == CRLF_BINARY && !ca->ident &&
+		!ca->working_tree_encoding;
+}
+
+int textil_ext_placeholder_cache_lookup(const char *path, const char *oid_hex)
+{
+	char *key = make_cache_key(path, oid_hex);
+	int found = strmap_contains(&placeholder_cache, key);
+	free(key);
+	return found;
+}
 
 /* --- Env helper --------------------------------------------------------- */
 
@@ -193,6 +210,7 @@ static const char *phase_to_string(enum textil_ext_executor_phase phase)
 	case TEXTIL_EXT_EXEC_PHASE_PREFLIGHT:
 		return "preflight";
 	case TEXTIL_EXT_EXEC_PHASE_MATERIALIZE:
+	case TEXTIL_EXT_EXEC_PHASE_CHECKOUT_FILE:
 		return "materialize";
 	case TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT:
 		return "checkin_convert";
@@ -275,6 +293,8 @@ static const char *command_for_phase(enum textil_ext_executor_phase phase)
 		return "preflight_batch";
 	case TEXTIL_EXT_EXEC_PHASE_MATERIALIZE:
 		return "materialize_batch";
+	case TEXTIL_EXT_EXEC_PHASE_CHECKOUT_FILE:
+		return "checkout_file";
 	case TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT:
 		return "checkin_convert_batch";
 	}
@@ -330,6 +350,10 @@ static int build_batch_header(
 	if (batch->phase == TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT &&
 	    batch->deferred_durability)
 		packet_buf_write(out, "durability=deferred\n");
+	if (batch->phase == TEXTIL_EXT_EXEC_PHASE_CHECKOUT_FILE) {
+		packet_buf_write(out, "output_process=%lu\n", batch->output_process);
+		packet_buf_write(out, "output_handle=%"PRIu64"\n", batch->output_handle);
+	}
 
 	return 0;
 }
@@ -709,6 +733,8 @@ static int parse_executor_response(const char *buf, size_t len,
 					projected = 1;
 				else if (val_len == 11 && !memcmp(val, "materialize", 11))
 					projected = 0;
+				else if (val_len == 11 && !memcmp(val, "placeholder", 11))
+					projected = 2;
 				else
 					return -1;
 				if (disposition_nr >= preflight_batch->nr_items)
@@ -1150,6 +1176,11 @@ static void textil_ext_collect_takeover_batch(
 
 		convert_attrs(index, &ca, ce->name);
 		filter_name = conv_attrs_filter_name(&ca);
+		if (!textil_ext_identity_conversion(&ca))
+			continue; /* Git owns EOL/ident/encoding and custom filter chains. */
+		if (phase == TEXTIL_EXT_EXEC_PHASE_MATERIALIZE &&
+		    textil_ext_placeholder_cache_lookup(ce->name, oid_to_hex(&ce->oid)))
+			continue;
 		if (phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT)
 			textil_ext_evaluate_for_preflight(
 				filter_name, 1, &ext_result);
@@ -1275,7 +1306,8 @@ static enum textil_ext_executor_status execute_preflight_slice(
 	/* Preconditions (common, evaluated before #ifdef split) */
 	if (!batch || !batch->items || batch->nr_items <= 0)
 		BUG("execute_takeover_batch called with invalid batch");
-	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_PREFLIGHT)
+	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_PREFLIGHT &&
+	    batch->phase != TEXTIL_EXT_EXEC_PHASE_CHECKOUT_FILE)
 		BUG("execute_takeover_batch called with non-preflight phase (phase=%d)",
 		    batch->phase);
 	if (!err)
@@ -1367,7 +1399,8 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 
 	if (!batch || !batch->items || batch->nr_items <= 0)
 		BUG("execute_takeover_batch called with invalid batch");
-	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_PREFLIGHT)
+	if (batch->phase != TEXTIL_EXT_EXEC_PHASE_PREFLIGHT &&
+	    batch->phase != TEXTIL_EXT_EXEC_PHASE_CHECKOUT_FILE)
 		BUG("execute_takeover_batch called with non-preflight phase");
 	if (!err)
 		BUG("execute_takeover_batch called with NULL err");
@@ -1382,6 +1415,17 @@ enum textil_ext_executor_status textil_ext_execute_takeover_batch(
 		status = execute_preflight_slice(&slice, &request, err);
 		if (status != TEXTIL_EXT_EXECUTOR_OK)
 			break;
+		if (batch->phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT) {
+			int i;
+			for (i = 0; i < slice.nr_items; i++) {
+				const struct textil_ext_takeover_item *item = &slice.items[i];
+				if (item->projected == 2) {
+					char *key = make_cache_key(item->path, item->blob_oid);
+					strmap_put(&placeholder_cache, key, (void *)1);
+					free(key);
+				}
+			}
+		}
 		start += slice.nr_items;
 	}
 	strbuf_release(&request);
@@ -1584,6 +1628,7 @@ void textil_ext_materialize_cache_clear(void)
 		free(entry->value);
 	strmap_clear(&materialize_cache, 0);
 	materialize_cache_populated = 0;
+	strmap_clear(&placeholder_cache, 0);
 }
 
 /* --- Materialize one-to-fd helper --------------------------------------- */
@@ -1994,4 +2039,108 @@ enum textil_ext_executor_status textil_ext_checkin_convert_fd_to_buf(
 		unlink(item.input_path);
 	textil_ext_takeover_batch_release(&batch);
 	return ret;
+}
+
+/*
+ * The controller duplicates this exact still-open output. A pathname from a
+ * filter is not an output identity. Errors never fall through to a byte copy.
+ */
+int textil_ext_try_install_placeholder(const char *path,
+	const struct object_id *oid, const char *filter,
+	const struct textil_ext_eval_result *eval, int out_fd, struct strbuf *err)
+{
+#if defined(GIT_WINDOWS_NATIVE) && defined(SUPPORTS_SIMPLE_IPC)
+	struct textil_ext_takeover_batch batch = { 0 };
+	struct textil_ext_takeover_item item = { 0 };
+	struct strbuf root = STRBUF_INIT;
+	enum textil_ext_executor_status status;
+	int ret;
+
+	textil_ext_resolve_worktree_root(&root);
+	item.path = xstrdup(path);
+	item.rule_id = eval->rule_id;
+	item.attr_filter = filter ? xstrdup(filter) : NULL;
+	item.blob_oid = xstrdup(oid_to_hex(oid));
+	item.is_regular_file = 1;
+	item.strict = eval->strict;
+	item.capabilities = eval->capabilities;
+	item.nr_capabilities = eval->nr_capabilities;
+	batch.phase = TEXTIL_EXT_EXEC_PHASE_CHECKOUT_FILE;
+	batch.operation = "checkout";
+	batch.repo_root = root.buf;
+	batch.items = &item;
+	batch.nr_items = 1;
+	batch.output_handle = (uint64_t)(uintptr_t)_get_osfhandle(out_fd);
+	batch.output_process = GetCurrentProcessId();
+	status = textil_ext_execute_takeover_batch(&batch, err);
+	ret = status != TEXTIL_EXT_EXECUTOR_OK ? -1 : item.projected == 2;
+	textil_ext_takeover_batch_release(&batch);
+	strbuf_release(&root);
+	return ret;
+#else
+	return 0;
+#endif
+}
+
+struct tempfile *textil_ext_open_checkout_temp(const char *path, unsigned int mode)
+{
+	struct strbuf pattern = STRBUF_INIT;
+	struct tempfile *temp;
+	strbuf_addf(&pattern, "%s.textil-XXXXXX", path);
+	temp = mks_tempfile_m(pattern.buf, mode);
+	strbuf_release(&pattern);
+	return temp;
+}
+
+/* Native no-replace publication preserves Git's O_EXCL dirty/race admission. */
+int textil_ext_publish_checkout_temp(struct tempfile **temp, const char *path)
+{
+	const char *source = get_tempfile_path(*temp);
+#ifdef GIT_WINDOWS_NATIVE
+	wchar_t old_path[MAX_LONG_PATH], new_path[MAX_LONG_PATH];
+	if (xutftowcs_long_path(old_path, source) < 0 ||
+	    xutftowcs_long_path(new_path, path) < 0)
+		return -1;
+	if (!MoveFileExW(old_path, new_path, 0)) {
+		errno = err_win_to_posix(GetLastError());
+		return -1;
+	}
+#else
+	/* Link publishes the exact inode without replacing an existing output. */
+	if (link(source, path))
+		return -1;
+#endif
+	/* Publication succeeded; the old name is no longer an owned output.
+	 * delete_tempfile also deregisters a Windows source already moved away. */
+	return delete_tempfile(temp);
+}
+
+int textil_ext_open_clean_input(struct index_state *index, const char *path)
+{
+#ifdef GIT_WINDOWS_NATIVE
+	struct conv_attrs ca;
+	struct textil_ext_eval_result eval;
+	convert_attrs(index, &ca, path);
+	textil_ext_evaluate_for_checkin(conv_attrs_filter_name(&ca), 1, &eval);
+	if (eval.matched && eval.action == TEXTIL_ACTION_TAKEOVER &&
+	    textil_ext_identity_conversion(&ca)) {
+		wchar_t wide[MAX_LONG_PATH];
+		HANDLE handle;
+		int fd;
+		if (xutftowcs_long_path(wide, path) < 0)
+			return -1;
+		handle = CreateFileW(wide, FILE_READ_ATTRIBUTES,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+		if (handle == INVALID_HANDLE_VALUE) {
+			errno = err_win_to_posix(GetLastError());
+			return -1;
+		}
+		fd = _open_osfhandle((intptr_t)handle, O_RDONLY | O_BINARY | O_NOINHERIT);
+		if (fd < 0)
+			CloseHandle(handle);
+		return fd;
+	}
+#endif
+	return git_open_cloexec(path, O_RDONLY);
 }
