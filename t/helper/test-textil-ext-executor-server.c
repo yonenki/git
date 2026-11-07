@@ -31,6 +31,7 @@
 #include "read-cache-ll.h"
 #include "textil-ext-policy.h"
 #include "hex.h"
+#include "tempfile.h"
 
 #ifndef SUPPORTS_SIMPLE_IPC
 int cmd__textil_ext_executor_server(int argc, const char **argv)
@@ -1735,6 +1736,27 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 
 	if (reply_mode_str)
 		server_args.mode = parse_reply_mode(reply_mode_str);
+
+	if (!strcmp(subcmd, "checkout-temp-interrupt") ||
+	    !strcmp(subcmd, "checkout-temp-terminate") ||
+	    !strcmp(subcmd, "checkout-temp-publish")) {
+		struct tempfile *temp = textil_ext_open_checkout_temp(server_args.path, 0666);
+		if (!temp)
+			die_errno("cannot create checkout temp");
+		write_or_die(get_tempfile_fd(temp), "payload\n", 8);
+		printf("%s\n", get_tempfile_path(temp));
+		fflush(stdout);
+		if (!strcmp(subcmd, "checkout-temp-publish")) {
+			if (close_tempfile_gently(temp) ||
+			    textil_ext_publish_checkout_temp(&temp, server_args.path))
+				die_errno("cannot publish checkout temp");
+			if (temp)
+				BUG("published checkout temp remains registered");
+			return 0;
+		}
+		raise(!strcmp(subcmd, "checkout-temp-interrupt") ? SIGINT : SIGTERM);
+		die("interruption did not terminate the checkout");
+	}
 
 	if (!strcmp(subcmd, "worktree-patch-id")) {
 		struct diff_options diffopt;

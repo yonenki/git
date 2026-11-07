@@ -66,6 +66,42 @@ expect_admission () {
 	! grep "> checkout_\\(two_tree\\|verified\\|overwrite\\)=" "$ADMISSION_PACKET_LOG"
 }
 
+
+# Exercise the actual checkout tempfile owner, not a test-created tempfile.
+# These signals are the Ctrl-C and kill/termination cleanup paths; SIGKILL and
+# Windows TerminateProcess cannot run any userspace cleanup handler.
+test_expect_success 'checkout interruption removes unpublished outputs' '
+	for interruption in interrupt terminate
+	do
+		{ test-tool textil-ext-executor-server checkout-temp-$interruption \
+			--name="$TRASH_DIRECTORY/interrupted" >temp-path; ret=$?; } &&
+		{
+			case "$interruption" in
+			interrupt) test_match_signal 2 "$ret" ;;
+			terminate) test_match_signal 15 "$ret" ;;
+			esac
+		} &&
+		test_path_is_missing "$(cat temp-path)" &&
+		test_path_is_missing "$TRASH_DIRECTORY/interrupted" || return 1
+	done
+'
+
+test_expect_success 'checkout publication keeps output and deregisters temp' '
+	test-tool textil-ext-executor-server checkout-temp-publish \
+		--name="$TRASH_DIRECTORY/published" >temp-path &&
+	test_path_is_missing "$(cat temp-path)" &&
+	echo payload >expect &&
+	test_cmp expect "$TRASH_DIRECTORY/published"
+'
+
+test_expect_success 'checkout publication does not replace an existing file' '
+	echo original >"$TRASH_DIRECTORY/existing" &&
+	test_must_fail test-tool textil-ext-executor-server checkout-temp-publish \
+		--name="$TRASH_DIRECTORY/existing" >temp-path &&
+	test_path_is_missing "$(cat temp-path)" &&
+	echo original >expect &&
+	test_cmp expect "$TRASH_DIRECTORY/existing"
+'
 # === Setup ===
 
 test_expect_success 'setup: create repo with lfs-tracked files' '

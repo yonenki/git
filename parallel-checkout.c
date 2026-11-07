@@ -20,6 +20,7 @@
 #include "thread-utils.h"
 #include "trace2.h"
 #include "copy.h"
+#include "tempfile.h"
 
 struct pc_worker {
 	struct child_process cp;
@@ -357,7 +358,8 @@ static void write_pc_takeover(struct parallel_checkout_item *pc_item,
 {
 	unsigned int mode = (pc_item->ce->ce_mode & 0100) ? 0777 : 0666;
 	int fd = -1, result;
-	struct strbuf path = STRBUF_INIT, temp = STRBUF_INIT, err = STRBUF_INIT;
+	struct strbuf path = STRBUF_INIT, err = STRBUF_INIT;
+	struct tempfile *temp = NULL;
 	const char *dir_sep;
 
 	strbuf_add(&path, state->base_dir, state->base_dir_len);
@@ -368,7 +370,8 @@ static void write_pc_takeover(struct parallel_checkout_item *pc_item,
 		pc_item->status = PC_ITEM_COLLIDED;
 		goto out;
 	}
-	fd = textil_ext_open_checkout_temp(path.buf, mode, &temp);
+	temp = textil_ext_open_checkout_temp(path.buf, mode);
+	fd = temp ? get_tempfile_fd(temp) : -1;
 	if (fd < 0) {
 		error_errno("failed to create checkout output for '%s'", path.buf);
 		pc_item->status = PC_ITEM_FAILED;
@@ -383,12 +386,12 @@ static void write_pc_takeover(struct parallel_checkout_item *pc_item,
 	}
 	if (result > 0)
 		pc_item->ce->ce_flags &= ~CE_SKIP_WORKTREE;
-	if (close_and_clear(&fd)) {
+	if (close_tempfile_gently(temp)) {
 		error_errno("unable to close output for '%s'", path.buf);
 		pc_item->status = PC_ITEM_FAILED;
 		goto out;
 	}
-	if (textil_ext_publish_checkout_temp(temp.buf, path.buf)) {
+	if (textil_ext_publish_checkout_temp(&temp, path.buf)) {
 		if (errno == EEXIST || errno == EISDIR) {
 			pc_item->status = PC_ITEM_COLLIDED;
 		} else {
@@ -397,7 +400,6 @@ static void write_pc_takeover(struct parallel_checkout_item *pc_item,
 		}
 		goto out;
 	}
-	strbuf_reset(&temp);
 	if (state->refresh_cache && lstat(path.buf, &pc_item->st) < 0) {
 		error_errno("unable to stat just-written file '%s'", path.buf);
 		pc_item->status = PC_ITEM_FAILED;
@@ -405,10 +407,7 @@ static void write_pc_takeover(struct parallel_checkout_item *pc_item,
 	}
 	pc_item->status = PC_ITEM_WRITTEN;
 out:
-	close_and_clear(&fd);
-	if (temp.len)
-		unlink(temp.buf);
-	strbuf_release(&temp);
+	delete_tempfile(&temp);
 	strbuf_release(&err);
 	strbuf_release(&path);
 }

@@ -20,6 +20,7 @@
 #include "string-list.h"
 #include "convert.h"
 #include "copy.h"
+#include "tempfile.h"
 
 /*
  * Materialize a single file to an open fd.
@@ -379,7 +380,7 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 			int is_pointer = 0;
 			struct strbuf mat_err = STRBUF_INIT;
 			int out_fd;
-			struct strbuf temp_output = STRBUF_INIT;
+			struct tempfile *temp_output = NULL;
 			const char *output_path;
 
 			if (textil_ext_blob_oid_is_lfs_pointer(&ce->oid,
@@ -397,14 +398,14 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 				out_fd = open_output_fd(path, ce, 1);
 				output_path = path;
 			} else {
-				out_fd = textil_ext_open_checkout_temp(path,
-					(ce->ce_mode & 0100) ? 0777 : 0666, &temp_output);
-				output_path = temp_output.buf;
+				temp_output = textil_ext_open_checkout_temp(path,
+					(ce->ce_mode & 0100) ? 0777 : 0666);
+				out_fd = temp_output ? get_tempfile_fd(temp_output) : -1;
+				output_path = temp_output ? get_tempfile_path(temp_output) : NULL;
 			}
 			if (out_fd < 0) {
 				error_errno("unable to create file %s", path);
 				strbuf_release(&mat_err);
-				strbuf_release(&temp_output);
 				return -1;
 			}
 
@@ -417,9 +418,12 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 				    out_fd, &mat_err);
 				if (mat_rc < 0) {
 					error("%s", mat_err.buf);
-					close(out_fd);
-					unlink(output_path);
-					strbuf_release(&temp_output);
+					if (to_tempfile) {
+						close(out_fd);
+						unlink(output_path);
+					} else {
+						delete_tempfile(&temp_output);
+					}
 					strbuf_release(&mat_err);
 					return -1;
 				}
@@ -427,15 +431,16 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 					ce->ce_flags &= ~CE_SKIP_WORKTREE;
 			}
 
-			if (close(out_fd) ||
-			    (!to_tempfile && textil_ext_publish_checkout_temp(output_path, path))) {
+			if ((to_tempfile ? close(out_fd) : close_tempfile_gently(temp_output)) ||
+			    (!to_tempfile && textil_ext_publish_checkout_temp(&temp_output, path))) {
 				error_errno("unable to publish file %s", path);
-				unlink(output_path);
-				strbuf_release(&temp_output);
+				if (to_tempfile)
+					unlink(output_path);
+				else
+					delete_tempfile(&temp_output);
 				strbuf_release(&mat_err);
 				return -1;
 			}
-			strbuf_release(&temp_output);
 			strbuf_release(&mat_err);
 			goto finish;
 		}

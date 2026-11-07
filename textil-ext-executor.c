@@ -20,6 +20,7 @@
 #include "trace2.h"
 #include "strmap.h"
 #include "parse.h"
+#include "tempfile.h"
 
 #ifdef SUPPORTS_SIMPLE_IPC
 #include "simple-ipc.h"
@@ -2081,32 +2082,37 @@ int textil_ext_try_install_placeholder(const char *path,
 #endif
 }
 
-int textil_ext_open_checkout_temp(const char *path, unsigned int mode,
-	struct strbuf *temp)
+struct tempfile *textil_ext_open_checkout_temp(const char *path, unsigned int mode)
 {
-	strbuf_addf(temp, "%s.textil-XXXXXX", path);
-	return git_mkstemp_mode(temp->buf, mode);
+	struct strbuf pattern = STRBUF_INIT;
+	struct tempfile *temp;
+	strbuf_addf(&pattern, "%s.textil-XXXXXX", path);
+	temp = mks_tempfile_m(pattern.buf, mode);
+	strbuf_release(&pattern);
+	return temp;
 }
 
 /* Native no-replace publication preserves Git's O_EXCL dirty/race admission. */
-int textil_ext_publish_checkout_temp(const char *temp, const char *path)
+int textil_ext_publish_checkout_temp(struct tempfile **temp, const char *path)
 {
+	const char *source = get_tempfile_path(*temp);
 #ifdef GIT_WINDOWS_NATIVE
 	wchar_t old_path[MAX_LONG_PATH], new_path[MAX_LONG_PATH];
-	if (xutftowcs_long_path(old_path, temp) < 0 ||
+	if (xutftowcs_long_path(old_path, source) < 0 ||
 	    xutftowcs_long_path(new_path, path) < 0)
 		return -1;
-	if (MoveFileExW(old_path, new_path, 0))
-		return 0;
-	errno = err_win_to_posix(GetLastError());
-	return -1;
-#else
-	/* POSIX link publication has the same no-replace property and keeps the
-	 * exact inode. Windows is the only placeholder-producing platform. */
-	if (link(temp, path))
+	if (!MoveFileExW(old_path, new_path, 0)) {
+		errno = err_win_to_posix(GetLastError());
 		return -1;
-	return unlink(temp);
+	}
+#else
+	/* Link publishes the exact inode without replacing an existing output. */
+	if (link(source, path))
+		return -1;
 #endif
+	/* Publication succeeded; the old name is no longer an owned output.
+	 * delete_tempfile also deregisters a Windows source already moved away. */
+	return delete_tempfile(temp);
 }
 
 int textil_ext_open_clean_input(struct index_state *index, const char *path)

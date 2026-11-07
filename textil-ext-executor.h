@@ -130,14 +130,15 @@ struct textil_ext_eval_result; /* forward declaration (textil-ext-policy.h) */
 struct object_id; /* forward declaration (hash.h) */
 struct strbuf; /* forward declaration */
 struct conv_attrs;
+struct tempfile;
 int textil_ext_identity_conversion(const struct conv_attrs *ca);
 int textil_ext_placeholder_cache_lookup(const char *path, const char *oid_hex);
 /* 1 installed (including native empty), 0 MaterializeBytes, -1 typed failure. */
 int textil_ext_try_install_placeholder(const char *path, const struct object_id *oid,
 	const char *filter, const struct textil_ext_eval_result *eval, int out_fd,
 	struct strbuf *err);
-int textil_ext_open_checkout_temp(const char *path, unsigned int mode, struct strbuf *temp);
-int textil_ext_publish_checkout_temp(const char *temp, const char *path);
+struct tempfile *textil_ext_open_checkout_temp(const char *path, unsigned int mode);
+int textil_ext_publish_checkout_temp(struct tempfile **temp, const char *path);
 int textil_ext_materialize_to_fd(const char *path, const struct object_id *oid,
 	const char *filter, const struct textil_ext_eval_result *eval, int out_fd,
 	struct strbuf *err);
