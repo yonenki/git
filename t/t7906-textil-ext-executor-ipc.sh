@@ -79,7 +79,9 @@ test_expect_success 'checkout interruption removes unpublished outputs' '
 			case "$interruption" in
 			interrupt) test_match_signal 2 "$ret" ;;
 			terminate) test_match_signal 15 "$ret" ;;
-			esac
+			esac ||
+			# Windows raise() exits with 3, as in t0005-signals.
+			{ test_have_prereq MINGW && test "$ret" = 3; }
 		} &&
 		test_path_is_missing "$(cat temp-path)" &&
 		test_path_is_missing "$TRASH_DIRECTORY/interrupted" || return 1
