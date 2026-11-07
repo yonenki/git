@@ -107,17 +107,17 @@ enum textil_ext_executor_status {
 /* --- Executor API ------------------------------------------------------- */
 
 /*
- * Execute a preflight takeover batch (preflight phase only).
+ * Execute ordered preflight or exact-output checkout dispositions.
  *
  * The executor does NOT die() on runtime failure; the caller is
- * responsible for fail-fast control.  However, calling with a
- * non-preflight phase is a programming error and triggers BUG().
+ * responsible for fail-fast control. Byte materialization and clean conversion
+ * have separate executor APIs; passing those phases here triggers BUG().
  *
  * Returns TEXTIL_EXT_EXECUTOR_OK on success.
  * On failure, returns a non-OK status and appends a message to err.
  *
  * Preconditions:
- *   - batch->phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT (BUG otherwise)
+ *   - batch->phase is PREFLIGHT or CHECKOUT_FILE (BUG otherwise)
  *   - batch->nr_items > 0
  *
  * For materialize, use textil_ext_resolve_materialize_batch() instead.

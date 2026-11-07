@@ -504,6 +504,8 @@ static int validate_batch_request(const char *req, size_t req_len,
 				    !val_equals(val, val_len,
 						"materialize_batch") &&
 				    !val_equals(val, val_len,
+						"checkout_file") &&
+				    !val_equals(val, val_len,
 						"checkin_convert_batch")) {
 					strbuf_addstr(reason,
 						      "command must be "
@@ -750,6 +752,22 @@ static int reply_checkin_deferred(const char *request, size_t request_len,
 	return 0;
 }
 
+static int is_checkout_file_request(const char *request, size_t request_len)
+{
+	size_t pos = 0;
+	for (;;) {
+		const char *line;
+		size_t len;
+		enum pktline_mem_status status =
+			pktline_read_mem(request, request_len, &pos, &line, &len);
+		if (status != PKTLINE_MEM_DATA)
+			return 0;
+		if (len == strlen("command=checkout_file") &&
+		    !memcmp(line, "command=checkout_file", len))
+			return 1;
+	}
+}
+
 static int app_cb(void *application_data UNUSED,
 		  const char *request, size_t request_len,
 		  ipc_server_reply_cb *reply_cb,
@@ -760,6 +778,19 @@ static int app_cb(void *application_data UNUSED,
 
 	if (request_len == 4 && !strncmp(request, "quit", 4))
 		return SIMPLE_IPC_QUIT;
+	/* These byte-output oracle servers register no native placeholder scope.
+	 * The real Rust controller's same typed outcome is MaterializeBytes. */
+	if (is_checkout_file_request(request, request_len)) {
+		struct strbuf reason = STRBUF_INIT;
+		if (validate_batch_request(request, request_len, &reason))
+			build_ok_reply(&reply, request, request_len);
+		else
+			build_error_reply(&reply, reason.buf);
+		strbuf_release(&reason);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+	}
 
 	switch (server_args.mode) {
 	case REPLY_CHECKIN_DEFERRED:
