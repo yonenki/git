@@ -1331,8 +1331,10 @@ static int git_path_check_ident(struct attr_check_item *check)
 
 static struct attr_check *check;
 
-static void init_convert_attrs(void)
+void convert_attrs(struct index_state *istate,
+		   struct conv_attrs *ca, const char *path)
 {
+	struct attr_check_item *ccheck;
 	if (!check) {
 		check = attr_check_initl("crlf", "ident", "filter",
 					 "eol", "text", "working-tree-encoding",
@@ -1340,20 +1342,9 @@ static void init_convert_attrs(void)
 		user_convert_tail = &user_convert;
 		repo_config(the_repository, read_convert_config, NULL);
 	}
-}
 
-struct attr_check *convert_attrs_check_alloc(void)
-{
-	init_convert_attrs();
-	return attr_check_dup(check);
-}
-
-void convert_attrs_with_check(struct index_state *istate, struct conv_attrs *ca,
-			      const char *path, struct attr_check *attributes)
-{
-	struct attr_check_item *ccheck;
-	git_check_attr(istate, path, attributes);
-	ccheck = attributes->items;
+	git_check_attr(istate, path, check);
+	ccheck = check->items;
 	ca->crlf_action = git_path_check_crlf(ccheck + 4);
 	if (ca->crlf_action == CRLF_UNDEFINED)
 		ca->crlf_action = git_path_check_crlf(ccheck + 0);
@@ -1391,12 +1382,6 @@ void convert_attrs_with_check(struct index_state *istate, struct conv_attrs *ca,
 		ca->crlf_action = CRLF_AUTO_INPUT;
 }
 
-void convert_attrs(struct index_state *istate,
-		   struct conv_attrs *ca, const char *path)
-{
-	init_convert_attrs();
-	convert_attrs_with_check(istate, ca, path, check);
-}
 
 const char *conv_attrs_filter_name(const struct conv_attrs *ca)
 {
