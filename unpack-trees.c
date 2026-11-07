@@ -424,6 +424,80 @@ static int must_checkout(const struct cache_entry *ce,
 	return ce->ce_flags & CE_UPDATE;
 }
 
+static int textil_is_identity_lfs(struct index_state *index, const char *path,
+				 struct attr_check *check)
+{
+	git_check_attr(index, path, check);
+	return !ATTR_UNSET(check->items[0].value) &&
+		!strcmp(check->items[0].value, "lfs") &&
+		ATTR_FALSE(check->items[1].value) &&
+		(ATTR_FALSE(check->items[2].value) || ATTR_UNSET(check->items[2].value)) &&
+		ATTR_UNSET(check->items[3].value);
+}
+
+static int textil_attributes_changed(struct index_state *a, struct index_state *b)
+{
+	int i;
+	for (i = 0; i < a->cache_nr; i++) {
+		const struct cache_entry *entry = a->cache[i];
+		const char *base = find_last_dir_sep(entry->name);
+		int pos;
+		if (strcmp(base ? base + 1 : entry->name, ".gitattributes"))
+			continue;
+		pos = index_name_pos(b, entry->name, ce_namelen(entry));
+		if (pos < 0 || !oideq(&entry->oid, &b->cache[pos]->oid))
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * A same-blob attribute-only change is not normally a checkout candidate.
+ * Reclassify just that case through Git's existing overwrite admission; never
+ * resurrect an unstaged deletion or treat a native placeholder as absent.
+ */
+static int textil_reclassify_lfs_entries(struct unpack_trees_options *o,
+					struct index_state *index)
+{
+	struct attr_check *old_attrs, *new_attrs;
+	int i, ret = 0;
+	if (!textil_attributes_changed(index, o->src_index) &&
+	    !textil_attributes_changed(o->src_index, index))
+		return 0;
+	old_attrs = attr_check_initl("filter", "text", "ident", "working-tree-encoding", NULL);
+	new_attrs = attr_check_initl("filter", "text", "ident", "working-tree-encoding", NULL);
+	for (i = 0; i < index->cache_nr; i++) {
+		struct cache_entry *entry = index->cache[i];
+		const struct cache_entry *old;
+		struct stat st;
+		int pos;
+		if ((entry->ce_flags & (CE_UPDATE | CE_WT_REMOVE)) || ce_stage(entry) ||
+		    ce_skip_worktree(entry) || !S_ISREG(entry->ce_mode))
+			continue;
+		pos = index_name_pos(o->src_index, entry->name, ce_namelen(entry));
+		if (pos < 0)
+			continue;
+		old = o->src_index->cache[pos];
+		if (old->ce_mode != entry->ce_mode || !oideq(&old->oid, &entry->oid) ||
+		    ce_stage(old))
+			continue;
+		if (textil_is_identity_lfs(o->src_index, entry->name, old_attrs) ==
+		    textil_is_identity_lfs(index, entry->name, new_attrs))
+			continue;
+		if (lstat(entry->name, &st) < 0 && errno == ENOENT)
+			continue;
+		git_attr_set_direction(GIT_ATTR_CHECKIN);
+		ret = verify_uptodate(old, o);
+		git_attr_set_direction(GIT_ATTR_CHECKOUT);
+		if (ret)
+			break;
+		entry->ce_flags |= CE_UPDATE;
+	}
+	attr_check_free(old_attrs);
+	attr_check_free(new_attrs);
+	return ret;
+}
+
 static int check_updates(struct unpack_trees_options *o,
 			 struct index_state *index)
 {
@@ -472,6 +546,12 @@ static int check_updates(struct unpack_trees_options *o,
 		struct strbuf main_wt = STRBUF_INIT;
 		enum textil_ext_executor_status pf_status =
 			TEXTIL_EXT_EXECUTOR_OK;
+		if (textil_reclassify_lfs_entries(o, index)) {
+			display_error_msgs(o);
+			stop_progress(&progress);
+			trace_performance_leave("check_updates");
+			return 1;
+		}
 
 		textil_ext_resolve_worktree_root(&main_wt);
 		if (textil_ext_collect_preflight_takeover_batch(
@@ -490,7 +570,7 @@ static int check_updates(struct unpack_trees_options *o,
 		}
 		for (i = 0; i < pf_batch.nr_items; i++) {
 			struct textil_ext_takeover_item *item = &pf_batch.items[i];
-			if (item->projected) {
+			if (item->projected == 1) {
 				struct cache_entry *ce = item->checkout_entry;
 				ce->ce_flags |= CE_SKIP_WORKTREE;
 				ce->ce_flags &= ~CE_UPDATE;

@@ -32,6 +32,7 @@
 #include "strvec.h"
 #include "tempfile.h"
 #include "tmp-objdir.h"
+#include "textil-ext-executor.h"
 
 static int get_conv_flags(unsigned flags)
 {
@@ -1079,7 +1080,7 @@ int index_path(struct index_state *istate, struct object_id *oid,
 
 	switch (st->st_mode & S_IFMT) {
 	case S_IFREG:
-		fd = open(path, O_RDONLY);
+		fd = textil_ext_open_clean_input(istate, path);
 		if (fd < 0)
 			return error_errno("open(\"%s\")", path);
 		rc = index_fd_with_input_path(istate, oid, fd, st, OBJ_BLOB,

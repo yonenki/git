@@ -46,6 +46,7 @@
 #include "progress.h"
 #include "sparse-index.h"
 #include "csum-file.h"
+#include "textil-ext-executor.h"
 #include "promisor-remote.h"
 #include "hook.h"
 #include "submodule.h"
@@ -234,7 +235,7 @@ static int ce_compare_data(struct index_state *istate,
 			   struct stat *st)
 {
 	int match = -1;
-	int fd = git_open_cloexec(ce->name, O_RDONLY);
+	int fd = textil_ext_open_clean_input(istate, ce->name);
 
 	if (fd >= 0) {
 		struct object_id oid;
