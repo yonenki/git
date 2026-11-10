@@ -2184,7 +2184,10 @@ struct tempfile *textil_ext_open_checkout_temp(const char *path, unsigned int mo
 	struct strbuf pattern = STRBUF_INIT;
 	struct tempfile *temp;
 	strbuf_addf(&pattern, "%s.textil-XXXXXX", path);
+	/* Counted by tests: ordinary eager outputs never create this sibling. */
+	trace2_region_enter("textil-ext", "checkout_temp", the_repository);
 	temp = mks_tempfile_m(pattern.buf, mode);
+	trace2_region_leave("textil-ext", "checkout_temp", the_repository);
 	strbuf_release(&pattern);
 	return temp;
 }

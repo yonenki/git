@@ -335,7 +335,11 @@ int textil_ext_preresolve_materialize_cache(
 	const struct textil_ext_takeover_batch *preflight_batch,
 	struct strbuf *err);
 
-/* Completed range owned by this checkout wave. */
+/*
+ * Completed range owned by this checkout wave. A hit is the eager decision:
+ * the caller writes an ordinary O_EXCL output. Placeholders are excluded
+ * from the materialize wave, so they and wave misses return NULL.
+ */
 const struct textil_ext_source *textil_ext_materialize_cache_lookup(
 	const char *path, const char *blob_oid_hex);
 

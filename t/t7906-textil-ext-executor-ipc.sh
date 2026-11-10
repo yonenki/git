@@ -1266,6 +1266,37 @@ test_expect_success '1000 and 10000 LFS entries accept large replies without ext
 	done
 '
 
+# Eager wave items are ordinary Git outputs: one O_EXCL create on the final
+# path per item, no .textil-XXXXXX sibling and no publication rename/link.
+test_expect_success 'eager wave outputs are created in place without sibling temporaries' '
+	for workers in 1 2
+	do
+		make_batched_checkout_repo "eager-output-$workers" 40 &&
+		trace_log="$TRASH_DIRECTORY/eager-output-$workers.ndjson" &&
+		git_trace="$TRASH_DIRECTORY/eager-output-$workers.trace2" &&
+		test_when_finished stop_executor_server &&
+		TMPDIR="$TRASH_DIRECTORY" restart_server_with_trace ordered-batch-checkout "$trace_log" &&
+		(
+			cd "eager-output-$workers" &&
+			env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-batched-checkout.json" \
+				TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+				GIT_TEST_CHECKOUT_WORKERS=$workers GIT_TRACE2_EVENT="$git_trace" \
+				git checkout with-lfs &&
+			test-tool textil-ext-executor-server verify-checkout --items=40
+		) &&
+		! grep "\"label\":\"checkout_temp\"" "$git_trace" &&
+		! grep "\"label\":\"output_publish\"" "$git_trace" &&
+		if test "$workers" = 1
+		then
+			grep "\"event\":\"region_enter\".*\"label\":\"output_create\"" \
+				"$git_trace" >creates &&
+			test_line_count = 40 creates
+		else
+			! grep "\"label\":\"output_create\"" "$git_trace"
+		fi || return 1
+	done
+'
+
 test_expect_success 'byte-bounded slices preserve every materialize result in request order' '
 	make_batched_checkout_repo sliced-checkout 40 &&
 	trace_log="$TRASH_DIRECTORY/sliced-checkout.ndjson" &&
