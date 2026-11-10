@@ -84,6 +84,18 @@ struct odb_transaction {
 	int (*write_object_stream)(struct odb_transaction *transaction,
 				   struct odb_stream *stream,
 				   struct object_id *oid);
+
+	/*
+	 * Optional callback that writes an in-core object whose ID `oid` the
+	 * caller has already computed and found absent from the object
+	 * database. When set, odb_write_object() writes every object into the
+	 * transaction through this callback instead of the source's own object
+	 * writer. Returns 0 on success, a negative error code otherwise.
+	 */
+	int (*write_object)(struct odb_transaction *transaction,
+			    const void *buf, size_t len,
+			    enum object_type type,
+			    const struct object_id *oid);
 	/*
 	 * This callback is expected to ingest the packfile readable via
 	 * `pack_fd` into the transaction. Returns 0 on success, a negative
@@ -107,6 +119,12 @@ struct odb_transaction {
 enum odb_transaction_flags {
 	/* Configures the transaction for use with git-receive-pack(1). */
 	ODB_TRANSACTION_RECEIVE = (1 << 0),
+	/*
+	 * Textil: write every object of the transaction, including small and
+	 * converted blobs, into the transaction packfile instead of loose
+	 * objects. Objects become readable only once the transaction commits.
+	 */
+	ODB_TRANSACTION_TEXTIL_PACK_OBJECTS = (1 << 1),
 };
 
 /*

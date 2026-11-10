@@ -14,6 +14,7 @@
 #include "object-name.h"
 #include "odb.h"
 #include "odb/source-inmemory.h"
+#include "odb/transaction.h"
 #include "path.h"
 #include "promisor-remote.h"
 #include "quote.h"
@@ -997,6 +998,15 @@ int odb_write_object_ext(struct object_database *odb,
 	 */
 	if (odb_freshen_object(odb, oid))
 		return 0;
+
+	/*
+	 * A transaction that owns object writes (Textil pack-objects) takes the
+	 * object with the ID computed above. It records no compatibility
+	 * object mapping.
+	 */
+	if (odb->transaction && odb->transaction->write_object)
+		return odb->transaction->write_object(odb->transaction, buf, len,
+						      type, oid);
 
 	if (compat) {
 		const struct git_hash_algo *algo = odb->repo->hash_algo;

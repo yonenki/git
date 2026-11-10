@@ -9,6 +9,7 @@
 #include "config.h"
 #include "environment.h"
 #include "lockfile.h"
+#include "cache-tree.h"
 #include "editor.h"
 #include "dir.h"
 #include "gettext.h"
@@ -242,6 +243,7 @@ N_("The following paths are ignored by one of your .gitignore files:\n");
 static int verbose, show_only, ignored_too, refresh_only;
 static int ignore_add_errors, intent_to_add, ignore_missing;
 static int warn_on_embedded_repo = 1;
+static int textil_pack_objects;
 
 #define ADDREMOVE_DEFAULT 1
 static int addremove = ADDREMOVE_DEFAULT;
@@ -287,6 +289,8 @@ static struct option builtin_add_options[] = {
 		   N_("override the executable bit of the listed files")),
 	OPT_HIDDEN_BOOL(0, "warn-embedded-repo", &warn_on_embedded_repo,
 			N_("warn when adding an embedded repository")),
+	OPT_BOOL(0, "textil-pack-objects", &textil_pack_objects,
+		 N_("write new objects and the index's trees into one pack")),
 	OPT_PATHSPEC_FROM_FILE(&pathspec_from_file),
 	OPT_PATHSPEC_FILE_NUL(&pathspec_file_nul),
 	OPT_END(),
@@ -668,7 +672,9 @@ int cmd_add(int argc,
 		string_list_clear(&only_match_skip_worktree, 0);
 	}
 
-	odb_transaction_begin_or_die(repo->objects, &transaction, 0);
+	odb_transaction_begin_or_die(repo->objects, &transaction,
+				     textil_pack_objects ?
+				     ODB_TRANSACTION_TEXTIL_PACK_OBJECTS : 0);
 
 	ps_matched = xcalloc(pathspec.nr, 1);
 	if (add_resolved)
@@ -689,6 +695,19 @@ int cmd_add(int argc,
 
 	if (chmod_arg && pathspec.nr)
 		exit_status |= chmod_pathspec(repo, &pathspec, chmod_arg[0], show_only);
+
+	/*
+	 * Textil pack-objects: write the trees of the resulting index into the
+	 * same pack, so that the following commit writes only its commit
+	 * object. The blobs this command staged are not readable until the
+	 * transaction commits, hence MISSING_OK; entries kept from before were
+	 * already validated when they entered the index. An index that cannot
+	 * produce a tree (e.g. unmerged) keeps an invalid cache tree and the
+	 * commit writes its trees as usual.
+	 */
+	if (textil_pack_objects && !show_only)
+		cache_tree_update(repo->index,
+				  WRITE_TREE_SILENT | WRITE_TREE_MISSING_OK);
 	odb_transaction_commit_and_finalize_or_die(transaction);
 
 finish:

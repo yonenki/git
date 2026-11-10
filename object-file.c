@@ -485,6 +485,8 @@ struct transaction_packfile {
 	struct pack_idx_entry **written;
 	uint32_t alloc_written;
 	uint32_t nr_written;
+	/* IDs of `written`, so that a repeated object is found in O(1). */
+	struct oidset written_oids;
 };
 
 struct odb_transaction_files {
@@ -721,10 +723,8 @@ static int already_written(struct odb_transaction_files *transaction,
 			   ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR))
 		return 1;
 
-	/* Might want to keep the list sorted */
-	for (uint32_t i = 0; i < transaction->packfile.nr_written; i++)
-		if (oideq(&transaction->packfile.written[i]->oid, oid))
-			return 1;
+	if (oidset_contains(&transaction->packfile.written_oids, oid))
+		return 1;
 
 	/* This is a new object we need to keep */
 	return 0;
@@ -929,11 +929,22 @@ clear_exit:
 	free(idx_tmp_name);
 	free(state->pack_tmp_name);
 	free(state->written);
+	oidset_clear(&state->written_oids);
 	memset(state, 0, sizeof(*state));
 
 	strbuf_release(&packname);
 	/* Make objects we just wrote available to ourselves */
 	odb_reprepare(repo->objects);
+}
+
+static void record_written_object(struct transaction_packfile *state,
+				  struct pack_idx_entry *idx,
+				  const struct object_id *oid)
+{
+	oidcpy(&idx->oid, oid);
+	ALLOC_GROW(state->written, state->nr_written + 1, state->alloc_written);
+	state->written[state->nr_written++] = idx;
+	oidset_insert(&state->written_oids, oid);
 }
 
 /*
@@ -1003,14 +1014,80 @@ static int odb_transaction_files_write_object_stream(struct odb_transaction *bas
 		state->offset = checkpoint.offset;
 		free(idx);
 	} else {
-		oidcpy(&idx->oid, result_oid);
-		ALLOC_GROW(state->written,
-			   state->nr_written + 1,
-			   state->alloc_written);
-		state->written[state->nr_written++] = idx;
+		record_written_object(state, idx, result_oid);
 	}
 
 	hashfile_checkpoint_release(&checkpoint);
+	return 0;
+}
+
+/*
+ * Deflate an in-core object into the transaction packfile as one undeltified
+ * pack entry.
+ */
+static void buffer_to_pack(struct transaction_packfile *state,
+			   enum object_type type, const void *buf, size_t len)
+{
+	git_zstream s;
+	unsigned char obuf[16384];
+	int status;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
+
+	git_deflate_init(&s, cfg->pack_compression_level);
+	s.next_in = (unsigned char *)buf;
+	s.avail_in = len;
+	s.next_out = obuf + encode_in_pack_object_header(obuf, sizeof(obuf),
+							  type, len);
+	s.avail_out = obuf + sizeof(obuf) - s.next_out;
+
+	do {
+		size_t written;
+
+		status = git_deflate(&s, Z_FINISH);
+		if (status != Z_OK && status != Z_BUF_ERROR &&
+		    status != Z_STREAM_END)
+			die("unexpected deflate failure: %d", status);
+		written = s.next_out - obuf;
+		hashwrite(state->f, obuf, written);
+		state->offset += written;
+		s.next_out = obuf;
+		s.avail_out = sizeof(obuf);
+	} while (status != Z_STREAM_END);
+
+	git_deflate_end(&s);
+}
+
+/*
+ * Textil pack-objects: odb_write_object() hands every object of the
+ * transaction here with its ID already computed and absent from the object
+ * database, so only this packfile needs to be checked for a repeat.
+ */
+static int odb_transaction_files_write_object(struct odb_transaction *base,
+					      const void *buf, size_t len,
+					      enum object_type type,
+					      const struct object_id *oid)
+{
+	struct odb_transaction_files *transaction = container_of(base,
+								 struct odb_transaction_files,
+								 base);
+	struct transaction_packfile *state = &transaction->packfile;
+	struct pack_idx_entry *idx;
+
+	if (oidset_contains(&state->written_oids, oid))
+		return 0;
+
+	/* Same size limit as odb_transaction_files_write_object_stream(). */
+	if (state->nr_written && pack_size_limit_cfg &&
+	    pack_size_limit_cfg < state->offset + len)
+		flush_packfile_transaction(transaction);
+
+	CALLOC_ARRAY(idx, 1);
+	prepare_packfile_transaction(transaction);
+	idx->offset = state->offset;
+	crc32_begin(state->f);
+	buffer_to_pack(state, type, buf, len);
+	idx->crc32 = crc32_end(state->f);
+	record_written_object(state, idx, oid);
 	return 0;
 }
 
@@ -1581,6 +1658,8 @@ int odb_transaction_files_begin(struct odb_source *source,
 	transaction->base.write_object_stream = odb_transaction_files_write_object_stream;
 	transaction->base.write_pack = odb_transaction_files_write_pack;
 	transaction->base.env = odb_transaction_files_env;
+	if (flags & ODB_TRANSACTION_TEXTIL_PACK_OBJECTS)
+		transaction->base.write_object = odb_transaction_files_write_object;
 	transaction->flags = flags;
 
 	transaction->prefix = "bulk-fsync";
