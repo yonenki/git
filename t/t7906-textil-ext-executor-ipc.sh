@@ -534,6 +534,15 @@ test_expect_success 'materialize-src-path-relative: C-side validates absolute pa
 	grep "^status=invalid$" out
 '
 
+test_expect_success 'materialize-source-overflow: C-side rejects a range beyond INT64' '
+	restart_server materialize-source-overflow &&
+	test_must_fail env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize \
+			--name="$IPC_PATH" >out &&
+	grep "^status=invalid$" out
+'
+
 test_expect_success MINGW 'materialize-src-path-windows-verbatim: C-side accepts verbatim drive path' '
 	restart_server materialize-src-path-windows-verbatim &&
 	env \
@@ -897,6 +906,31 @@ test_expect_success 'materialize E2E: checkout writes src_path content to file' 
 		test -f b.bin &&
 		grep "materialized-by-textil" a.bin &&
 		grep "materialized-by-textil" b.bin
+	)
+'
+
+# A short source range is an I/O failure of the ordinary O_EXCL output and
+# behaves like a stock Git write error: each failed output is reported and
+# removed, and its index entry is left not up to date (stock unpack_trees
+# reports check_updates failures without aborting the switch).
+test_expect_success 'materialize E2E: short source range leaves no partial output' '
+	restart_server materialize-checkout-short-source &&
+	(
+		cd executor-ipc-repo &&
+		git checkout -f main &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-ipc-mat-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git checkout with-lfs 2>err &&
+		grep "cannot read completed source range" err &&
+		grep "unable to write file a.bin" err &&
+		grep "unable to write file b.bin" err &&
+		test_path_is_missing a.bin &&
+		test_path_is_missing b.bin &&
+		git diff --name-status -- a.bin b.bin >actual &&
+		printf "D\t%s\n" a.bin b.bin >expect &&
+		test_cmp expect actual
 	)
 '
 
@@ -1266,8 +1300,9 @@ test_expect_success '1000 and 10000 LFS entries accept large replies without ext
 	done
 '
 
-# Eager wave items are ordinary Git outputs: one O_EXCL create on the final
-# path per item, no .textil-XXXXXX sibling and no publication rename/link.
+# Eager wave items are ordinary Git outputs: O_EXCL on the final path, no
+# .textil-XXXXXX sibling and therefore no publication rename/link. The
+# materialize region proves the trace was written for the checkout wave.
 test_expect_success 'eager wave outputs are created in place without sibling temporaries' '
 	for workers in 1 2
 	do
@@ -1284,16 +1319,8 @@ test_expect_success 'eager wave outputs are created in place without sibling tem
 				git checkout with-lfs &&
 			test-tool textil-ext-executor-server verify-checkout --items=40
 		) &&
-		! grep "\"label\":\"checkout_temp\"" "$git_trace" &&
-		! grep "\"label\":\"output_publish\"" "$git_trace" &&
-		if test "$workers" = 1
-		then
-			grep "\"event\":\"region_enter\".*\"label\":\"output_create\"" \
-				"$git_trace" >creates &&
-			test_line_count = 40 creates
-		else
-			! grep "\"label\":\"output_create\"" "$git_trace"
-		fi || return 1
+		grep "\"event\":\"region_enter\".*\"label\":\"materialize\"" "$git_trace" &&
+		! grep "\"label\":\"checkout_temp\"" "$git_trace" || return 1
 	done
 '
 

@@ -210,6 +210,10 @@ static int pc_item_is_takeover_candidate(struct parallel_checkout_item *pc_item,
 	    ext_result->action != TEXTIL_ACTION_TAKEOVER ||
 	    !textil_ext_identity_conversion(&pc_item->ca))
 		return 0;
+	/* The wave admitted every cached (path, blob OID) as an LFS pointer. */
+	if (textil_ext_materialize_cache_lookup(pc_item->ce->name,
+						oid_to_hex(&pc_item->ce->oid)))
+		return 1;
 
 	if (textil_ext_blob_oid_is_lfs_pointer(&pc_item->ce->oid, &is_pointer,
 					       &pointer_err))

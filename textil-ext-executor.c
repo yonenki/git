@@ -1166,11 +1166,7 @@ int textil_ext_blob_oid_is_lfs_pointer(
 	int *is_pointer,
 	struct strbuf *err)
 {
-	int ret;
-	trace2_region_enter("textil-ext", "pointer_check", the_repository);
-	ret = blob_oid_is_pointer(oid, NULL, is_pointer, NULL, err);
-	trace2_region_leave("textil-ext", "pointer_check", the_repository);
-	return ret;
+	return blob_oid_is_pointer(oid, NULL, is_pointer, NULL, err);
 }
 
 static int blob_oid_is_takeover_candidate(

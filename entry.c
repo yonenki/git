@@ -21,7 +21,6 @@
 #include "convert.h"
 #include "copy.h"
 #include "tempfile.h"
-#include "trace2.h"
 
 /*
  * Materialize a single takeover output that has no wave source: a native
@@ -368,7 +367,32 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 			int out_fd;
 			struct tempfile *temp_output = NULL;
 			const char *output_path;
-			const struct textil_ext_source *source;
+			/*
+			 * The wave's materialize reply names a byte source for
+			 * every eager item before any output is opened; the
+			 * wave admitted this (path, blob OID) as an LFS pointer.
+			 * Those outputs are ordinary Git outputs: O_EXCL on the
+			 * final path, no sibling temporary and no publication.
+			 * Placeholders and wave misses keep the exact-output
+			 * temporary below.
+			 */
+			const struct textil_ext_source *source =
+				textil_ext_materialize_cache_lookup(
+					ce->name, oid_to_hex(&ce->oid));
+
+			if (source) {
+				out_fd = open_output_fd(path, ce, to_tempfile);
+				if (out_fd < 0)
+					return error_errno("unable to create file %s", path);
+				ret = textil_ext_copy_source_to_fd(source, out_fd);
+				fstat_done = fstat_checkout_output(out_fd, state, &st);
+				ret |= close(out_fd);
+				if (ret) {
+					unlink(path);
+					return error("unable to write file %s", path);
+				}
+				goto finish;
+			}
 
 			if (textil_ext_blob_oid_is_lfs_pointer(&ce->oid,
 							       &is_pointer,
@@ -381,35 +405,6 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 			if (!is_pointer)
 				goto no_takeover;
 
-			/*
-			 * The wave's materialize reply names a byte source for
-			 * every eager item before any output is opened. Those
-			 * outputs are ordinary Git outputs: O_EXCL on the final
-			 * path, no sibling temporary and no publication step.
-			 * Placeholders and wave misses keep the exact-output
-			 * temporary below.
-			 */
-			source = textil_ext_materialize_cache_lookup(
-				ce->name, oid_to_hex(&ce->oid));
-			if (source) {
-				trace2_region_enter("textil-ext", "output_create", the_repository);
-				out_fd = open_output_fd(path, ce, to_tempfile);
-				trace2_region_leave("textil-ext", "output_create", the_repository);
-				if (out_fd < 0)
-					return error_errno("unable to create file %s", path);
-				trace2_region_enter("textil-ext", "output_copy", the_repository);
-				ret = textil_ext_copy_source_to_fd(source, out_fd);
-				trace2_region_leave("textil-ext", "output_copy", the_repository);
-				fstat_done = fstat_checkout_output(out_fd, state, &st);
-				ret |= close(out_fd);
-				if (ret) {
-					unlink(path);
-					return error("unable to write file %s", path);
-				}
-				goto finish;
-			}
-
-			trace2_region_enter("textil-ext", "output_create", the_repository);
 			if (to_tempfile) {
 				out_fd = open_output_fd(path, ce, 1);
 				output_path = path;
@@ -419,7 +414,6 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 				out_fd = temp_output ? get_tempfile_fd(temp_output) : -1;
 				output_path = temp_output ? get_tempfile_path(temp_output) : NULL;
 			}
-			trace2_region_leave("textil-ext", "output_create", the_repository);
 			if (out_fd < 0) {
 				error_errno("unable to create file %s", path);
 				strbuf_release(&mat_err);
@@ -448,10 +442,8 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 					ce->ce_flags &= ~CE_SKIP_WORKTREE;
 			}
 
-			trace2_region_enter("textil-ext", "output_publish", the_repository);
 			ret = (to_tempfile ? close(out_fd) : close_tempfile_gently(temp_output)) ||
 			    (!to_tempfile && textil_ext_publish_checkout_temp(&temp_output, path));
-			trace2_region_leave("textil-ext", "output_publish", the_repository);
 			if (ret) {
 				error_errno("unable to publish file %s", path);
 				if (to_tempfile)

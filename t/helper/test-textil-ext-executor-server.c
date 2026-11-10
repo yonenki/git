@@ -69,6 +69,7 @@ enum reply_mode {
 	REPLY_MATERIALIZE_OK,
 	REPLY_MATERIALIZE_REJECTED,
 	REPLY_MATERIALIZE_SRC_PATH_RELATIVE,
+	REPLY_MATERIALIZE_SOURCE_OVERFLOW,
 	REPLY_MATERIALIZE_SRC_PATH_MAX,
 	REPLY_MATERIALIZE_SRC_PATH_TOO_LONG,
 	REPLY_MATERIALIZE_SRC_PATH_WITH_STATUS_ERROR,
@@ -77,6 +78,7 @@ enum reply_mode {
 	REPLY_MATERIALIZE_SRC_PATH_WINDOWS_VERBATIM,
 	REPLY_MATERIALIZE_SRC_PATH_WINDOWS_UNC,
 	REPLY_MATERIALIZE_CHECKOUT,
+	REPLY_MATERIALIZE_CHECKOUT_SHORT_SOURCE,
 	REPLY_MATERIALIZE_COUNT_MISMATCH,
 	REPLY_VALIDATE_REQUEST_MATERIALIZE,
 	REPLY_CHECKIN_CONVERT_CHECKIN,
@@ -183,6 +185,8 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_MATERIALIZE_REJECTED;
 	if (!strcmp(s, "materialize-src-path-relative"))
 		return REPLY_MATERIALIZE_SRC_PATH_RELATIVE;
+	if (!strcmp(s, "materialize-source-overflow"))
+		return REPLY_MATERIALIZE_SOURCE_OVERFLOW;
 	if (!strcmp(s, "materialize-src-path-with-status-error"))
 		return REPLY_MATERIALIZE_SRC_PATH_WITH_STATUS_ERROR;
 	if (!strcmp(s, "materialize-ok-without-src-path"))
@@ -199,6 +203,8 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_MATERIALIZE_SRC_PATH_WINDOWS_UNC;
 	if (!strcmp(s, "materialize-checkout"))
 		return REPLY_MATERIALIZE_CHECKOUT;
+	if (!strcmp(s, "materialize-checkout-short-source"))
+		return REPLY_MATERIALIZE_CHECKOUT_SHORT_SOURCE;
 	if (!strcmp(s, "batch-checkout"))
 		return REPLY_BATCH_CHECKOUT;
 	if (!strcmp(s, "ordered-batch-checkout"))
@@ -998,6 +1004,16 @@ static int app_cb(void *application_data UNUSED,
 		strbuf_release(&reply);
 		return ret;
 
+	case REPLY_MATERIALIZE_SOURCE_OVERFLOW:
+		/* offset + length exceeds INT64_MAX (offset alone overflows it) */
+		packet_buf_write(&reply, "status=ok\n");
+		packet_buf_delim(&reply);
+		packet_buf_write(&reply, "source=18446744073709551615:1:/x\n");
+		packet_buf_flush(&reply);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
 	case REPLY_MATERIALIZE_SRC_PATH_WITH_STATUS_ERROR:
 		/* status=error but includes src_path (forbidden) */
 		packet_buf_write(&reply, "status=error\n");
@@ -1048,10 +1064,12 @@ static int app_cb(void *application_data UNUSED,
 		strbuf_release(&reply);
 		return ret;
 
-	case REPLY_MATERIALIZE_CHECKOUT: {
+	case REPLY_MATERIALIZE_CHECKOUT:
+	case REPLY_MATERIALIZE_CHECKOUT_SHORT_SOURCE: {
 		/*
 		 * Parse request to extract item paths, create temp files
-		 * with predictable content, return src_paths.
+		 * with predictable content, return source ranges. The
+		 * short-source mode claims one byte past the end of each file.
 		 */
 		size_t pos = 0;
 		int in_header = 1;
@@ -1142,7 +1160,8 @@ static int app_cb(void *application_data UNUSED,
 			}
 			packet_buf_delim(&reply);
 			packet_buf_write(&reply, "source=0:%d:%s\n",
-					 (int)strlen("materialized-by-textil\n"),
+					 (int)strlen("materialized-by-textil\n") +
+					 (server_args.mode == REPLY_MATERIALIZE_CHECKOUT_SHORT_SOURCE),
 					 tmp_path.buf);
 			strbuf_release(&tmp_path);
 			strbuf_release(&item_paths[i]);
