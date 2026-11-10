@@ -534,6 +534,15 @@ test_expect_success 'materialize-src-path-relative: C-side validates absolute pa
 	grep "^status=invalid$" out
 '
 
+test_expect_success 'materialize-source-overflow: C-side rejects a range beyond INT64' '
+	restart_server materialize-source-overflow &&
+	test_must_fail env \
+		TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+		test-tool textil-ext-executor-server send-materialize \
+			--name="$IPC_PATH" >out &&
+	grep "^status=invalid$" out
+'
+
 test_expect_success MINGW 'materialize-src-path-windows-verbatim: C-side accepts verbatim drive path' '
 	restart_server materialize-src-path-windows-verbatim &&
 	env \
@@ -828,7 +837,13 @@ test_expect_success 'force on an indexed target still materializes with its real
 		test_cmp expect target.bin &&
 		expect_admission materialize 1 &&
 		grep "> old_blob_oid=$(cat old)\$" "$ADMISSION_PACKET_LOG" &&
-		! grep "> checkout_admission=verified_initial_absence\$" "$ADMISSION_PACKET_LOG"
+		! grep "> checkout_admission=verified_initial_absence\$" "$ADMISSION_PACKET_LOG" &&
+		# Git forwards the pointer bytes it already read to both phases, so
+		# the controller never re-reads the blob by OID.
+		git cat-file blob second:target.bin |
+			perl -0777 -ne "print unpack(\"H*\", \$_)" >pointer_hex &&
+		grep "> pointer_hex=$(cat pointer_hex)\$" "$ADMISSION_PACKET_LOG" >forwarded &&
+		test_line_count = 2 forwarded
 	)
 '
 
@@ -891,6 +906,31 @@ test_expect_success 'materialize E2E: checkout writes src_path content to file' 
 		test -f b.bin &&
 		grep "materialized-by-textil" a.bin &&
 		grep "materialized-by-textil" b.bin
+	)
+'
+
+# A short source range is an I/O failure of the ordinary O_EXCL output and
+# behaves like a stock Git write error: each failed output is reported and
+# removed, and its index entry is left not up to date (stock unpack_trees
+# reports check_updates failures without aborting the switch).
+test_expect_success 'materialize E2E: short source range leaves no partial output' '
+	restart_server materialize-checkout-short-source &&
+	(
+		cd executor-ipc-repo &&
+		git checkout -f main &&
+		env \
+			TEXTIL_GIT_EXT_POLICY_PATH="$(pwd)/../policy-ipc-mat-takeover.json" \
+			TEXTIL_GIT_EXT_POLICY_VERSION=v1 \
+			TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+			git checkout with-lfs 2>err &&
+		grep "cannot read completed source range" err &&
+		grep "unable to write file a.bin" err &&
+		grep "unable to write file b.bin" err &&
+		test_path_is_missing a.bin &&
+		test_path_is_missing b.bin &&
+		git diff --name-status -- a.bin b.bin >actual &&
+		printf "D\t%s\n" a.bin b.bin >expect &&
+		test_cmp expect actual
 	)
 '
 
@@ -1257,6 +1297,30 @@ test_expect_success '1000 and 10000 LFS entries accept large replies without ext
 		) &&
 		test_line_count = 2 "$trace_log" &&
 		check_batch_trace 8388608 "$count" "$trace_log" || return 1
+	done
+'
+
+# Eager wave items are ordinary Git outputs: O_EXCL on the final path, no
+# .textil-XXXXXX sibling and therefore no publication rename/link. The
+# materialize region proves the trace was written for the checkout wave.
+test_expect_success 'eager wave outputs are created in place without sibling temporaries' '
+	for workers in 1 2
+	do
+		make_batched_checkout_repo "eager-output-$workers" 40 &&
+		trace_log="$TRASH_DIRECTORY/eager-output-$workers.ndjson" &&
+		git_trace="$TRASH_DIRECTORY/eager-output-$workers.trace2" &&
+		test_when_finished stop_executor_server &&
+		TMPDIR="$TRASH_DIRECTORY" restart_server_with_trace ordered-batch-checkout "$trace_log" &&
+		(
+			cd "eager-output-$workers" &&
+			env TEXTIL_GIT_EXT_POLICY_PATH="$TRASH_DIRECTORY/policy-ipc-batched-checkout.json" \
+				TEXTIL_GIT_EXT_POLICY_VERSION=v1 TEXTIL_GIT_EXT_ENDPOINT="$IPC_PATH" \
+				GIT_TEST_CHECKOUT_WORKERS=$workers GIT_TRACE2_EVENT="$git_trace" \
+				git checkout with-lfs &&
+			test-tool textil-ext-executor-server verify-checkout --items=40
+		) &&
+		grep "\"event\":\"region_enter\".*\"label\":\"materialize\"" "$git_trace" &&
+		! grep "\"label\":\"checkout_temp\"" "$git_trace" || return 1
 	done
 '
 

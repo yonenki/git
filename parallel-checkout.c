@@ -210,6 +210,10 @@ static int pc_item_is_takeover_candidate(struct parallel_checkout_item *pc_item,
 	    ext_result->action != TEXTIL_ACTION_TAKEOVER ||
 	    !textil_ext_identity_conversion(&pc_item->ca))
 		return 0;
+	/* The wave admitted every cached (path, blob OID) as an LFS pointer. */
+	if (textil_ext_materialize_cache_lookup(pc_item->ce->name,
+						oid_to_hex(&pc_item->ce->oid)))
+		return 1;
 
 	if (textil_ext_blob_oid_is_lfs_pointer(&pc_item->ce->oid, &is_pointer,
 					       &pointer_err))
@@ -298,6 +302,9 @@ static int reset_fd(int fd, const char *path)
 
 
 static int close_and_clear(int *fd);
+static void write_pc_output(struct parallel_checkout_item *pc_item,
+			    struct checkout *state,
+			    const struct textil_ext_source *source);
 
 static int write_pc_item_to_fd(struct parallel_checkout_item *pc_item, int fd,
 			       const char *path)
@@ -361,6 +368,14 @@ static void write_pc_takeover(struct parallel_checkout_item *pc_item,
 	struct strbuf path = STRBUF_INIT, err = STRBUF_INIT;
 	struct tempfile *temp = NULL;
 	const char *dir_sep;
+	/* An eager wave item is an ordinary Git output (see write_entry). */
+	const struct textil_ext_source *source = textil_ext_materialize_cache_lookup(
+		pc_item->ce->name, oid_to_hex(&pc_item->ce->oid));
+
+	if (source) {
+		write_pc_output(pc_item, state, source);
+		return;
+	}
 
 	strbuf_add(&path, state->base_dir, state->base_dir_len);
 	strbuf_add(&path, pc_item->ce->name, pc_item->ce->ce_namelen);
@@ -424,8 +439,9 @@ static int close_and_clear(int *fd)
 	return ret;
 }
 
-void write_pc_item(struct parallel_checkout_item *pc_item,
-		   struct checkout *state)
+static void write_pc_output(struct parallel_checkout_item *pc_item,
+			    struct checkout *state,
+			    const struct textil_ext_source *source)
 {
 	unsigned int mode = (pc_item->ce->ce_mode & 0100) ? 0777 : 0666;
 	int fd = -1, fstat_done = 0;
@@ -471,7 +487,8 @@ void write_pc_item(struct parallel_checkout_item *pc_item,
 		goto out;
 	}
 
-	if (write_pc_item_to_fd(pc_item, fd, path.buf)) {
+	if (source ? textil_ext_copy_source_to_fd(source, fd) :
+		     write_pc_item_to_fd(pc_item, fd, path.buf)) {
 		/* Error was already reported. */
 		pc_item->status = PC_ITEM_FAILED;
 		close_and_clear(&fd);
@@ -504,6 +521,12 @@ void write_pc_item(struct parallel_checkout_item *pc_item,
 
 out:
 	strbuf_release(&path);
+}
+
+void write_pc_item(struct parallel_checkout_item *pc_item,
+		   struct checkout *state)
+{
+	write_pc_output(pc_item, state, NULL);
 }
 
 static void send_one_item(int fd, size_t item_id)

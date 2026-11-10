@@ -69,6 +69,7 @@ enum reply_mode {
 	REPLY_MATERIALIZE_OK,
 	REPLY_MATERIALIZE_REJECTED,
 	REPLY_MATERIALIZE_SRC_PATH_RELATIVE,
+	REPLY_MATERIALIZE_SOURCE_OVERFLOW,
 	REPLY_MATERIALIZE_SRC_PATH_MAX,
 	REPLY_MATERIALIZE_SRC_PATH_TOO_LONG,
 	REPLY_MATERIALIZE_SRC_PATH_WITH_STATUS_ERROR,
@@ -77,6 +78,7 @@ enum reply_mode {
 	REPLY_MATERIALIZE_SRC_PATH_WINDOWS_VERBATIM,
 	REPLY_MATERIALIZE_SRC_PATH_WINDOWS_UNC,
 	REPLY_MATERIALIZE_CHECKOUT,
+	REPLY_MATERIALIZE_CHECKOUT_SHORT_SOURCE,
 	REPLY_MATERIALIZE_COUNT_MISMATCH,
 	REPLY_VALIDATE_REQUEST_MATERIALIZE,
 	REPLY_CHECKIN_CONVERT_CHECKIN,
@@ -183,6 +185,8 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_MATERIALIZE_REJECTED;
 	if (!strcmp(s, "materialize-src-path-relative"))
 		return REPLY_MATERIALIZE_SRC_PATH_RELATIVE;
+	if (!strcmp(s, "materialize-source-overflow"))
+		return REPLY_MATERIALIZE_SOURCE_OVERFLOW;
 	if (!strcmp(s, "materialize-src-path-with-status-error"))
 		return REPLY_MATERIALIZE_SRC_PATH_WITH_STATUS_ERROR;
 	if (!strcmp(s, "materialize-ok-without-src-path"))
@@ -199,6 +203,8 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_MATERIALIZE_SRC_PATH_WINDOWS_UNC;
 	if (!strcmp(s, "materialize-checkout"))
 		return REPLY_MATERIALIZE_CHECKOUT;
+	if (!strcmp(s, "materialize-checkout-short-source"))
+		return REPLY_MATERIALIZE_CHECKOUT_SHORT_SOURCE;
 	if (!strcmp(s, "batch-checkout"))
 		return REPLY_BATCH_CHECKOUT;
 	if (!strcmp(s, "ordered-batch-checkout"))
@@ -952,7 +958,7 @@ static int app_cb(void *application_data UNUSED,
 			       4095 : 4096);
 		packet_buf_write(&reply, "status=ok\n");
 		packet_buf_delim(&reply);
-		packet_buf_write(&reply, "src_path=%s\n", path.buf);
+		packet_buf_write(&reply, "source=0:0:%s\n", path.buf);
 		packet_buf_flush(&reply);
 		strbuf_release(&path);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
@@ -973,7 +979,7 @@ static int app_cb(void *application_data UNUSED,
 		/* materialize ok with 1 src_path (matches 1-item batch) */
 		packet_buf_write(&reply, "status=ok\n");
 		packet_buf_delim(&reply);
-		packet_buf_write(&reply, "src_path=/tmp/textil/materialize/aa/bb/aabb1234\n");
+		packet_buf_write(&reply, "source=0:0:/tmp/textil/materialize/aa/bb/aabb1234\n");
 		packet_buf_flush(&reply);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
@@ -992,7 +998,17 @@ static int app_cb(void *application_data UNUSED,
 		/* materialize ok but src_path is relative (invalid) */
 		packet_buf_write(&reply, "status=ok\n");
 		packet_buf_delim(&reply);
-		packet_buf_write(&reply, "src_path=relative/path/file.bin\n");
+		packet_buf_write(&reply, "source=0:0:relative/path/file.bin\n");
+		packet_buf_flush(&reply);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
+	case REPLY_MATERIALIZE_SOURCE_OVERFLOW:
+		/* offset + length exceeds INT64_MAX (offset alone overflows it) */
+		packet_buf_write(&reply, "status=ok\n");
+		packet_buf_delim(&reply);
+		packet_buf_write(&reply, "source=18446744073709551615:1:/x\n");
 		packet_buf_flush(&reply);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
@@ -1003,7 +1019,7 @@ static int app_cb(void *application_data UNUSED,
 		packet_buf_write(&reply, "status=error\n");
 		packet_buf_write(&reply, "message=something failed\n");
 		packet_buf_delim(&reply);
-		packet_buf_write(&reply, "src_path=/tmp/should/not/be/here\n");
+		packet_buf_write(&reply, "source=0:0:/tmp/should/not/be/here\n");
 		packet_buf_flush(&reply);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
@@ -1022,7 +1038,7 @@ static int app_cb(void *application_data UNUSED,
 		packet_buf_write(&reply, "status=ok\n");
 		packet_buf_write(&reply, "message=should not be here\n");
 		packet_buf_delim(&reply);
-		packet_buf_write(&reply, "src_path=/tmp/textil/materialize/aa/bb/aabb1234\n");
+		packet_buf_write(&reply, "source=0:0:/tmp/textil/materialize/aa/bb/aabb1234\n");
 		packet_buf_flush(&reply);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
@@ -1032,7 +1048,7 @@ static int app_cb(void *application_data UNUSED,
 		packet_buf_write(&reply, "status=ok\n");
 		packet_buf_delim(&reply);
 		packet_buf_write(&reply,
-				 "src_path=\\\\?\\C:\\textil\\materialize\\aa\\bb\\aabb1234.bin\n");
+				 "source=0:0:\\\\?\\C:\\textil\\materialize\\aa\\bb\\aabb1234.bin\n");
 		packet_buf_flush(&reply);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
@@ -1042,16 +1058,18 @@ static int app_cb(void *application_data UNUSED,
 		packet_buf_write(&reply, "status=ok\n");
 		packet_buf_delim(&reply);
 		packet_buf_write(&reply,
-				 "src_path=\\\\server\\share\\textil\\materialize\\aa\\bb\\aabb1234.bin\n");
+				 "source=0:0:\\\\server\\share\\textil\\materialize\\aa\\bb\\aabb1234.bin\n");
 		packet_buf_flush(&reply);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
 		return ret;
 
-	case REPLY_MATERIALIZE_CHECKOUT: {
+	case REPLY_MATERIALIZE_CHECKOUT:
+	case REPLY_MATERIALIZE_CHECKOUT_SHORT_SOURCE: {
 		/*
 		 * Parse request to extract item paths, create temp files
-		 * with predictable content, return src_paths.
+		 * with predictable content, return source ranges. The
+		 * short-source mode claims one byte past the end of each file.
 		 */
 		size_t pos = 0;
 		int in_header = 1;
@@ -1141,7 +1159,9 @@ static int app_cb(void *application_data UNUSED,
 				close(tmp_fd);
 			}
 			packet_buf_delim(&reply);
-			packet_buf_write(&reply, "src_path=%s\n",
+			packet_buf_write(&reply, "source=0:%d:%s\n",
+					 (int)strlen("materialized-by-textil\n") +
+					 (server_args.mode == REPLY_MATERIALIZE_CHECKOUT_SHORT_SOURCE),
 					 tmp_path.buf);
 			strbuf_release(&tmp_path);
 			strbuf_release(&item_paths[i]);
@@ -1189,7 +1209,7 @@ static int app_cb(void *application_data UNUSED,
 		for (i = 0; i < nr_items + 1; i++) {
 			packet_buf_delim(&reply);
 			packet_buf_write(&reply,
-					 "src_path=/tmp/mismatch-%d\n", i);
+					 "source=0:0:/tmp/mismatch-%d\n", i);
 		}
 		packet_buf_flush(&reply);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
@@ -1210,7 +1230,7 @@ static int app_cb(void *application_data UNUSED,
 			packet_buf_write(&reply, "status=ok\n");
 			packet_buf_delim(&reply);
 			packet_buf_write(&reply,
-					 "src_path=/tmp/validate-ok\n");
+					 "source=0:0:/tmp/validate-ok\n");
 			packet_buf_flush(&reply);
 			ret = reply_cb(reply_data, reply.buf, reply.len);
 		} else {
@@ -1522,33 +1542,32 @@ static int app_cb(void *application_data UNUSED,
 
 		/* materialize: return ok + src_paths with temp files */
 		{
-			int i;
+			int i, tmp_fd;
+			uint64_t offset = 0;
+			struct strbuf tmp_path = STRBUF_INIT;
+			strbuf_addf(&tmp_path, "%s/batch-mat-XXXXXX",
+				    getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+			tmp_fd = mkstemp(tmp_path.buf);
+			if (tmp_fd < 0)
+				die_errno("cannot create test source spool");
 			packet_buf_write(&reply, "status=ok\n");
 			for (i = 0; i < nr_items; i++) {
-				struct strbuf tmp_path = STRBUF_INIT;
-				int tmp_fd;
-				strbuf_addf(&tmp_path, "%s/batch-mat-XXXXXX",
-					    getenv("TMPDIR") ? getenv("TMPDIR")
-							     : "/tmp");
-				tmp_fd = mkstemp(tmp_path.buf);
-				if (tmp_fd >= 0) {
-					const char *content =
-						"materialized-by-textil-batch\n";
-					write_in_full(tmp_fd, content,
-						      strlen(content));
-					if (server_args.mode == REPLY_ORDERED_BATCH_CHECKOUT) {
-						write_in_full(tmp_fd, items[i].path.buf,
-							      items[i].path.len);
-						write_in_full(tmp_fd, "\n", 1);
-					}
-					close(tmp_fd);
+				const char *content = "materialized-by-textil-batch\n";
+				uint64_t length = strlen(content);
+				write_in_full(tmp_fd, content, length);
+				if (server_args.mode == REPLY_ORDERED_BATCH_CHECKOUT) {
+					write_in_full(tmp_fd, items[i].path.buf, items[i].path.len);
+					write_in_full(tmp_fd, "\n", 1);
+					length += items[i].path.len + 1;
 				}
 				packet_buf_delim(&reply);
-				packet_buf_write(&reply, "src_path=%s\n",
-						 tmp_path.buf);
-				strbuf_release(&tmp_path);
+				packet_buf_write(&reply, "source=%"PRIu64":%"PRIu64":%s\n",
+						 offset, length, tmp_path.buf);
+				offset += length;
 				strbuf_release(&items[i].path);
 			}
+			close(tmp_fd);
+			strbuf_release(&tmp_path);
 			packet_buf_flush(&reply);
 			free(items);
 			ret = reply_cb(reply_data, reply.buf, reply.len);
@@ -1978,8 +1997,8 @@ int cmd__textil_ext_executor_server(int argc, const char **argv)
 			printf("status=invalid\n");
 			break;
 		}
-		for (i = 0; i < result.src_paths.nr; i++)
-			printf("src_path=%s\n", result.src_paths.items[i].string);
+		for (i = 0; i < result.sources.nr; i++)
+			printf("src_path=%s\n", result.sources.items[i].string);
 		if (err_buf.len)
 			printf("message=%s\n", err_buf.buf);
 

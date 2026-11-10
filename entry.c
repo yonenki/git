@@ -23,11 +23,9 @@
 #include "tempfile.h"
 
 /*
- * Materialize a single file to an open fd.
- *
- * Batch-first: looks up the pre-resolved cache first. Falls back to
- * single-item IPC only if the cache has no entry (non-wave single-file
- * checkout). The hot checkout wave path always hits the cache.
+ * Materialize a single takeover output that has no wave source: a native
+ * placeholder installed on the exact still-open output, or the single-item
+ * IPC fallback for a checkout outside a preflight wave.
  */
 int textil_ext_materialize_to_fd(const char *ce_name,
 					const struct object_id *ce_oid,
@@ -36,19 +34,6 @@ int textil_ext_materialize_to_fd(const char *ce_name,
 					int out_fd,
 					struct strbuf *err)
 {
-	const char *source = textil_ext_materialize_cache_lookup(
-		ce_name, oid_to_hex(ce_oid));
-	if (source) {
-		int src_fd = open(source, O_RDONLY);
-		int ret;
-		if (src_fd < 0)
-			return error_errno("textil-ext: cannot open cached src_path '%s'", source);
-		ret = copy_fd(src_fd, out_fd);
-		close(src_fd);
-		if (ret)
-			return error("textil-ext: copy_fd failed for '%s'", ce_name);
-		return 0;
-	}
 	{
 		int installed = textil_ext_try_install_placeholder(
 			ce_name, ce_oid, attr_filter, eval_result, out_fd, err);
@@ -382,6 +367,32 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 			int out_fd;
 			struct tempfile *temp_output = NULL;
 			const char *output_path;
+			/*
+			 * The wave's materialize reply names a byte source for
+			 * every eager item before any output is opened; the
+			 * wave admitted this (path, blob OID) as an LFS pointer.
+			 * Those outputs are ordinary Git outputs: O_EXCL on the
+			 * final path, no sibling temporary and no publication.
+			 * Placeholders and wave misses keep the exact-output
+			 * temporary below.
+			 */
+			const struct textil_ext_source *source =
+				textil_ext_materialize_cache_lookup(
+					ce->name, oid_to_hex(&ce->oid));
+
+			if (source) {
+				out_fd = open_output_fd(path, ce, to_tempfile);
+				if (out_fd < 0)
+					return error_errno("unable to create file %s", path);
+				ret = textil_ext_copy_source_to_fd(source, out_fd);
+				fstat_done = fstat_checkout_output(out_fd, state, &st);
+				ret |= close(out_fd);
+				if (ret) {
+					unlink(path);
+					return error("unable to write file %s", path);
+				}
+				goto finish;
+			}
 
 			if (textil_ext_blob_oid_is_lfs_pointer(&ce->oid,
 							       &is_pointer,
@@ -431,8 +442,9 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 					ce->ce_flags &= ~CE_SKIP_WORKTREE;
 			}
 
-			if ((to_tempfile ? close(out_fd) : close_tempfile_gently(temp_output)) ||
-			    (!to_tempfile && textil_ext_publish_checkout_temp(&temp_output, path))) {
+			ret = (to_tempfile ? close(out_fd) : close_tempfile_gently(temp_output)) ||
+			    (!to_tempfile && textil_ext_publish_checkout_temp(&temp_output, path));
+			if (ret) {
 				error_errno("unable to publish file %s", path);
 				if (to_tempfile)
 					unlink(output_path);

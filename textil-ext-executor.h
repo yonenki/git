@@ -63,6 +63,7 @@ struct textil_ext_takeover_item {
 	const char *rule_id;         /* matched rule id (borrowed) */
 	char *attr_filter;           /* selector input (owned, xstrdup; NULL ok) */
 	char *blob_oid;              /* blob object id hex (owned, xstrdup; NULL for checkin_convert) */
+	char *pointer_hex;           /* pointer bytes already read from ODB, owned */
 	char *old_blob_oid;          /* preflight predecessor (owned); NULL for target-only paths */
 	char *input_path;            /* abs path to input file (owned, xstrdup; NULL for preflight/materialize) */
 	int is_regular_file;         /* 0/1 */
@@ -149,16 +150,23 @@ int textil_ext_open_clean_input(struct index_state *index, const char *path);
 /*
  * Ordered materialize resolution result.
  *
- * `src_paths` is owned by the result object and preserves the same order as
- * the batch items that were sent to the backend. The executor validates that
- * the reply count matches the batch count before returning OK.
+ * `sources` is owned by the result object and preserves the same order as
+ * the batch items that were sent to the backend. Each source is a completed
+ * range of the invocation's source spool. The executor validates that the
+ * reply count matches the batch count before returning OK.
  *
  * Lifetime:
  *   - initialize with textil_ext_materialize_batch_result_init()
  *   - release with textil_ext_materialize_batch_result_release()
  */
+struct textil_ext_source {
+	char *path;
+	uint64_t offset;
+	uint64_t length;
+};
+int textil_ext_copy_source_to_fd(const struct textil_ext_source *source, int out_fd);
 struct textil_ext_materialize_batch_result {
-	struct string_list src_paths;
+	struct string_list sources; /* string=path; util=owned textil_ext_source */
 };
 
 void textil_ext_materialize_batch_result_init(
@@ -167,11 +175,11 @@ void textil_ext_materialize_batch_result_release(
 	struct textil_ext_materialize_batch_result *result);
 
 /*
- * Resolve materialize src_paths for a batch.
+ * Resolve materialize sources for a batch.
  *
  * This is the primary hot-path materialize executor API. The executor slices
  * requests only at item boundaries to fit the controller's byte budget,
- * validates each reply against its slice, and publishes one ordered src_path
+ * validates each reply against its slice, and publishes one ordered source
  * per batch item only after every slice succeeds.
  *
  * Preconditions:
@@ -204,8 +212,8 @@ int textil_ext_blob_oid_is_lfs_pointer(
  * High-level helper: resolve and copy a single file to an open fd.
  *
  * Builds a 1-item materialize batch from the eval_result and file metadata,
- * calls the batch-first materialize resolution API, opens the returned
- * src_path, and copies content to out_fd via copy_fd().
+ * calls the batch-first materialize resolution API, and copies the returned
+ * source range to out_fd.
  * All internal resources (batch, string_list, strbuf) are cleaned up.
  *
  * Returns 0 on success, -1 on any failure (error() already emitted).
@@ -306,8 +314,8 @@ void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch);
 /*
  * Batch-first materialize cache.
  *
- * Pre-resolves all materialize src_paths in a single IPC roundtrip before
- * the per-file checkout loop. entry.c looks up pre-resolved paths here
+ * Pre-resolves all materialize sources in a single IPC roundtrip before
+ * the per-file checkout loop. entry.c looks up pre-resolved sources here
  * instead of issuing per-file IPC.
  *
  * Lifecycle: create after preflight, populate with preresolve, lookup during
@@ -318,8 +326,8 @@ void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch);
  * Populate the global materialize cache from a preflight batch.
  *
  * Builds a materialize-phase batch from the same items used for preflight,
- * resolves all src_paths in one IPC call, and stores them keyed by
- * "path\0oid" for O(1) lookup during sequential checkout.
+ * resolves all sources in one IPC call, and stores them keyed by
+ * "path\toid" for O(1) lookup during sequential checkout.
  *
  * Returns 0 on success. On failure, returns -1 and appends to err.
  * If the cache is already populated, this is a no-op (returns 0).
@@ -328,8 +336,12 @@ int textil_ext_preresolve_materialize_cache(
 	const struct textil_ext_takeover_batch *preflight_batch,
 	struct strbuf *err);
 
-/* Look up a canonical source. The returned path is owned by the cache. */
-const char *textil_ext_materialize_cache_lookup(
+/*
+ * Completed range owned by this checkout wave. A hit is the eager decision:
+ * the caller writes an ordinary O_EXCL output. Placeholders are excluded
+ * from the materialize wave, so they and wave misses return NULL.
+ */
+const struct textil_ext_source *textil_ext_materialize_cache_lookup(
 	const char *path, const char *blob_oid_hex);
 
 /*
