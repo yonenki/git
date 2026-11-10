@@ -556,7 +556,7 @@ static enum pktline_mem_status pktline_read_mem(
 }
 
 /*
- * Validate a src_path value from a materialize response.
+ * Validate the pathname of a materialize source descriptor.
  *
  * Rules:
  * - Must be an absolute path (starts with '/' or Windows drive letter)
@@ -654,12 +654,12 @@ static struct textil_ext_source *parse_source(const char *value, size_t len)
  *   ...
  *   <flush>
  *
- * Materialize format (item_key = "src_path"):
+ * Materialize format (item_key = "source"; ranges of one source spool):
  *   <pkt> status=ok
  *   <delim>
- *   <pkt> src_path=<abs_path>
+ *   <pkt> source=<offset>:<length>:<abs_path>
  *   <delim>
- *   <pkt> src_path=<abs_path>
+ *   <pkt> source=<offset>:<length>:<abs_path>
  *   ...
  *   <flush>
  *
@@ -1577,7 +1577,7 @@ void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch)
 #include "strmap.h"
 
 /*
- * Global cache: "path\toid" → canonical src_path.
+ * Global cache: "path\toid" → completed source range.
  * Populated once before the sequential checkout loop, looked up per-file.
  */
 static struct strmap materialize_cache = STRMAP_INIT;

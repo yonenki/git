@@ -150,9 +150,10 @@ int textil_ext_open_clean_input(struct index_state *index, const char *path);
 /*
  * Ordered materialize resolution result.
  *
- * `src_paths` is owned by the result object and preserves the same order as
- * the batch items that were sent to the backend. The executor validates that
- * the reply count matches the batch count before returning OK.
+ * `sources` is owned by the result object and preserves the same order as
+ * the batch items that were sent to the backend. Each source is a completed
+ * range of the invocation's source spool. The executor validates that the
+ * reply count matches the batch count before returning OK.
  *
  * Lifetime:
  *   - initialize with textil_ext_materialize_batch_result_init()
@@ -174,11 +175,11 @@ void textil_ext_materialize_batch_result_release(
 	struct textil_ext_materialize_batch_result *result);
 
 /*
- * Resolve materialize src_paths for a batch.
+ * Resolve materialize sources for a batch.
  *
  * This is the primary hot-path materialize executor API. The executor slices
  * requests only at item boundaries to fit the controller's byte budget,
- * validates each reply against its slice, and publishes one ordered src_path
+ * validates each reply against its slice, and publishes one ordered source
  * per batch item only after every slice succeeds.
  *
  * Preconditions:
@@ -211,8 +212,8 @@ int textil_ext_blob_oid_is_lfs_pointer(
  * High-level helper: resolve and copy a single file to an open fd.
  *
  * Builds a 1-item materialize batch from the eval_result and file metadata,
- * calls the batch-first materialize resolution API, opens the returned
- * src_path, and copies content to out_fd via copy_fd().
+ * calls the batch-first materialize resolution API, and copies the returned
+ * source range to out_fd.
  * All internal resources (batch, string_list, strbuf) are cleaned up.
  *
  * Returns 0 on success, -1 on any failure (error() already emitted).
@@ -313,8 +314,8 @@ void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch);
 /*
  * Batch-first materialize cache.
  *
- * Pre-resolves all materialize src_paths in a single IPC roundtrip before
- * the per-file checkout loop. entry.c looks up pre-resolved paths here
+ * Pre-resolves all materialize sources in a single IPC roundtrip before
+ * the per-file checkout loop. entry.c looks up pre-resolved sources here
  * instead of issuing per-file IPC.
  *
  * Lifecycle: create after preflight, populate with preresolve, lookup during
@@ -325,8 +326,8 @@ void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch);
  * Populate the global materialize cache from a preflight batch.
  *
  * Builds a materialize-phase batch from the same items used for preflight,
- * resolves all src_paths in one IPC call, and stores them keyed by
- * "path\0oid" for O(1) lookup during sequential checkout.
+ * resolves all sources in one IPC call, and stores them keyed by
+ * "path\toid" for O(1) lookup during sequential checkout.
  *
  * Returns 0 on success. On failure, returns -1 and appends to err.
  * If the cache is already populated, this is a no-op (returns 0).
