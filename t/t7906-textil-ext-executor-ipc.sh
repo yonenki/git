@@ -828,7 +828,13 @@ test_expect_success 'force on an indexed target still materializes with its real
 		test_cmp expect target.bin &&
 		expect_admission materialize 1 &&
 		grep "> old_blob_oid=$(cat old)\$" "$ADMISSION_PACKET_LOG" &&
-		! grep "> checkout_admission=verified_initial_absence\$" "$ADMISSION_PACKET_LOG"
+		! grep "> checkout_admission=verified_initial_absence\$" "$ADMISSION_PACKET_LOG" &&
+		# Git forwards the pointer bytes it already read to both phases, so
+		# the controller never re-reads the blob by OID.
+		git cat-file blob second:target.bin |
+			perl -0777 -ne "print unpack(\"H*\", \$_)" >pointer_hex &&
+		grep "> pointer_hex=$(cat pointer_hex)\$" "$ADMISSION_PACKET_LOG" >forwarded &&
+		test_line_count = 2 forwarded
 	)
 '
 

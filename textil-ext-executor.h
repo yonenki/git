@@ -63,6 +63,7 @@ struct textil_ext_takeover_item {
 	const char *rule_id;         /* matched rule id (borrowed) */
 	char *attr_filter;           /* selector input (owned, xstrdup; NULL ok) */
 	char *blob_oid;              /* blob object id hex (owned, xstrdup; NULL for checkin_convert) */
+	char *pointer_hex;           /* pointer bytes already read from ODB, owned */
 	char *old_blob_oid;          /* preflight predecessor (owned); NULL for target-only paths */
 	char *input_path;            /* abs path to input file (owned, xstrdup; NULL for preflight/materialize) */
 	int is_regular_file;         /* 0/1 */
@@ -157,8 +158,14 @@ int textil_ext_open_clean_input(struct index_state *index, const char *path);
  *   - initialize with textil_ext_materialize_batch_result_init()
  *   - release with textil_ext_materialize_batch_result_release()
  */
+struct textil_ext_source {
+	char *path;
+	uint64_t offset;
+	uint64_t length;
+};
+int textil_ext_copy_source_to_fd(const struct textil_ext_source *source, int out_fd);
 struct textil_ext_materialize_batch_result {
-	struct string_list src_paths;
+	struct string_list sources; /* string=path; util=owned textil_ext_source */
 };
 
 void textil_ext_materialize_batch_result_init(
@@ -328,8 +335,8 @@ int textil_ext_preresolve_materialize_cache(
 	const struct textil_ext_takeover_batch *preflight_batch,
 	struct strbuf *err);
 
-/* Look up a canonical source. The returned path is owned by the cache. */
-const char *textil_ext_materialize_cache_lookup(
+/* Completed range owned by this checkout wave. */
+const struct textil_ext_source *textil_ext_materialize_cache_lookup(
 	const char *path, const char *blob_oid_hex);
 
 /*

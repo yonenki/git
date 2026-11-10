@@ -21,6 +21,7 @@
 #include "convert.h"
 #include "copy.h"
 #include "tempfile.h"
+#include "trace2.h"
 
 /*
  * Materialize a single file to an open fd.
@@ -36,18 +37,10 @@ int textil_ext_materialize_to_fd(const char *ce_name,
 					int out_fd,
 					struct strbuf *err)
 {
-	const char *source = textil_ext_materialize_cache_lookup(
+	const struct textil_ext_source *source = textil_ext_materialize_cache_lookup(
 		ce_name, oid_to_hex(ce_oid));
 	if (source) {
-		int src_fd = open(source, O_RDONLY);
-		int ret;
-		if (src_fd < 0)
-			return error_errno("textil-ext: cannot open cached src_path '%s'", source);
-		ret = copy_fd(src_fd, out_fd);
-		close(src_fd);
-		if (ret)
-			return error("textil-ext: copy_fd failed for '%s'", ce_name);
-		return 0;
+		return textil_ext_copy_source_to_fd(source, out_fd);
 	}
 	{
 		int installed = textil_ext_try_install_placeholder(
@@ -394,6 +387,7 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 			if (!is_pointer)
 				goto no_takeover;
 
+			trace2_region_enter("textil-ext", "output_create", the_repository);
 			if (to_tempfile) {
 				out_fd = open_output_fd(path, ce, 1);
 				output_path = path;
@@ -403,6 +397,7 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 				out_fd = temp_output ? get_tempfile_fd(temp_output) : -1;
 				output_path = temp_output ? get_tempfile_path(temp_output) : NULL;
 			}
+			trace2_region_leave("textil-ext", "output_create", the_repository);
 			if (out_fd < 0) {
 				error_errno("unable to create file %s", path);
 				strbuf_release(&mat_err);
@@ -411,11 +406,13 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 
 			{
 				int mat_rc;
+				trace2_region_enter("textil-ext", "output_copy", the_repository);
 				mat_rc = textil_ext_materialize_to_fd(
 				    ce->name, &ce->oid,
 				    conv_attrs_filter_name(ca),
 				    &ext_result,
 				    out_fd, &mat_err);
+				trace2_region_leave("textil-ext", "output_copy", the_repository);
 				if (mat_rc < 0) {
 					error("%s", mat_err.buf);
 					if (to_tempfile) {
@@ -431,8 +428,11 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 					ce->ce_flags &= ~CE_SKIP_WORKTREE;
 			}
 
-			if ((to_tempfile ? close(out_fd) : close_tempfile_gently(temp_output)) ||
-			    (!to_tempfile && textil_ext_publish_checkout_temp(&temp_output, path))) {
+			trace2_region_enter("textil-ext", "output_publish", the_repository);
+			ret = (to_tempfile ? close(out_fd) : close_tempfile_gently(temp_output)) ||
+			    (!to_tempfile && textil_ext_publish_checkout_temp(&temp_output, path));
+			trace2_region_leave("textil-ext", "output_publish", the_repository);
+			if (ret) {
 				error_errno("unable to publish file %s", path);
 				if (to_tempfile)
 					unlink(output_path);

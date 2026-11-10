@@ -404,8 +404,11 @@ static int build_batch_item(
 		packet_buf_write(out, "attr_filter=%s\n", item->attr_filter);
 	if (batch->phase == TEXTIL_EXT_EXEC_PHASE_CHECKIN_CONVERT)
 		packet_buf_write(out, "input_path=%s\n", item->input_path);
-	else
+	else {
 		packet_buf_write(out, "blob_oid=%s\n", item->blob_oid);
+		if (item->pointer_hex)
+			packet_buf_write(out, "pointer_hex=%s\n", item->pointer_hex);
+	}
 	if (item->old_blob_oid)
 		packet_buf_write(out, "old_blob_oid=%s\n", item->old_blob_oid);
 	if (batch->phase == TEXTIL_EXT_EXEC_PHASE_PREFLIGHT)
@@ -612,6 +615,34 @@ static int validate_pointer_hex(const char *value, size_t len)
 			return -1;
 	return 0;
 }
+/* Protocol boundary: two decimal fields precede the absolute pathname.
+ * A Windows drive ':' is therefore unambiguous. */
+static struct textil_ext_source *parse_source(const char *value, size_t len)
+{
+	const char *cursor = value, *end = value + len;
+	uint64_t fields[2] = { 0, 0 };
+	struct textil_ext_source *source;
+	for (int i = 0; i < 2; i++) {
+		int digits = 0;
+		while (cursor < end && *cursor >= '0' && *cursor <= '9') {
+			unsigned digit = *cursor++ - '0';
+			if (fields[i] > (UINT64_MAX - digit) / 10)
+				return NULL;
+			fields[i] = fields[i] * 10 + digit;
+			digits++;
+		}
+		if (!digits || cursor == end || *cursor++ != ':')
+			return NULL;
+	}
+	if (fields[0] > INT64_MAX || fields[1] > INT64_MAX - fields[0] ||
+	    validate_src_path(cursor, end - cursor))
+		return NULL;
+	CALLOC_ARRAY(source, 1);
+	source->offset = fields[0];
+	source->length = fields[1];
+	source->path = xmemdupz(cursor, end - cursor);
+	return source;
+}
 
 /*
  * Parse a pkt-line v1 executor response.
@@ -747,12 +778,19 @@ static int parse_executor_response(const char *buf, size_t len,
 				struct strbuf value_buf = STRBUF_INIT;
 				if (has_item_value)
 					return -1;
-				if (!strcmp(item_key, "src_path") ?
-				    validate_src_path(val, val_len) :
-				    validate_pointer_hex(val, val_len))
-					return -1;
-				strbuf_add(&value_buf, val, val_len);
-				string_list_append(item_values_out, value_buf.buf);
+				if (!strcmp(item_key, "source")) {
+					struct textil_ext_source *source = parse_source(val, val_len);
+					struct string_list_item *item;
+					if (!source)
+						return -1;
+					item = string_list_append_nodup(item_values_out, source->path);
+					item->util = source;
+				} else {
+					if (validate_pointer_hex(val, val_len))
+						return -1;
+					strbuf_add(&value_buf, val, val_len);
+					string_list_append(item_values_out, value_buf.buf);
+				}
 				has_item_value = 1;
 				strbuf_release(&value_buf);
 			} else if (fence_oids_out && key_len == 9 &&
@@ -951,15 +989,17 @@ static enum textil_ext_executor_status execute_item_value_batch(
 				fence_oids_out ? &slice_oids : NULL, err);
 			if (status == TEXTIL_EXT_EXECUTOR_OK) {
 				for (i = 0; i < slice_values.nr; i++) {
-					string_list_append_nodup(&values, slice_values.items[i].string);
+					struct string_list_item *item = string_list_append_nodup(&values, slice_values.items[i].string);
+					item->util = slice_values.items[i].util;
 					slice_values.items[i].string = NULL;
+					slice_values.items[i].util = NULL;
 				}
 				for (i = 0; i < slice_oids.nr; i++) {
 					string_list_append_nodup(&oids, slice_oids.items[i].string);
 					slice_oids.items[i].string = NULL;
 				}
 			}
-			string_list_clear(&slice_values, 0);
+			string_list_clear(&slice_values, 1);
 			string_list_clear(&slice_oids, 0);
 		}
 		if (status != TEXTIL_EXT_EXECUTOR_OK)
@@ -969,8 +1009,10 @@ static enum textil_ext_executor_status execute_item_value_batch(
 
 	/* Publish ordered results only after every slice has succeeded. */
 	for (i = 0; i < values.nr; i++) {
-		string_list_append_nodup(item_values_out, values.items[i].string);
+		struct string_list_item *item = string_list_append_nodup(item_values_out, values.items[i].string);
+		item->util = values.items[i].util;
 		values.items[i].string = NULL;
+		values.items[i].util = NULL;
 	}
 	if (fence_oids_out)
 		for (i = 0; i < oids.nr; i++) {
@@ -979,7 +1021,7 @@ static enum textil_ext_executor_status execute_item_value_batch(
 		}
 done:
 	strbuf_release(&request);
-	string_list_clear(&values, 0);
+	string_list_clear(&values, 1);
 	string_list_clear(&oids, 0);
 	return status;
 }
@@ -1071,7 +1113,7 @@ static int blob_content_is_lfs_pointer(const char *buf, size_t len)
 static int blob_oid_is_pointer(
 	const struct object_id *oid,
 	const char *source_prefix,
-	int *is_pointer,
+	int *is_pointer, char **pointer_hex,
 	struct strbuf *err)
 {
 	enum object_type type;
@@ -1106,6 +1148,15 @@ static int blob_oid_is_pointer(
 	*is_pointer = source_prefix ?
 		starts_with(blob, source_prefix) :
 		blob_content_is_lfs_pointer(blob, size);
+	if (*is_pointer && pointer_hex) {
+		char *hex = xmalloc(size * 2 + 1);
+		for (size_t i = 0; i < size; i++) {
+			hex[2 * i] = "0123456789abcdef"[((unsigned char *)blob)[i] >> 4];
+			hex[2 * i + 1] = "0123456789abcdef"[((unsigned char *)blob)[i] & 15];
+		}
+		hex[2 * size] = '\0';
+		*pointer_hex = hex;
+	}
 	free(blob);
 	return 0;
 }
@@ -1115,14 +1166,18 @@ int textil_ext_blob_oid_is_lfs_pointer(
 	int *is_pointer,
 	struct strbuf *err)
 {
-	return blob_oid_is_pointer(oid, NULL, is_pointer, err);
+	int ret;
+	trace2_region_enter("textil-ext", "pointer_check", the_repository);
+	ret = blob_oid_is_pointer(oid, NULL, is_pointer, NULL, err);
+	trace2_region_leave("textil-ext", "pointer_check", the_repository);
+	return ret;
 }
 
 static int blob_oid_is_takeover_candidate(
 	const struct object_id *oid,
 	const char *filter_name,
 	enum textil_ext_executor_phase phase,
-	int *is_pointer,
+	int *is_pointer, char **pointer_hex,
 	struct strbuf *err)
 {
 	const char *source_prefix;
@@ -1131,7 +1186,7 @@ static int blob_oid_is_takeover_candidate(
 	if (!filter_name)
 		return 0;
 	if (!strcmp(filter_name, "lfs"))
-		return textil_ext_blob_oid_is_lfs_pointer(oid, is_pointer, err);
+		return blob_oid_is_pointer(oid, NULL, is_pointer, pointer_hex, err);
 	if (phase != TEXTIL_EXT_EXEC_PHASE_PREFLIGHT)
 		return 0;
 	if (!strcmp(filter_name, "p4"))
@@ -1142,7 +1197,7 @@ static int blob_oid_is_takeover_candidate(
 		return 0;
 
 	/* Rust textil-source-pointer owns validation; only select candidates. */
-	return blob_oid_is_pointer(oid, source_prefix, is_pointer, err);
+	return blob_oid_is_pointer(oid, source_prefix, is_pointer, pointer_hex, err);
 }
 
 static void textil_ext_collect_takeover_batch(
@@ -1168,6 +1223,7 @@ static void textil_ext_collect_takeover_batch(
 		struct textil_ext_takeover_item *item;
 		struct strbuf pointer_err = STRBUF_INIT;
 		int is_pointer = 0;
+		char *pointer_hex = NULL;
 
 		if (!(ce->ce_flags & CE_UPDATE))
 			continue;
@@ -1196,7 +1252,7 @@ static void textil_ext_collect_takeover_batch(
 			continue;
 
 		if (blob_oid_is_takeover_candidate(&ce->oid, filter_name, phase,
-						  &is_pointer, &pointer_err))
+						  &is_pointer, &pointer_hex, &pointer_err))
 			die("%s", pointer_err.buf);
 		strbuf_release(&pointer_err);
 		if (!is_pointer)
@@ -1211,6 +1267,7 @@ static void textil_ext_collect_takeover_batch(
 		item->attr_filter = filter_name ?
 			xstrdup(filter_name) : NULL;
 		item->blob_oid = xstrdup(oid_to_hex(&ce->oid));
+		item->pointer_hex = pointer_hex;
 		item->is_regular_file = 1;
 		item->strict = ext_result.strict;
 		item->capabilities = ext_result.capabilities;
@@ -1439,7 +1496,7 @@ void textil_ext_materialize_batch_result_init(
 		BUG("textil_ext_materialize_batch_result_init called with NULL result");
 
 	memset(result, 0, sizeof(*result));
-	string_list_init_dup(&result->src_paths);
+	string_list_init_dup(&result->sources);
 }
 
 void textil_ext_materialize_batch_result_release(
@@ -1448,7 +1505,7 @@ void textil_ext_materialize_batch_result_release(
 	if (!result)
 		return;
 
-	string_list_clear(&result->src_paths, 0);
+	string_list_clear(&result->sources, 1);
 }
 
 enum textil_ext_executor_status textil_ext_resolve_materialize_batch(
@@ -1466,7 +1523,7 @@ enum textil_ext_executor_status textil_ext_resolve_materialize_batch(
 		BUG("resolve_materialize_batch called with NULL err");
 
 	return execute_item_value_batch(batch, "materialize",
-				      &result_out->src_paths, "src_path", NULL, err);
+				      &result_out->sources, "source", NULL, err);
 }
 
 
@@ -1509,6 +1566,7 @@ void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch)
 		free(batch->items[i].path);
 		free(batch->items[i].attr_filter);
 		free(batch->items[i].blob_oid);
+		free(batch->items[i].pointer_hex);
 		free(batch->items[i].old_blob_oid);
 		free(batch->items[i].input_path);
 	}
@@ -1523,6 +1581,36 @@ void textil_ext_takeover_batch_release(struct textil_ext_takeover_batch *batch)
  * Populated once before the sequential checkout loop, looked up per-file.
  */
 static struct strmap materialize_cache = STRMAP_INIT;
+static struct strmap source_handles = STRMAP_INIT;
+
+int textil_ext_copy_source_to_fd(const struct textil_ext_source *source, int out_fd)
+{
+	int *fd = strmap_get(&source_handles, source->path);
+	uint64_t offset = source->offset, remaining = source->length;
+	char buffer[65536];
+	if (!fd) {
+		int opened = open(source->path, O_RDONLY);
+		if (opened < 0)
+			return error_errno("textil-ext: cannot open source spool '%s'", source->path);
+		fd = xmalloc(sizeof(*fd));
+		*fd = opened;
+		strmap_put(&source_handles, source->path, fd);
+	}
+	while (remaining) {
+		size_t count = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+		ssize_t read = xpread(*fd, buffer, count, (off_t)offset);
+		if (read <= 0) {
+			if (!read)
+				errno = EIO;
+			return error_errno("textil-ext: cannot read completed source range");
+		}
+		if (write_in_full(out_fd, buffer, read) < 0)
+			return error_errno("textil-ext: cannot write checkout output");
+		offset += read;
+		remaining -= read;
+	}
+	return 0;
+}
 static int materialize_cache_populated;
 
 static char *make_cache_key(const char *path, const char *oid_hex)
@@ -1558,6 +1646,7 @@ int textil_ext_preresolve_materialize_cache(
 		items[i].rule_id = src->rule_id;
 		items[i].attr_filter = src->attr_filter ? xstrdup(src->attr_filter) : NULL;
 		items[i].blob_oid = src->blob_oid ? xstrdup(src->blob_oid) : NULL;
+		items[i].pointer_hex = src->pointer_hex ? xstrdup(src->pointer_hex) : NULL;
 		items[i].is_regular_file = src->is_regular_file;
 		items[i].strict = src->strict;
 		items[i].capabilities = src->capabilities;
@@ -1583,17 +1672,18 @@ int textil_ext_preresolve_materialize_cache(
 		return -1;
 	}
 
-	if (result.src_paths.nr != preflight_batch->nr_items)
-		BUG("preresolve: batch returned %lu src_paths for %d items",
-		    (unsigned long)result.src_paths.nr, preflight_batch->nr_items);
+	if (result.sources.nr != preflight_batch->nr_items)
+		BUG("preresolve: batch returned %lu sources for %d items",
+		    (unsigned long)result.sources.nr, preflight_batch->nr_items);
 
 	/* cache にストアする */
 	for (i = 0; i < preflight_batch->nr_items; i++) {
 		char *key = make_cache_key(
 			preflight_batch->items[i].path,
 			preflight_batch->items[i].blob_oid);
-		strmap_put(&materialize_cache, key, result.src_paths.items[i].string);
-		result.src_paths.items[i].string = NULL;
+		strmap_put(&materialize_cache, key, result.sources.items[i].util);
+		result.sources.items[i].string = NULL;
+		result.sources.items[i].util = NULL;
 		free(key);
 	}
 	materialize_cache_populated = 1;
@@ -1605,11 +1695,11 @@ int textil_ext_preresolve_materialize_cache(
 	return 0;
 }
 
-const char *textil_ext_materialize_cache_lookup(
+const struct textil_ext_source *textil_ext_materialize_cache_lookup(
 	const char *path, const char *blob_oid_hex)
 {
 	char *key;
-	const char *source;
+	const struct textil_ext_source *source;
 
 	if (!materialize_cache_populated)
 		return NULL;
@@ -1624,8 +1714,17 @@ void textil_ext_materialize_cache_clear(void)
 	struct hashmap_iter iter;
 	struct strmap_entry *entry;
 
-	hashmap_for_each_entry(&materialize_cache.map, &iter, entry, ent)
-		free(entry->value);
+	hashmap_for_each_entry(&materialize_cache.map, &iter, entry, ent) {
+		struct textil_ext_source *source = entry->value;
+		free(source->path);
+		free(source);
+	}
+	hashmap_for_each_entry(&source_handles.map, &iter, entry, ent) {
+		int *fd = entry->value;
+		close(*fd);
+		free(fd);
+	}
+	strmap_clear(&source_handles, 0);
 	strmap_clear(&materialize_cache, 0);
 	materialize_cache_populated = 0;
 	strmap_clear(&placeholder_cache, 0);
@@ -1646,7 +1745,7 @@ int textil_ext_materialize_one_to_fd(
 	struct textil_ext_takeover_item item;
 	struct textil_ext_materialize_batch_result result;
 	enum textil_ext_executor_status st;
-	int src_fd, ret = -1;
+	int ret = -1;
 
 	memset(&batch, 0, sizeof(batch));
 	memset(&item, 0, sizeof(item));
@@ -1656,6 +1755,11 @@ int textil_ext_materialize_one_to_fd(
 	item.rule_id = eval_result->rule_id;
 	item.attr_filter = attr_filter ? xstrdup(attr_filter) : NULL;
 	item.blob_oid = xstrdup(oid_to_hex(ce_oid));
+	{
+		int is_pointer;
+		if (blob_oid_is_pointer(ce_oid, NULL, &is_pointer, &item.pointer_hex, err))
+			goto cleanup;
+	}
 	item.is_regular_file = 1;
 	item.strict = eval_result->strict;
 	item.capabilities = eval_result->capabilities;
@@ -1674,21 +1778,7 @@ int textil_ext_materialize_one_to_fd(
 		goto cleanup;
 	}
 
-	src_fd = open(result.src_paths.items[0].string, O_RDONLY);
-	if (src_fd < 0) {
-		error_errno("textil-ext: cannot open src_path '%s'",
-			    result.src_paths.items[0].string);
-		goto cleanup;
-	}
-
-	if (copy_fd(src_fd, out_fd)) {
-		close(src_fd);
-		error("textil-ext: copy_fd failed for '%s'", ce_name);
-		goto cleanup;
-	}
-
-	close(src_fd);
-	ret = 0;
+	ret = textil_ext_copy_source_to_fd(result.sources.items[0].util, out_fd);
 
 cleanup:
 	textil_ext_takeover_batch_release(&batch);
@@ -2072,8 +2162,15 @@ int textil_ext_try_install_placeholder(const char *path,
 	batch.nr_items = 1;
 	batch.output_handle = (uint64_t)(uintptr_t)_get_osfhandle(out_fd);
 	batch.output_process = GetCurrentProcessId();
-	status = textil_ext_execute_takeover_batch(&batch, err);
-	ret = status != TEXTIL_EXT_EXECUTOR_OK ? -1 : item.projected == 2;
+	{
+		int is_pointer;
+		if (blob_oid_is_pointer(oid, NULL, &is_pointer, &item.pointer_hex, err))
+			ret = -1;
+		else {
+			status = textil_ext_execute_takeover_batch(&batch, err);
+			ret = status != TEXTIL_EXT_EXECUTOR_OK ? -1 : item.projected == 2;
+		}
+	}
 	textil_ext_takeover_batch_release(&batch);
 	strbuf_release(&root);
 	return ret;
