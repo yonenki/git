@@ -95,15 +95,17 @@ test_expect_success 'the following commit writes only its commit object' '
 test_expect_success 'objects already in the repository are not written again' '
 	(
 		cd packed &&
+		ls .git/objects/pack/*.idx >idx-before &&
 		printf "new\n" >Source/Game/new.txt &&
+		# A new path whose content is an object already in the repository.
+		cp Source/Game/Game.cpp Source/Game/copy.cpp &&
 		git add --textil-pack-objects . &&
-		ls .git/objects/pack/*.pack >packs &&
-		test_line_count = 2 packs &&
-		new_blob=$(git rev-parse :Source/Game/new.txt) &&
-		new_pack=$(ls -t .git/objects/pack/*.idx | head -n 1) &&
-		git show-index <"$new_pack" | cut -d" " -f2 >new-pack-oids &&
-		grep "$new_blob" new-pack-oids &&
-		! grep "$(git rev-parse :Source/Game/Game.cpp)" new-pack-oids
+		ls .git/objects/pack/*.idx >idx-after &&
+		comm -13 idx-before idx-after >new-idx &&
+		test_line_count = 1 new-idx &&
+		git show-index <"$(cat new-idx)" | cut -d" " -f2 >new-pack-oids &&
+		grep "$(git rev-parse :Source/Game/new.txt)" new-pack-oids &&
+		! grep "$(git rev-parse :Source/Game/copy.cpp)" new-pack-oids
 	)
 '
 
