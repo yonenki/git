@@ -233,7 +233,7 @@ static int update_some(const struct object_id *oid, struct strbuf *base,
 			discard_cache_entry(ce);
 			return 0;
 		}
-		if (!oideq(&ce->oid, &old->oid))
+		if (ctx->replaced && !oideq(&ce->oid, &old->oid))
 			add_index_entry(ctx->replaced,
 					dup_cache_entry(old, ctx->replaced),
 					ADD_CACHE_OK_TO_ADD | ADD_CACHE_SKIP_DFCHECK);
@@ -468,8 +468,7 @@ static int checkout_worktree(const struct checkout_opts *opts,
 	state.force = 1;
 	state.refresh_cache = 1;
 	state.istate = the_repository->index;
-	state.textil_records_index = records_index &&
-		textil_index_is_repository_index(the_repository->index);
+	state.textil_records_index = records_index;
 	state.textil_previous_index = replaced;
 
 	mem_pool_init(&ce_mem_pool, 0);
@@ -547,6 +546,7 @@ static int checkout_paths(const struct checkout_opts *opts,
 	int errs = 0;
 	struct lock_file lock_file = LOCK_INIT;
 	int checkout_index;
+	int textil_records_index;
 	struct index_state replaced = INDEX_STATE_INIT(the_repository);
 
 	trace2_cmd_mode(opts->patch_mode ? "patch" : "path");
@@ -655,9 +655,26 @@ static int checkout_paths(const struct checkout_opts *opts,
 	if (repo_read_index_preload(the_repository, &opts->pathspec, 0) < 0)
 		return error(_("index file corrupt"));
 
+	/*
+	 * Allow updating the index when checking out from the index.
+	 * This is to save new stat info.
+	 */
+	if (opts->checkout_worktree && !opts->checkout_index && !opts->source_tree)
+		checkout_index = 1;
+	else
+		checkout_index = opts->checkout_index;
+	/*
+	 * Textil: only outputs written to the worktree whose stat is recorded
+	 * in the repository index take a chosen mtime, so only they need the
+	 * entries update_some replaces.
+	 */
+	textil_records_index = opts->checkout_worktree && checkout_index &&
+		textil_index_is_repository_index(the_repository->index);
+
 	if (opts->source_tree)
 		read_tree_some(opts->source_tree, &opts->pathspec,
-			       opts->overlay_mode, &replaced);
+			       opts->overlay_mode,
+			       textil_records_index ? &replaced : NULL);
 	if (opts->merge)
 		unmerge_index(the_repository->index, &opts->pathspec, CE_MATCHED);
 
@@ -708,19 +725,10 @@ static int checkout_paths(const struct checkout_opts *opts,
 		return 1;
 	}
 
-	/*
-	 * Allow updating the index when checking out from the index.
-	 * This is to save new stat info.
-	 */
-	if (opts->checkout_worktree && !opts->checkout_index && !opts->source_tree)
-		checkout_index = 1;
-	else
-		checkout_index = opts->checkout_index;
-
 	/* Now we are committed to check them out */
 	if (opts->checkout_worktree)
-		errs |= checkout_worktree(opts, new_branch_info, checkout_index,
-					  &replaced);
+		errs |= checkout_worktree(opts, new_branch_info,
+					  textil_records_index, &replaced);
 	else
 		remove_marked_cache_entries(the_repository->index, 1);
 	discard_index(&replaced);

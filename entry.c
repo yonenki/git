@@ -22,20 +22,32 @@
 #include "copy.h"
 #include "tempfile.h"
 #include "read-cache-ll.h"
+#include "name-hash.h"
 
 int textil_checkout_replaced_mtime(const struct checkout *state,
 				   const struct cache_entry *ce, uint32_t *sec)
 {
 	struct index_state *previous = state->textil_previous_index;
+	const struct cache_entry *old;
 	int pos;
 
 	if (!previous)
 		return 0;
 	/* Never expand a sparse previous index for this lookup. */
 	pos = index_name_pos_sparse(previous, ce->name, ce_namelen(ce));
-	if (pos < 0 || oideq(&previous->cache[pos]->oid, &ce->oid))
+	if (pos >= 0)
+		old = previous->cache[pos];
+	else if (repo_ignore_case(the_repository))
+		/*
+		 * A case-only rename replaces the old spelling on a
+		 * case-insensitive worktree; match it as icase_exists() does.
+		 */
+		old = index_file_exists(previous, ce->name, ce_namelen(ce), 1);
+	else
+		old = NULL;
+	if (!old || ce_stage(old) || oideq(&old->oid, &ce->oid))
 		return 0;
-	*sec = previous->cache[pos]->ce_stat_data.sd_mtime.sec;
+	*sec = old->ce_stat_data.sd_mtime.sec;
 	return 1;
 }
 

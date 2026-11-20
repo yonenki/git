@@ -106,6 +106,11 @@ test_expect_success 'setup' '
 		write_pointer dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd 9 >dir/c.bin &&
 		git add dir/c.bin &&
 		git commit -m third &&
+		git switch -c renamed main &&
+		git mv dir/a.bin dir/A.bin &&
+		write_pointer eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee 9 >dir/A.bin &&
+		git add dir/A.bin &&
+		git commit -m "case-only rename with a same-size object" &&
 		git switch main
 	)
 '
@@ -142,6 +147,20 @@ test_expect_success 'a new path has no replaced mtime' '
 		placeholder_git switch third &&
 		expect_output_index recorded &&
 		expect_replaced_mtime &&
+		git checkout -q -f main
+	)
+'
+
+# A case-only rename replaces the old spelling on a case-insensitive worktree,
+# so that entry is the one left on disk if the checkout fails.
+test_expect_success 'a case-only rename passes the replaced mtime' '
+	(
+		cd repo &&
+		test "$(git config --bool core.ignoreCase)" = true &&
+		old=$(indexed_mtime dir/a.bin) &&
+		placeholder_git switch renamed &&
+		expect_output_index recorded &&
+		expect_replaced_mtime "$old" &&
 		git checkout -q -f main
 	)
 '

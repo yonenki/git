@@ -34,10 +34,11 @@ struct checkout {
 #define CHECKOUT_INIT { .base_dir = "" }
 
 /*
- * Textil: when the previous index has a stage-0 entry for ce's path that
- * records a different object, store that entry's mtime second in *sec and
- * return 1. A new output must not take that second: if the index is never
- * written, a same-size output would stat-match the stale entry.
+ * Textil: when the previous index has a stage-0 entry for ce's path (or,
+ * with core.ignoreCase and no exact match, for a spelling that differs only
+ * in case) that records a different object, store that entry's mtime second
+ * in *sec and return 1. A new output must not take that second: if the index
+ * is never written, a same-size output would stat-match the stale entry.
  */
 int textil_checkout_replaced_mtime(const struct checkout *state,
 				   const struct cache_entry *ce, uint32_t *sec);
