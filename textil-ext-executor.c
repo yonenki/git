@@ -275,6 +275,12 @@ static int validate_request_value(const char *key, const char *value,
  *   <pkt> phase=<phase>
  *   <pkt> operation=<operation>
  *   <pkt> repo_root=<path>          (optional, omitted when NULL)
+ *   checkout_file only:
+ *   <pkt> output_process=<pid>
+ *   <pkt> output_handle=<handle>
+ *   <pkt> output_index=recorded|unrecorded
+ *   <pkt> output_replaced_mtime_sec=<u32>  (recorded only; see
+ *                                   struct textil_ext_output_index)
  *   <delim>                         (start first item)
  *   <pkt> path=<path>
  *   <pkt> rule_id=<id>
@@ -353,6 +359,12 @@ static int build_batch_header(
 	if (batch->phase == TEXTIL_EXT_EXEC_PHASE_CHECKOUT_FILE) {
 		packet_buf_write(out, "output_process=%lu\n", batch->output_process);
 		packet_buf_write(out, "output_handle=%"PRIu64"\n", batch->output_handle);
+		packet_buf_write(out, "output_index=%s\n",
+				 batch->output_index.recorded ? "recorded" : "unrecorded");
+		if (batch->output_index.recorded &&
+		    batch->output_index.has_replaced_mtime)
+			packet_buf_write(out, "output_replaced_mtime_sec=%"PRIu32"\n",
+					 batch->output_index.replaced_mtime_sec);
 	}
 
 	return 0;
@@ -2133,7 +2145,8 @@ enum textil_ext_executor_status textil_ext_checkin_convert_fd_to_buf(
  */
 int textil_ext_try_install_placeholder(const char *path,
 	const struct object_id *oid, const char *filter,
-	const struct textil_ext_eval_result *eval, int out_fd, struct strbuf *err)
+	const struct textil_ext_eval_result *eval, int out_fd,
+	const struct textil_ext_output_index *output_index, struct strbuf *err)
 {
 #if defined(GIT_WINDOWS_NATIVE) && defined(SUPPORTS_SIMPLE_IPC)
 	struct textil_ext_takeover_batch batch = { 0 };
@@ -2158,6 +2171,7 @@ int textil_ext_try_install_placeholder(const char *path,
 	batch.nr_items = 1;
 	batch.output_handle = (uint64_t)(uintptr_t)_get_osfhandle(out_fd);
 	batch.output_process = GetCurrentProcessId();
+	batch.output_index = *output_index;
 	{
 		int is_pointer;
 		if (blob_oid_is_pointer(oid, NULL, &is_pointer, &item.pointer_hex, err))

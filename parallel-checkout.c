@@ -368,6 +368,10 @@ static void write_pc_takeover(struct parallel_checkout_item *pc_item,
 	struct strbuf path = STRBUF_INIT, err = STRBUF_INIT;
 	struct tempfile *temp = NULL;
 	const char *dir_sep;
+	/* Takeovers never reach checkout--worker, so state is the caller's. */
+	struct textil_ext_output_index output_index = {
+		.recorded = state->textil_records_index,
+	};
 	/* An eager wave item is an ordinary Git output (see write_entry). */
 	const struct textil_ext_source *source = textil_ext_materialize_cache_lookup(
 		pc_item->ce->name, oid_to_hex(&pc_item->ce->oid));
@@ -392,8 +396,11 @@ static void write_pc_takeover(struct parallel_checkout_item *pc_item,
 		pc_item->status = PC_ITEM_FAILED;
 		goto out;
 	}
+	if (output_index.recorded)
+		output_index.has_replaced_mtime = textil_checkout_replaced_mtime(
+			state, pc_item->ce, &output_index.replaced_mtime_sec);
 	result = textil_ext_materialize_to_fd(pc_item->ce->name, &pc_item->ce->oid,
-		conv_attrs_filter_name(&pc_item->ca), eval, fd, &err);
+		conv_attrs_filter_name(&pc_item->ca), eval, fd, &output_index, &err);
 	if (result < 0) {
 		error("%s", err.buf);
 		pc_item->status = PC_ITEM_FAILED;
@@ -415,6 +422,12 @@ static void write_pc_takeover(struct parallel_checkout_item *pc_item,
 		}
 		goto out;
 	}
+	/*
+	 * As in write_pc_output(): an in-process write may run inside a
+	 * caller's fscache window (checkout_worktree()), whose directory
+	 * listing predates this publication.
+	 */
+	flush_fscache();
 	if (state->refresh_cache && lstat(path.buf, &pc_item->st) < 0) {
 		error_errno("unable to stat just-written file '%s'", path.buf);
 		pc_item->status = PC_ITEM_FAILED;

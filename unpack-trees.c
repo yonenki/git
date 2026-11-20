@@ -440,6 +440,11 @@ static int check_updates(struct unpack_trees_options *o,
 	state.quiet = 1;
 	state.refresh_cache = 1;
 	state.istate = index;
+	/* index becomes o->dst_index, which the caller commits on success. */
+	state.textil_records_index = o->dst_index &&
+		textil_index_is_repository_index(o->dst_index);
+	/* Still intact here: the result replaces it only after check_updates. */
+	state.textil_previous_index = o->src_index;
 	clone_checkout_metadata(&state.meta, &o->meta, NULL);
 
 	if (!o->update || o->dry_run) {

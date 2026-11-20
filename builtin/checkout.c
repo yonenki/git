@@ -190,13 +190,20 @@ cleanup:
 	return result;
 }
 
+struct update_some_context {
+	int overlay_mode;
+	/* Textil: copies of the replaced stage-0 entries (struct checkout). */
+	struct index_state *replaced;
+};
+
 static int update_some(const struct object_id *oid, struct strbuf *base,
 		       const char *pathname, unsigned mode, void *context)
 {
 	int len;
 	struct cache_entry *ce;
 	int pos;
-	int overlay_mode = context ? *((int *)context) : 1;
+	struct update_some_context *ctx = context;
+	int overlay_mode = ctx->overlay_mode;
 
 	if (S_ISDIR(mode))
 		return try_update_sparse_directory(oid, base, pathname,
@@ -226,6 +233,10 @@ static int update_some(const struct object_id *oid, struct strbuf *base,
 			discard_cache_entry(ce);
 			return 0;
 		}
+		if (ctx->replaced && !oideq(&ce->oid, &old->oid))
+			add_index_entry(ctx->replaced,
+					dup_cache_entry(old, ctx->replaced),
+					ADD_CACHE_OK_TO_ADD | ADD_CACHE_SKIP_DFCHECK);
 	}
 
 	add_index_entry(the_repository->index, ce,
@@ -234,10 +245,15 @@ static int update_some(const struct object_id *oid, struct strbuf *base,
 }
 
 static int read_tree_some(struct tree *tree, const struct pathspec *pathspec,
-			  int overlay_mode)
+			  int overlay_mode, struct index_state *replaced)
 {
+	struct update_some_context ctx = {
+		.overlay_mode = overlay_mode,
+		.replaced = replaced,
+	};
+
 	read_tree(the_repository, tree,
-		  pathspec, update_some, &overlay_mode);
+		  pathspec, update_some, &ctx);
 
 	/* update the index with the given tree's info
 	 * for all args, expanding wildcards, and exit
@@ -438,7 +454,9 @@ static void mark_ce_for_checkout_no_overlay(struct cache_entry *ce,
 }
 
 static int checkout_worktree(const struct checkout_opts *opts,
-			     const struct branch_info *info)
+			     const struct branch_info *info,
+			     int records_index,
+			     struct index_state *replaced)
 {
 	struct checkout state = CHECKOUT_INIT;
 	int nr_checkouts = 0, nr_unmerged = 0;
@@ -450,6 +468,8 @@ static int checkout_worktree(const struct checkout_opts *opts,
 	state.force = 1;
 	state.refresh_cache = 1;
 	state.istate = the_repository->index;
+	state.textil_records_index = records_index;
+	state.textil_previous_index = replaced;
 
 	mem_pool_init(&ce_mem_pool, 0);
 	get_parallel_checkout_configs(&pc_workers, &pc_threshold);
@@ -526,6 +546,8 @@ static int checkout_paths(const struct checkout_opts *opts,
 	int errs = 0;
 	struct lock_file lock_file = LOCK_INIT;
 	int checkout_index;
+	int textil_records_index;
+	struct index_state replaced = INDEX_STATE_INIT(the_repository);
 
 	trace2_cmd_mode(opts->patch_mode ? "patch" : "path");
 
@@ -633,9 +655,26 @@ static int checkout_paths(const struct checkout_opts *opts,
 	if (repo_read_index_preload(the_repository, &opts->pathspec, 0) < 0)
 		return error(_("index file corrupt"));
 
+	/*
+	 * Allow updating the index when checking out from the index.
+	 * This is to save new stat info.
+	 */
+	if (opts->checkout_worktree && !opts->checkout_index && !opts->source_tree)
+		checkout_index = 1;
+	else
+		checkout_index = opts->checkout_index;
+	/*
+	 * Textil: only outputs written to the worktree whose stat is recorded
+	 * in the repository index take a chosen mtime, so only they need the
+	 * entries update_some replaces.
+	 */
+	textil_records_index = opts->checkout_worktree && checkout_index &&
+		textil_index_is_repository_index(the_repository->index);
+
 	if (opts->source_tree)
 		read_tree_some(opts->source_tree, &opts->pathspec,
-			       opts->overlay_mode);
+			       opts->overlay_mode,
+			       textil_records_index ? &replaced : NULL);
 	if (opts->merge)
 		unmerge_index(the_repository->index, &opts->pathspec, CE_MATCHED);
 
@@ -681,23 +720,18 @@ static int checkout_paths(const struct checkout_opts *opts,
 			pos = skip_same_name(ce, pos) - 1;
 		}
 	}
-	if (errs)
+	if (errs) {
+		discard_index(&replaced);
 		return 1;
+	}
 
 	/* Now we are committed to check them out */
 	if (opts->checkout_worktree)
-		errs |= checkout_worktree(opts, new_branch_info);
+		errs |= checkout_worktree(opts, new_branch_info,
+					  textil_records_index, &replaced);
 	else
 		remove_marked_cache_entries(the_repository->index, 1);
-
-	/*
-	 * Allow updating the index when checking out from the index.
-	 * This is to save new stat info.
-	 */
-	if (opts->checkout_worktree && !opts->checkout_index && !opts->source_tree)
-		checkout_index = 1;
-	else
-		checkout_index = opts->checkout_index;
+	discard_index(&replaced);
 
 	if (checkout_index) {
 		if (write_locked_index(the_repository->index, &lock_file, COMMIT_LOCK))

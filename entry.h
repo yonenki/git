@@ -12,14 +12,36 @@ struct checkout {
 	int base_dir_len;
 	const char *super_prefix;
 	struct delayed_checkout *delayed_checkout;
+	/*
+	 * Textil: entries of the index this checkout started from that it
+	 * replaces, consulted only with textil_records_index (see
+	 * textil_checkout_replaced_mtime()).
+	 */
+	struct index_state *textil_previous_index;
 	struct checkout_metadata meta;
 	unsigned force:1,
 		 quiet:1,
 		 not_new:1,
 		 clone:1,
-		 refresh_cache:1;
+		 refresh_cache:1,
+		 /*
+		  * Textil: on success, written outputs' stat data is recorded in
+		  * the repository's on-disk index (see
+		  * textil_index_is_repository_index()).
+		  */
+		 textil_records_index:1;
 };
 #define CHECKOUT_INIT { .base_dir = "" }
+
+/*
+ * Textil: when the previous index has a stage-0 entry for ce's path (or,
+ * with core.ignoreCase and no exact match, for a spelling that differs only
+ * in case) that records a different object, store that entry's mtime second
+ * in *sec and return 1. A new output must not take that second: if the index
+ * is never written, a same-size output would stat-match the stale entry.
+ */
+int textil_checkout_replaced_mtime(const struct checkout *state,
+				   const struct cache_entry *ce, uint32_t *sec);
 
 #define TEMPORARY_FILENAME_LENGTH 25
 /*

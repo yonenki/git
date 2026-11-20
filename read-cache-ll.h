@@ -479,6 +479,7 @@ int repo_refresh_and_write_index(struct repository*, unsigned int refresh_flags,
 struct cache_entry *refresh_cache_entry(struct index_state *, struct cache_entry *, unsigned int);
 
 void set_alternate_index_output(const char *);
+int textil_index_is_repository_index(const struct index_state *istate);
 
 extern int verify_index_checksum;
 extern int verify_ce_order;
