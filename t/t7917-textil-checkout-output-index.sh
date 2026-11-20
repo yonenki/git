@@ -1,12 +1,21 @@
 #!/bin/sh
 
-test_description='textil-ext: checkout_file says whether its output reaches the index
+test_description='textil-ext: checkout_file says whether its output will be recorded
 
 A placeholder controller may only adjust the timestamp of an output whose stat
-data Git commits to the repository index (output_index=recorded). Outputs of
-worktree-only restores, --temp checkouts and alternate indexes are unrecorded.'
+data Git will record in the repository index on success (output_index=recorded).
+Outputs of worktree-only restores, --temp checkouts and alternate indexes are
+unrecorded. A recorded output that replaces an entry for a different object
+also carries that entry'"'"'s mtime second (output_replaced_mtime_sec).'
 
 . ./test-lib.sh
+
+# Git sends checkout_file only on native Windows with simple IPC.
+if ! test_have_prereq MINGW
+then
+	skip_all='skipping Windows-specific tests'
+	test_done
+fi
 
 test-tool textil-ext-executor-server SUPPORTS_SIMPLE_IPC || {
 	skip_all='simple IPC not supported on this platform'
@@ -37,6 +46,24 @@ expect_output_index () {
 	printf "%s\n" "$@" >expect &&
 	sed -n "s/.*> output_index=//p" "$PACKETS" >actual &&
 	test_cmp expect actual
+}
+
+# The output_replaced_mtime_sec of the requests, in order; none without args.
+expect_replaced_mtime () {
+	if test $# = 0
+	then
+		! grep "> output_replaced_mtime_sec=" "$PACKETS"
+	else
+		printf "%s\n" "$@" >expect &&
+		sed -n "s/.*> output_replaced_mtime_sec=//p" "$PACKETS" >actual &&
+		test_cmp expect actual
+	fi
+}
+
+# The mtime second the index records for a path.
+indexed_mtime () {
+	git ls-files --debug "$1" >debug &&
+	sed -n "s/^  mtime: \([0-9]*\):.*/\1/p" debug
 }
 
 test_expect_success 'setup' '
@@ -75,6 +102,10 @@ test_expect_success 'setup' '
 		git switch -c second &&
 		write_pointer cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc 9 >dir/a.bin &&
 		git commit -am second &&
+		git switch -c third main &&
+		write_pointer dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd 9 >dir/c.bin &&
+		git add dir/c.bin &&
+		git commit -m third &&
 		git switch main
 	)
 '
@@ -82,21 +113,35 @@ test_expect_success 'setup' '
 # The controller double leaves each placeholder output as the empty file Git
 # created, so its index entry (size 0, non-empty blob) is never stat-clean.
 # Plain Git (no policy) restores real bytes before the next recorded command.
-test_expect_success 'switch records its outputs' '
+test_expect_success 'switch records its outputs and the replaced mtime' '
 	(
 		cd repo &&
+		old=$(indexed_mtime dir/a.bin) &&
 		placeholder_git switch second &&
 		expect_output_index recorded &&
+		expect_replaced_mtime "$old" &&
 		git checkout -q -f main
 	)
 '
 
-test_expect_success 'parallel switch records its outputs' '
+test_expect_success 'parallel switch records its outputs and the replaced mtime' '
 	(
 		cd repo &&
+		old=$(indexed_mtime dir/a.bin) &&
 		placeholder_git -c checkout.workers=2 \
 			-c checkout.thresholdForParallelism=0 switch second &&
 		expect_output_index recorded &&
+		expect_replaced_mtime "$old" &&
+		git checkout -q -f main
+	)
+'
+
+test_expect_success 'a new path has no replaced mtime' '
+	(
+		cd repo &&
+		placeholder_git switch third &&
+		expect_output_index recorded &&
+		expect_replaced_mtime &&
 		git checkout -q -f main
 	)
 '
@@ -107,10 +152,12 @@ test_expect_success 'reset --hard and read-tree -u record their outputs' '
 		rm dir/a.bin &&
 		placeholder_git reset --hard &&
 		expect_output_index recorded &&
+		expect_replaced_mtime &&
 		git reset -q --hard &&
 		rm dir/a.bin &&
 		placeholder_git read-tree --reset -u HEAD &&
 		expect_output_index recorded &&
+		expect_replaced_mtime &&
 		git reset -q --hard
 	)
 '
@@ -121,6 +168,7 @@ test_expect_success 'read-tree -u into an alternate index output is unrecorded' 
 		rm dir/a.bin &&
 		placeholder_git read-tree --reset -u --index-output=../alternate-index HEAD &&
 		expect_output_index unrecorded &&
+		expect_replaced_mtime &&
 		git reset -q --hard
 	)
 '
@@ -131,13 +179,18 @@ test_expect_success 'path checkouts that write the index record their outputs' '
 		rm dir/a.bin &&
 		placeholder_git restore dir/a.bin &&
 		expect_output_index recorded &&
+		expect_replaced_mtime &&
 		git reset -q --hard &&
+		old=$(indexed_mtime dir/a.bin) &&
 		placeholder_git checkout second -- dir/a.bin &&
 		expect_output_index recorded &&
+		expect_replaced_mtime "$old" &&
 		git reset -q --hard &&
 		git checkout second -- dir/a.bin &&
+		old=$(indexed_mtime dir/a.bin) &&
 		placeholder_git restore --source=main --staged --worktree dir/a.bin &&
 		expect_output_index recorded &&
+		expect_replaced_mtime "$old" &&
 		git diff --cached --exit-code &&
 		git reset -q --hard
 	)
@@ -148,6 +201,7 @@ test_expect_success 'worktree-only restore from another tree is unrecorded' '
 		cd repo &&
 		placeholder_git restore --source=second --worktree dir/a.bin &&
 		expect_output_index unrecorded &&
+		expect_replaced_mtime &&
 		git reset -q --hard
 	)
 '
@@ -185,7 +239,7 @@ test_expect_success 'checkout-index into GIT_INDEX_FILE is unrecorded' '
 # this process, inside checkout_worktree()'s fscache window. The stat it
 # records must be the published file's, not the directory listing cached
 # before the old files were removed.
-test_expect_success MINGW 'in-process parallel path checkout stats new outputs' '
+test_expect_success 'in-process parallel path checkout stats new outputs' '
 	(
 		cd repo &&
 		git reset --hard &&
@@ -200,7 +254,7 @@ test_expect_success MINGW 'in-process parallel path checkout stats new outputs' 
 	)
 '
 
-test_expect_success MINGW 'in-process parallel path checkout stats replaced outputs' '
+test_expect_success 'in-process parallel path checkout stats replaced outputs' '
 	(
 		cd repo &&
 		echo "an older and longer worktree file" >dir/a.bin &&

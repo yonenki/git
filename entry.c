@@ -21,6 +21,23 @@
 #include "convert.h"
 #include "copy.h"
 #include "tempfile.h"
+#include "read-cache-ll.h"
+
+int textil_checkout_replaced_mtime(const struct checkout *state,
+				   const struct cache_entry *ce, uint32_t *sec)
+{
+	struct index_state *previous = state->textil_previous_index;
+	int pos;
+
+	if (!previous)
+		return 0;
+	/* Never expand a sparse previous index for this lookup. */
+	pos = index_name_pos_sparse(previous, ce->name, ce_namelen(ce));
+	if (pos < 0 || oideq(&previous->cache[pos]->oid, &ce->oid))
+		return 0;
+	*sec = previous->cache[pos]->ce_stat_data.sd_mtime.sec;
+	return 1;
+}
 
 /*
  * Materialize a single takeover output that has no wave source: a native
@@ -31,13 +48,14 @@ int textil_ext_materialize_to_fd(const char *ce_name,
 					const struct object_id *ce_oid,
 					const char *attr_filter,
 					const struct textil_ext_eval_result *eval_result,
-					int out_fd, int records_index,
+					int out_fd,
+					const struct textil_ext_output_index *output_index,
 					struct strbuf *err)
 {
 	{
 		int installed = textil_ext_try_install_placeholder(
 			ce_name, ce_oid, attr_filter, eval_result, out_fd,
-			records_index, err);
+			output_index, err);
 		if (installed)
 			return installed;
 	}
@@ -423,12 +441,18 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 
 			{
 				int mat_rc;
+				struct textil_ext_output_index output_index = {
+					.recorded = !to_tempfile && state->textil_records_index,
+				};
+				if (output_index.recorded)
+					output_index.has_replaced_mtime =
+						textil_checkout_replaced_mtime(
+							state, ce, &output_index.replaced_mtime_sec);
 				mat_rc = textil_ext_materialize_to_fd(
 				    ce->name, &ce->oid,
 				    conv_attrs_filter_name(ca),
 				    &ext_result,
-				    out_fd,
-				    !to_tempfile && state->textil_records_index,
+				    out_fd, &output_index,
 				    &mat_err);
 				if (mat_rc < 0) {
 					error("%s", mat_err.buf);
