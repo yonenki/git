@@ -438,7 +438,8 @@ static void mark_ce_for_checkout_no_overlay(struct cache_entry *ce,
 }
 
 static int checkout_worktree(const struct checkout_opts *opts,
-			     const struct branch_info *info)
+			     const struct branch_info *info,
+			     int records_index)
 {
 	struct checkout state = CHECKOUT_INIT;
 	int nr_checkouts = 0, nr_unmerged = 0;
@@ -450,6 +451,8 @@ static int checkout_worktree(const struct checkout_opts *opts,
 	state.force = 1;
 	state.refresh_cache = 1;
 	state.istate = the_repository->index;
+	state.textil_records_index = records_index &&
+		textil_index_is_repository_index(the_repository->index);
 
 	mem_pool_init(&ce_mem_pool, 0);
 	get_parallel_checkout_configs(&pc_workers, &pc_threshold);
@@ -684,12 +687,6 @@ static int checkout_paths(const struct checkout_opts *opts,
 	if (errs)
 		return 1;
 
-	/* Now we are committed to check them out */
-	if (opts->checkout_worktree)
-		errs |= checkout_worktree(opts, new_branch_info);
-	else
-		remove_marked_cache_entries(the_repository->index, 1);
-
 	/*
 	 * Allow updating the index when checking out from the index.
 	 * This is to save new stat info.
@@ -698,6 +695,12 @@ static int checkout_paths(const struct checkout_opts *opts,
 		checkout_index = 1;
 	else
 		checkout_index = opts->checkout_index;
+
+	/* Now we are committed to check them out */
+	if (opts->checkout_worktree)
+		errs |= checkout_worktree(opts, new_branch_info, checkout_index);
+	else
+		remove_marked_cache_entries(the_repository->index, 1);
 
 	if (checkout_index) {
 		if (write_locked_index(the_repository->index, &lock_file, COMMIT_LOCK))

@@ -3132,6 +3132,25 @@ void set_alternate_index_output(const char *name)
 	alternate_index_output = name;
 }
 
+/*
+ * Textil: whether stat data refreshed into istate is later committed to the
+ * repository's own on-disk index (not GIT_INDEX_FILE, not an alternate
+ * output such as read-tree --index-output). Anything else is unrecorded.
+ */
+int textil_index_is_repository_index(const struct index_state *istate)
+{
+	struct repository *r = istate->repo ? istate->repo : the_repository;
+	char *repository_index;
+	int ret;
+
+	if (alternate_index_output || istate != r->index)
+		return 0;
+	repository_index = xstrfmt("%s/index", r->gitdir);
+	ret = !strcmp(repo_get_index_file(r), repository_index);
+	free(repository_index);
+	return ret;
+}
+
 static int commit_locked_index(struct lock_file *lk)
 {
 	if (alternate_index_output)

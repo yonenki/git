@@ -91,6 +91,12 @@ struct textil_ext_takeover_batch {
 	int deferred_durability;
 	uint64_t output_handle;     /* CHECKOUT_FILE only; exact Git-owned output */
 	unsigned long output_process;
+	/*
+	 * CHECKOUT_FILE only: the output's stat data is refreshed into an
+	 * index that is committed to the repository's on-disk index. Sent as
+	 * output_index=recorded|unrecorded.
+	 */
+	int output_records_index;
 };
 
 /* --- Executor status ---------------------------------------------------- */
@@ -134,15 +140,19 @@ struct conv_attrs;
 struct tempfile;
 int textil_ext_identity_conversion(const struct conv_attrs *ca);
 int textil_ext_placeholder_cache_lookup(const char *path, const char *oid_hex);
-/* 1 installed (including native empty), 0 MaterializeBytes, -1 typed failure. */
+/*
+ * 1 installed (including native empty), 0 MaterializeBytes, -1 typed failure.
+ * records_index: the output's stat reaches the repository's on-disk index
+ * (struct checkout's textil_records_index, never for a --temp output).
+ */
 int textil_ext_try_install_placeholder(const char *path, const struct object_id *oid,
 	const char *filter, const struct textil_ext_eval_result *eval, int out_fd,
-	struct strbuf *err);
+	int records_index, struct strbuf *err);
 struct tempfile *textil_ext_open_checkout_temp(const char *path, unsigned int mode);
 int textil_ext_publish_checkout_temp(struct tempfile **temp, const char *path);
 int textil_ext_materialize_to_fd(const char *path, const struct object_id *oid,
 	const char *filter, const struct textil_ext_eval_result *eval, int out_fd,
-	struct strbuf *err);
+	int records_index, struct strbuf *err);
 struct index_state;
 /* Metadata-only for identity takeover; never expose sparse backing as bytes. */
 int textil_ext_open_clean_input(struct index_state *index, const char *path);

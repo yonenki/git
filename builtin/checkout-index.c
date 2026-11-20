@@ -286,6 +286,8 @@ int cmd_checkout_index(int argc,
 	if (index_opt && !state.base_dir_len && !to_tempfile) {
 		state.refresh_cache = 1;
 		state.istate = repo->index;
+		state.textil_records_index =
+			textil_index_is_repository_index(repo->index);
 		repo_hold_locked_index(repo, &lock_file,
 				       LOCK_DIE_ON_ERROR);
 	}

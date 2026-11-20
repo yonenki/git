@@ -17,7 +17,12 @@ struct checkout {
 		 quiet:1,
 		 not_new:1,
 		 clone:1,
-		 refresh_cache:1;
+		 refresh_cache:1,
+		 /*
+		  * Textil: written outputs' stat data reaches the repository's
+		  * on-disk index (see textil_index_is_repository_index()).
+		  */
+		 textil_records_index:1;
 };
 #define CHECKOUT_INIT { .base_dir = "" }
 

@@ -90,6 +90,7 @@ enum reply_mode {
 	REPLY_LATER_PREFLIGHT_ERROR,
 	REPLY_LATER_MATERIALIZE_ERROR,
 	REPLY_ADMITTED_CHECKOUT, /* single-path lazy-admission regression */
+	REPLY_PLACEHOLDER_CHECKOUT, /* placeholder preflight and checkout_file */
 	REPLY_CHECKIN_DEFERRED, /* fence_oid for deferred checkins, logged fences */
 	REPLY_CHECKIN_DEFERRED_FENCE_ERROR,
 	REPLY_CHECKIN_CONTENT, /* Return exact input bytes, including empty input. */
@@ -215,6 +216,8 @@ static enum reply_mode parse_reply_mode(const char *s)
 		return REPLY_LATER_MATERIALIZE_ERROR;
 	if (!strcmp(s, "admitted-checkout"))
 		return REPLY_ADMITTED_CHECKOUT;
+	if (!strcmp(s, "placeholder-checkout"))
+		return REPLY_PLACEHOLDER_CHECKOUT;
 	if (!strcmp(s, "materialize-count-mismatch"))
 		return REPLY_MATERIALIZE_COUNT_MISMATCH;
 	if (!strcmp(s, "validate-request-materialize"))
@@ -775,6 +778,46 @@ static int is_checkout_file_request(const char *request, size_t request_len)
 	}
 }
 
+/* checkout_file must say whether its output's stat reaches the index. */
+static int has_output_index(const char *request, size_t request_len)
+{
+	size_t pos = 0;
+	for (;;) {
+		const char *line;
+		size_t len;
+		enum pktline_mem_status status =
+			pktline_read_mem(request, request_len, &pos, &line, &len);
+		if (status != PKTLINE_MEM_DATA)
+			return 0;
+		if ((len == strlen("output_index=recorded") &&
+		     !memcmp(line, "output_index=recorded", len)) ||
+		    (len == strlen("output_index=unrecorded") &&
+		     !memcmp(line, "output_index=unrecorded", len)))
+			return 1;
+	}
+}
+
+/* One disposition=placeholder per request item: the native-scope outcome. */
+static void build_placeholder_reply(struct strbuf *out,
+				    const char *request, size_t request_len)
+{
+	size_t pos = 0;
+	packet_buf_write(out, "status=ok\n");
+	for (;;) {
+		const char *line;
+		size_t line_len;
+		enum pktline_mem_status status =
+			pktline_read_mem(request, request_len, &pos, &line, &line_len);
+		if (status == PKTLINE_MEM_FLUSH || status == PKTLINE_MEM_ERROR)
+			break;
+		if (status == PKTLINE_MEM_DELIM) {
+			packet_buf_delim(out);
+			packet_buf_write(out, "disposition=placeholder\n");
+		}
+	}
+	packet_buf_flush(out);
+}
+
 static int app_cb(void *application_data UNUSED,
 		  const char *request, size_t request_len,
 		  ipc_server_reply_cb *reply_cb,
@@ -786,13 +829,19 @@ static int app_cb(void *application_data UNUSED,
 	if (request_len == 4 && !strncmp(request, "quit", 4))
 		return SIMPLE_IPC_QUIT;
 	/* These byte-output oracle servers register no native placeholder scope.
-	 * The real Rust controller's same typed outcome is MaterializeBytes. */
+	 * The real Rust controller's same typed outcome is MaterializeBytes.
+	 * placeholder-checkout stands in for a registered scope: the output
+	 * stays the empty native file Git created. */
 	if (is_checkout_file_request(request, request_len)) {
 		struct strbuf reason = STRBUF_INIT;
-		if (validate_batch_request(request, request_len, &reason))
-			build_ok_reply(&reply, request, request_len);
-		else
+		if (!validate_batch_request(request, request_len, &reason))
 			build_error_reply(&reply, reason.buf);
+		else if (!has_output_index(request, request_len))
+			build_error_reply(&reply, "checkout_file missing output_index");
+		else if (server_args.mode == REPLY_PLACEHOLDER_CHECKOUT)
+			build_placeholder_reply(&reply, request, request_len);
+		else
+			build_ok_reply(&reply, request, request_len);
 		strbuf_release(&reason);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
@@ -810,6 +859,12 @@ static int app_cb(void *application_data UNUSED,
 
 	case REPLY_OK:
 		build_ok_reply(&reply, request, request_len);
+		ret = reply_cb(reply_data, reply.buf, reply.len);
+		strbuf_release(&reply);
+		return ret;
+
+	case REPLY_PLACEHOLDER_CHECKOUT:
+		build_placeholder_reply(&reply, request, request_len);
 		ret = reply_cb(reply_data, reply.buf, reply.len);
 		strbuf_release(&reply);
 		return ret;

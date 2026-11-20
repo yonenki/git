@@ -392,8 +392,10 @@ static void write_pc_takeover(struct parallel_checkout_item *pc_item,
 		pc_item->status = PC_ITEM_FAILED;
 		goto out;
 	}
+	/* Takeovers never reach checkout--worker, so state is the caller's. */
 	result = textil_ext_materialize_to_fd(pc_item->ce->name, &pc_item->ce->oid,
-		conv_attrs_filter_name(&pc_item->ca), eval, fd, &err);
+		conv_attrs_filter_name(&pc_item->ca), eval, fd,
+		state->textil_records_index, &err);
 	if (result < 0) {
 		error("%s", err.buf);
 		pc_item->status = PC_ITEM_FAILED;
@@ -415,6 +417,12 @@ static void write_pc_takeover(struct parallel_checkout_item *pc_item,
 		}
 		goto out;
 	}
+	/*
+	 * As in write_pc_output(): an in-process write may run inside a
+	 * caller's fscache window (checkout_worktree()), whose directory
+	 * listing predates this publication.
+	 */
+	flush_fscache();
 	if (state->refresh_cache && lstat(path.buf, &pc_item->st) < 0) {
 		error_errno("unable to stat just-written file '%s'", path.buf);
 		pc_item->status = PC_ITEM_FAILED;

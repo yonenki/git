@@ -31,12 +31,13 @@ int textil_ext_materialize_to_fd(const char *ce_name,
 					const struct object_id *ce_oid,
 					const char *attr_filter,
 					const struct textil_ext_eval_result *eval_result,
-					int out_fd,
+					int out_fd, int records_index,
 					struct strbuf *err)
 {
 	{
 		int installed = textil_ext_try_install_placeholder(
-			ce_name, ce_oid, attr_filter, eval_result, out_fd, err);
+			ce_name, ce_oid, attr_filter, eval_result, out_fd,
+			records_index, err);
 		if (installed)
 			return installed;
 	}
@@ -426,7 +427,9 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 				    ce->name, &ce->oid,
 				    conv_attrs_filter_name(ca),
 				    &ext_result,
-				    out_fd, &mat_err);
+				    out_fd,
+				    !to_tempfile && state->textil_records_index,
+				    &mat_err);
 				if (mat_rc < 0) {
 					error("%s", mat_err.buf);
 					if (to_tempfile) {
